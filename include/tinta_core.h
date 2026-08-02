@@ -23,7 +23,18 @@ extern "C" {
 #define TINTA_CORE_VERSION_MINOR 2
 #define TINTA_CORE_VERSION_PATCH 0
 
+/* Register this class with TintaCoreInitialize before calling CreateWindowExW. */
 #define TINTA_MARKDOWN_VIEW_CLASSW L"Tinta.MarkdownView"
+
+/*
+ * Public ABI conventions
+ * ----------------------
+ * - Set cb_size to sizeof(the structure) before sending it to the control.
+ * - Input strings need not be NUL terminated when an explicit length is given.
+ * - Input data is copied before SendMessage returns unless stated otherwise.
+ * - Pointers received through WM_NOTIFY are valid only during that notification.
+ * - Create, message, and destroy each HWND on its owning UI thread.
+ */
 
 typedef enum TintaDocumentFormat {
     TINTA_FORMAT_AUTO = 0,
@@ -33,28 +44,34 @@ typedef enum TintaDocumentFormat {
 
 typedef struct TintaDocument {
     UINT cb_size;
-    const char *utf8;
-    size_t utf8_length;
-    const wchar_t *base_uri;
+    const char *utf8;             /* UTF-8 source. */
+    size_t utf8_length;           /* Bytes, excluding any trailing NUL. */
+    const wchar_t *base_uri;      /* Optional file path or HTTP(S) base URI. */
     TintaDocumentFormat format;
-    DWORD flags;
+    DWORD flags;                  /* Reserved; set to zero. */
 } TintaDocument;
 
+/* Starts a new empty streamed document and replaces any current document. */
 typedef struct TintaStreamBegin {
     UINT cb_size;
-    const wchar_t *base_uri;
+    const wchar_t *base_uri;      /* Fixed for the lifetime of this stream. */
     TintaDocumentFormat format;
-    UINT refresh_interval_ms;
-    DWORD flags;
+    UINT refresh_interval_ms;     /* 0 = 50 ms; otherwise 20 through 1000 ms. */
+    DWORD flags;                  /* Reserved; set to zero. */
 } TintaStreamBegin;
 
+/*
+ * A stream chunk may split a UTF-8 character. Invalid chunks are rejected
+ * atomically; incomplete trailing characters remain pending for the next chunk.
+ */
 typedef struct TintaStreamChunk {
     UINT cb_size;
     const char *utf8;
-    size_t utf8_length;
-    DWORD flags;
+    size_t utf8_length;           /* Bytes; arbitrary SSE/delta boundaries. */
+    DWORD flags;                  /* Reserved; set to zero. */
 } TintaStreamChunk;
 
+/* TintaOptions::flags. */
 enum {
     TINTA_OPTION_SELECTION = 0x0001,
     TINTA_OPTION_KEYBOARD_NAVIGATION = 0x0002,
@@ -72,9 +89,9 @@ typedef struct TintaOptions {
 
 typedef struct TintaLimits {
     UINT cb_size;
-    size_t max_document_bytes;
+    size_t max_document_bytes;    /* UTF-8 bytes, including buffered stream data. */
     size_t max_ast_nodes;
-    uint64_t max_image_pixels;
+    uint64_t max_image_pixels;    /* Per decoded image: width * height. */
     UINT max_image_resources;
     UINT max_concurrent_downloads;
 } TintaLimits;
@@ -98,6 +115,7 @@ typedef struct TintaThemeSpec {
     const wchar_t *font_family;
     const wchar_t *code_font_family;
     BOOL dark;
+    /* Colors use 0xRRGGBB. */
     uint32_t background;
     uint32_t text;
     uint32_t heading;
@@ -136,18 +154,18 @@ typedef struct TintaFindState {
 
 typedef struct TintaHeadingInfo {
     UINT cb_size;
-    size_t index;
+    size_t index;                 /* Input: zero-based heading index. */
     int level;
-    wchar_t *text;
+    wchar_t *text;                /* Optional caller-owned output buffer. */
     size_t text_capacity;
-    wchar_t *anchor;
+    wchar_t *anchor;              /* Optional caller-owned output buffer. */
     size_t anchor_capacity;
 } TintaHeadingInfo;
 
 typedef struct TintaSelection {
     UINT cb_size;
-    size_t start;
-    size_t end;
+    size_t start;                 /* UTF-16 offset in rendered document text. */
+    size_t end;                   /* Exclusive UTF-16 offset. */
 } TintaSelection;
 
 typedef struct TintaScrollPosition {
@@ -170,7 +188,7 @@ typedef enum TintaResourceKind {
 typedef enum TintaResourceAction {
     TINTA_RESOURCE_DEFAULT = 0,
     TINTA_RESOURCE_BLOCK = 1,
-    TINTA_RESOURCE_REPLACE = 2
+    TINTA_RESOURCE_REPLACE = 2    /* Set replacement_uri before returning. */
 } TintaResourceAction;
 
 typedef struct TintaLinkNotify {
@@ -183,7 +201,7 @@ typedef struct TintaResourceNotify {
     TintaResourceKind kind;
     const wchar_t *original_uri;
     const wchar_t *resolved_uri;
-    const wchar_t *replacement_uri;
+    const wchar_t *replacement_uri; /* Host output for TINTA_RESOURCE_REPLACE. */
 } TintaResourceNotify;
 
 typedef struct TintaErrorNotify {
@@ -203,8 +221,8 @@ typedef struct TintaContextMenuNotify {
 
 typedef struct TintaStreamUpdateNotify {
     NMHDR hdr;
-    uint64_t revision;
-    size_t utf8_length;
+    uint64_t revision;            /* Monotonic within the current stream. */
+    size_t utf8_length;           /* Bytes committed to this displayed revision. */
     TintaContentSize content_size;
 } TintaStreamUpdateNotify;
 
@@ -215,11 +233,31 @@ enum {
 typedef struct TintaContentUpdateNotify {
     NMHDR hdr;
     DWORD flags;
-    uint64_t revision;
+    uint64_t revision;            /* Text revision whose layout changed. */
     size_t utf8_length;
     TintaContentSize content_size;
 } TintaContentUpdateNotify;
 
+/*
+ * Control messages. Unless described otherwise, wParam is zero and a mutating
+ * message returns nonzero on success.
+ *
+ * TMM_SETDOCUMENT       lParam = const TintaDocument *; replaces active stream.
+ * TMM_SETBASEURI        lParam = const wchar_t *; rejected during a stream.
+ * TMM_SET/GETOPTIONS    lParam = TintaOptions *.
+ * TMM_SET/GETLIMITS     lParam = TintaLimits *.
+ * TMM_SETBUILTINTHEME   wParam = TintaBuiltinTheme.
+ * TMM_SETCUSTOMTHEME    lParam = const TintaThemeSpec *.
+ * TMM_SET/GETZOOM       lParam points to a float.
+ * TMM_SET/GETSCROLLPOS  lParam = TintaScrollPosition *.
+ * TMM_GETCONTENTSIZE    lParam = TintaContentSize *.
+ * TMM_FIND              lParam = const TintaFindRequest *.
+ * TMM_GETFINDSTATE      lParam = TintaFindState *.
+ * TMM_GETHEADINGCOUNT   returns the number of headings.
+ * TMM_GETHEADING        lParam = TintaHeadingInfo *.
+ * TMM_SCROLLTOHEADING   wParam = zero-based heading index.
+ * TMM_GETSELECTION      lParam = TintaSelection *.
+ */
 #define TMM_FIRST                 (WM_USER + 0x500)
 #define TMM_SETDOCUMENT           (TMM_FIRST + 0)
 #define TMM_SETBASEURI            (TMM_FIRST + 1)
@@ -246,11 +284,35 @@ typedef struct TintaContentUpdateNotify {
 #define TMM_CLEARSELECTION        (TMM_FIRST + 22)
 #define TMM_GETSELECTION          (TMM_FIRST + 23)
 #define TMM_REFRESHAPPEARANCE     (TMM_FIRST + 24)
+
+/*
+ * Streaming state machine
+ * -----------------------
+ * BEGIN  lParam = const TintaStreamBegin *; starts a new empty document.
+ * APPEND lParam = const TintaStreamChunk *; copies and queues one UTF-8 delta.
+ * END    validates the final UTF-8 character and forces the final revision.
+ * CANCEL discards undisplayed data and keeps the last displayed revision.
+ *
+ * A new BEGIN, WM_SETTEXT, or TMM_SETDOCUMENT replaces an active stream.
+ * Intermediate parses/layouts are coalesced to the configured refresh rate.
+ */
 #define TMM_STREAM_BEGIN          (TMM_FIRST + 25)
 #define TMM_STREAM_APPEND         (TMM_FIRST + 26)
 #define TMM_STREAM_END            (TMM_FIRST + 27)
 #define TMM_STREAM_CANCEL         (TMM_FIRST + 28)
 
+/*
+ * WM_NOTIFY codes sent synchronously to the parent window.
+ *
+ * TMN_DOCUMENTREADY   Final text layout is ready; images may still be loading.
+ * TMN_ERROR           lParam = const TintaErrorNotify *.
+ * TMN_LINKACTIVATE    lParam = const TintaLinkNotify *; nonzero means handled.
+ * TMN_RESOURCEOPENING lParam = TintaResourceNotify *; return TintaResourceAction.
+ * TMN_CONTEXTMENU     lParam = const TintaContextMenuNotify *.
+ * TMN_STREAMUPDATED   lParam = const TintaStreamUpdateNotify *.
+ * TMN_CONTENTUPDATED  lParam = const TintaContentUpdateNotify *; for example,
+ *                     an image completion that changes content size.
+ */
 #define TMN_FIRST                 ((UINT)-1800)
 #define TMN_DOCUMENTREADY         (TMN_FIRST - 1)
 #define TMN_ERROR                 (TMN_FIRST - 2)
@@ -266,6 +328,10 @@ typedef struct TintaContentUpdateNotify {
 #define TMN_STREAMUPDATED         (TMN_FIRST - 12)
 #define TMN_CONTENTUPDATED        (TMN_FIRST - 13)
 
+/*
+ * Initialization is process-wide and reference counted. Pair every successful
+ * (SUCCEEDED) call with TintaCoreUninitialize after all owned controls are gone.
+ */
 TINTA_CORE_API HRESULT TintaCoreInitialize(void);
 TINTA_CORE_API void TintaCoreUninitialize(void);
 
