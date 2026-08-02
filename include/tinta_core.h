@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 #define TINTA_CORE_VERSION_MAJOR 0
-#define TINTA_CORE_VERSION_MINOR 1
+#define TINTA_CORE_VERSION_MINOR 2
 #define TINTA_CORE_VERSION_PATCH 0
 
 #define TINTA_MARKDOWN_VIEW_CLASSW L"Tinta.MarkdownView"
@@ -39,6 +39,21 @@ typedef struct TintaDocument {
     TintaDocumentFormat format;
     DWORD flags;
 } TintaDocument;
+
+typedef struct TintaStreamBegin {
+    UINT cb_size;
+    const wchar_t *base_uri;
+    TintaDocumentFormat format;
+    UINT refresh_interval_ms;
+    DWORD flags;
+} TintaStreamBegin;
+
+typedef struct TintaStreamChunk {
+    UINT cb_size;
+    const char *utf8;
+    size_t utf8_length;
+    DWORD flags;
+} TintaStreamChunk;
 
 enum {
     TINTA_OPTION_SELECTION = 0x0001,
@@ -186,6 +201,25 @@ typedef struct TintaContextMenuNotify {
     BOOL over_code_block;
 } TintaContextMenuNotify;
 
+typedef struct TintaStreamUpdateNotify {
+    NMHDR hdr;
+    uint64_t revision;
+    size_t utf8_length;
+    TintaContentSize content_size;
+} TintaStreamUpdateNotify;
+
+enum {
+    TINTA_CONTENT_UPDATE_RESOURCE = 0x0001
+};
+
+typedef struct TintaContentUpdateNotify {
+    NMHDR hdr;
+    DWORD flags;
+    uint64_t revision;
+    size_t utf8_length;
+    TintaContentSize content_size;
+} TintaContentUpdateNotify;
+
 #define TMM_FIRST                 (WM_USER + 0x500)
 #define TMM_SETDOCUMENT           (TMM_FIRST + 0)
 #define TMM_SETBASEURI            (TMM_FIRST + 1)
@@ -212,6 +246,10 @@ typedef struct TintaContextMenuNotify {
 #define TMM_CLEARSELECTION        (TMM_FIRST + 22)
 #define TMM_GETSELECTION          (TMM_FIRST + 23)
 #define TMM_REFRESHAPPEARANCE     (TMM_FIRST + 24)
+#define TMM_STREAM_BEGIN          (TMM_FIRST + 25)
+#define TMM_STREAM_APPEND         (TMM_FIRST + 26)
+#define TMM_STREAM_END            (TMM_FIRST + 27)
+#define TMM_STREAM_CANCEL         (TMM_FIRST + 28)
 
 #define TMN_FIRST                 ((UINT)-1800)
 #define TMN_DOCUMENTREADY         (TMN_FIRST - 1)
@@ -225,6 +263,8 @@ typedef struct TintaContextMenuNotify {
 #define TMN_REQUESTFIND           (TMN_FIRST - 9)
 #define TMN_CONTEXTMENU           (TMN_FIRST - 10)
 #define TMN_COPYCOMPLETED         (TMN_FIRST - 11)
+#define TMN_STREAMUPDATED         (TMN_FIRST - 12)
+#define TMN_CONTENTUPDATED        (TMN_FIRST - 13)
 
 TINTA_CORE_API HRESULT TintaCoreInitialize(void);
 TINTA_CORE_API void TintaCoreUninitialize(void);

@@ -24,8 +24,9 @@ library. md4c is vendored, so configuring the project requires no downloads.
 
 The examples include `tinta_minimal`, the feature-oriented `tinta_demo`, and
 `tinta_chat_demo`. The chat demo hosts one Markdown control per message,
-provides a scrolling left/right conversation layout, and simulates a streaming
-assistant response without network access.
+provides a scrolling left/right conversation layout, and sends 128 simulated
+SSE deltas through the streaming API. Its first response also demonstrates a
+cached local image and an optional remote image.
 
 ## Minimal use
 
@@ -45,6 +46,10 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   `TintaCoreUninitialize` after destroying the last one.
 - `WM_SETTEXT` and `WM_GETTEXT` use UTF-16 Markdown. `TMM_SETDOCUMENT` accepts
   UTF-8, a Markdown/Mermaid format, and an optional local or HTTP base URI.
+- `TMM_STREAM_BEGIN`, `TMM_STREAM_APPEND`, `TMM_STREAM_END` and
+  `TMM_STREAM_CANCEL` accept arbitrary UTF-8 delta boundaries. The control
+  copies each delta, coalesces full parse/layout revisions at 20 Hz by default,
+  and reports displayed revisions with `TMN_STREAMUPDATED`.
 - Input pointers are copied before `SendMessage` returns. Output messages use
   caller-owned buffers, so no allocator crosses a static-library or DLL ABI.
 - The control owns parsing, Direct2D drawing, scrolling, selection, zoom,
@@ -53,6 +58,9 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - External links send `TMN_LINKACTIVATE`; returning zero permits the default
   `ShellExecuteW` behavior. Images send `TMN_RESOURCEOPENING`; the host can
   return default, block, or replace the resource URI.
+- Local and remote image resolution, download failures, decoded WIC sources,
+  and device-specific Direct2D bitmaps are cached per control for the lifetime
+  of a streamed document. Image reflow sends `TMN_CONTENTUPDATED`.
 - The default limits are 64 MiB of Markdown, one million AST nodes, 64 million
   decoded pixels per image, 512 image resources and four concurrent downloads.
 

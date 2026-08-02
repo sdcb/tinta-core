@@ -8,6 +8,8 @@
 static int notifications;
 static int resource_notifications;
 static int link_notifications;
+static int document_ready_notifications;
+static int stream_update_notifications;
 static bool post_quit_on_destroy;
 static int destroy_quit_code;
 
@@ -18,6 +20,10 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
     if (message == WM_NOTIFY) {
         NMHDR *header = reinterpret_cast<NMHDR *>(lparam);
         if (header) notifications++;
+        if (header && header->code == TMN_DOCUMENTREADY)
+            document_ready_notifications++;
+        if (header && header->code == TMN_STREAMUPDATED)
+            stream_update_notifications++;
         if (header && header->code == TMN_LINKACTIVATE) {
             link_notifications++;
             return TRUE;
@@ -33,6 +39,20 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
         return 0;
     }
     return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static bool pump_until(HWND view, int *value, int target, DWORD timeout_ms) {
+    ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    while (*value < target && GetTickCount64() < deadline) {
+        MSG message;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        SendMessageW(view, WM_PAINT, 0, 0);
+        Sleep(1);
+    }
+    return *value >= target;
 }
 
 int main() {
@@ -107,6 +127,78 @@ int main() {
         std::cerr << "selection API failed\n";
         return 1;
     }
+    TintaStreamBegin stream_begin{};
+    stream_begin.cb_size = sizeof(stream_begin);
+    stream_begin.base_uri = L"C:\\temp\\stream.md";
+    stream_begin.format = TINTA_FORMAT_MARKDOWN;
+    stream_begin.refresh_interval_ms = 20;
+    if (!SendMessageW(view, TMM_STREAM_BEGIN, 0,
+                      reinterpret_cast<LPARAM>(&stream_begin))) {
+        std::cerr << "stream begin failed\n";
+        return 1;
+    }
+    const char stream_prefix[] = "# Stream\n\n![cached](missing.png)\n\ncaf";
+    TintaStreamChunk stream_chunk{};
+    stream_chunk.cb_size = sizeof(stream_chunk);
+    stream_chunk.utf8 = stream_prefix;
+    stream_chunk.utf8_length = std::strlen(stream_prefix);
+    if (!SendMessageW(view, TMM_STREAM_APPEND, 0,
+                      reinterpret_cast<LPARAM>(&stream_chunk))) {
+        std::cerr << "stream prefix failed\n";
+        return 1;
+    }
+    const char utf8_lead[] = {static_cast<char>(0xc3)};
+    stream_chunk.utf8 = utf8_lead;
+    stream_chunk.utf8_length = sizeof(utf8_lead);
+    if (!SendMessageW(view, TMM_STREAM_APPEND, 0,
+                      reinterpret_cast<LPARAM>(&stream_chunk))) {
+        std::cerr << "split UTF-8 lead failed\n";
+        return 1;
+    }
+    const char invalid[] = {static_cast<char>(0xff)};
+    stream_chunk.utf8 = invalid;
+    if (SendMessageW(view, TMM_STREAM_APPEND, 0,
+                     reinterpret_cast<LPARAM>(&stream_chunk))) {
+        std::cerr << "invalid UTF-8 was accepted\n";
+        return 1;
+    }
+    const char utf8_tail[] = {static_cast<char>(0xa9)};
+    stream_chunk.utf8 = utf8_tail;
+    if (!SendMessageW(view, TMM_STREAM_APPEND, 0,
+                      reinterpret_cast<LPARAM>(&stream_chunk))) {
+        std::cerr << "split UTF-8 tail failed\n";
+        return 1;
+    }
+    const char delta[] = " more";
+    stream_chunk.utf8 = delta;
+    stream_chunk.utf8_length = std::strlen(delta);
+    for (int index = 0; index < 1000; index++) {
+        if (!SendMessageW(view, TMM_STREAM_APPEND, 0,
+                          reinterpret_cast<LPARAM>(&stream_chunk))) {
+            std::cerr << "high frequency stream append failed\n";
+            return 1;
+        }
+    }
+    int ready_target = document_ready_notifications + 1;
+    if (!SendMessageW(view, TMM_STREAM_END, 0, 0) ||
+        !pump_until(view, &document_ready_notifications, ready_target, 3000)) {
+        std::cerr << "stream end failed\n";
+        return 1;
+    }
+    if (stream_update_notifications >= 1000 ||
+        resource_notifications != 1) {
+        std::cerr << "stream coalescing or image cache failed\n";
+        return 1;
+    }
+    int stream_text_length = GetWindowTextLengthW(view);
+    wchar_t *stream_text = new wchar_t[static_cast<size_t>(stream_text_length) + 1];
+    GetWindowTextW(view, stream_text, stream_text_length + 1);
+    bool stream_text_ok = std::wcsstr(stream_text, L"caf\u00e9 more") != nullptr;
+    delete[] stream_text;
+    if (!stream_text_ok) {
+        std::cerr << "stream final text mismatch\n";
+        return 1;
+    }
     TintaDocument image_document{};
     const char image_markdown[] = "# Image\n\n![alt](missing.png)\n";
     image_document.cb_size = sizeof(image_document);
@@ -120,7 +212,7 @@ int main() {
         return 1;
     }
     SendMessageW(view, TMM_GETHEADINGCOUNT, 0, 0);
-    if (resource_notifications != 1) {
+    if (resource_notifications != 2) {
         std::cerr << "resource notification failed\n";
         return 1;
     }

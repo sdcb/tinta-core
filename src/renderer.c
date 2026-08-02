@@ -217,11 +217,6 @@ void tinta_layout_clear(TintaApp *app) {
         free(heading->text);
         free(heading->slug);
     }
-    for (i = 0; i < app->bitmaps.len; i++) {
-        TintaDrawBitmap *item = TINTA_VEC_PTR(TintaDrawBitmap, app->bitmaps, i);
-        if (item->bitmap) item->bitmap->lpVtbl->Release(item->bitmap);
-        if (item->source) IWICBitmapSource_Release(item->source);
-    }
     for (i = 0; i < app->code_blocks.len; i++) free(TINTA_VEC_AT(TintaCodeBlock, app->code_blocks, i).text);
     tinta_vec_clear(&app->text_runs); tinta_vec_clear(&app->rects);
     tinta_vec_clear(&app->lines); tinta_vec_clear(&app->headings);
@@ -1089,27 +1084,6 @@ done:
     return ok;
 }
 
-static bool wic_bitmap(TintaApp *app, const wchar_t *path,
-                       IWICBitmapSource **source, UINT *width, UINT *height) {
-    IWICBitmapDecoder *decoder = NULL; IWICBitmapFrameDecode *frame = NULL;
-    IWICFormatConverter *converter = NULL;
-    HRESULT hr = IWICImagingFactory_CreateDecoderFromFilename(app->wic_factory, path, NULL, GENERIC_READ,
-                                                               WICDecodeMetadataCacheOnLoad, &decoder);
-    if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
-    if (SUCCEEDED(hr)) hr = IWICBitmapFrameDecode_GetSize(frame, width, height);
-    if (SUCCEEDED(hr)) hr = IWICImagingFactory_CreateFormatConverter(app->wic_factory, &converter);
-    if (SUCCEEDED(hr)) hr = IWICFormatConverter_Initialize(converter, (IWICBitmapSource *)frame,
-        &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0, WICBitmapPaletteTypeCustom);
-    if (SUCCEEDED(hr)) {
-        *source = (IWICBitmapSource *)converter;
-        converter = NULL;
-    }
-    if (converter) IWICFormatConverter_Release(converter);
-    if (frame) IWICBitmapFrameDecode_Release(frame);
-    if (decoder) IWICBitmapDecoder_Release(decoder);
-    return SUCCEEDED(hr) && *source;
-}
-
 static bool rects_overlap(D2D1_RECT_F a, D2D1_RECT_F b) {
     return a.left < b.right && a.right > b.left &&
            a.top < b.bottom && a.bottom > b.top;
@@ -1161,92 +1135,28 @@ static bool layout_image_placeholder(TintaApp *app, const TintaElement *element,
     return ok;
 }
 
-static bool image_path_is_absolute(const wchar_t *path) {
-    return path && ((path[0] && (path[0] == L'\\' || path[0] == L'/')) ||
-                    (path[0] && path[1] == L':'));
-}
-
 static bool layout_image(TintaApp *app, const TintaElement *element, float *y, float left, float right) {
-    TintaStr16 source = {0}; TintaStr16 path = {0}; TintaStr8 remote8 = {0};
-    IWICBitmapSource *bitmap_source = NULL;
-    UINT width = 0, height = 0; TintaDrawBitmap item; float ratio;
-    bool remote, blocked = false;
+    size_t resource_index = 0;
+    TintaImageResource *resource;
+    TintaDrawBitmap item;
+    float ratio;
+    bool ready = false;
     if (!element->url) return layout_image_placeholder(app, element, y, left);
-    if (app->max_image_resources &&
-        app->bitmaps.len + app->remote_images.len >= app->max_image_resources)
+    if (!tinta_image_resource_get(app, element->url,
+                                  &resource_index, &ready))
+        return false;
+    if (!ready || resource_index >= app->image_resources.len)
         return layout_image_placeholder(app, element, y, left);
-    if (app->resolve_image) {
-        if (!app->resolve_image(app, element->url, &path, &remote, &blocked))
-            return false;
-        if (blocked || !path.data)
-            return layout_image_placeholder(app, element, y, left);
-    } else {
-        remote = !_strnicmp(element->url, "http://", 7) ||
-                 !_strnicmp(element->url, "https://", 8);
-    }
-    if (remote) {
-        bool failed = false;
-        const char *request_url = element->url;
-        if (path.data) {
-            if (!tinta_utf16_to_utf8(path.data, path.len, &remote8)) {
-                tinta_str16_destroy(&path);
-                return false;
-            }
-            request_url = remote8.data;
-        }
-        bitmap_source = tinta_remote_image_request(app, request_url, &failed);
-        tinta_str8_destroy(&remote8);
-        tinta_str16_destroy(&path);
-        if(!bitmap_source) {
-            return layout_image_placeholder(app, element, y, left);
-        }
-        IWICBitmapSource_AddRef(bitmap_source);
-        if (FAILED(IWICBitmapSource_GetSize(bitmap_source, &width, &height)) ||
-            !width || !height) {
-            IWICBitmapSource_Release(bitmap_source);
-            return layout_image_placeholder(app, element, y, left);
-        }
-    } else {
-        if (!path.data) {
-            if (!tinta_utf8_to_utf16(element->url, strlen(element->url), &source))
-                return false;
-            if (!source.data) return false;
-        }
-        if (!path.data && !image_path_is_absolute(source.data) && app->current_file.len) {
-            size_t separator = app->current_file.len;
-            while (separator > 0 &&
-                   app->current_file.data[separator - 1] != L'\\' &&
-                   app->current_file.data[separator - 1] != L'/')
-                separator--;
-            if (!tinta_str16_assign(&path, app->current_file.data, separator) ||
-                !tinta_str16_append(&path, source.data, source.len)) {
-                tinta_str16_destroy(&source);
-                tinta_str16_destroy(&path);
-                return false;
-            }
-        } else if (!path.data) {
-            if (!tinta_str16_assign(&path, source.data, source.len)) {
-                tinta_str16_destroy(&source);
-                return false;
-            }
-        }
-        tinta_str16_destroy(&source);
-        if (!wic_bitmap(app, path.data, &bitmap_source, &width, &height) ||
-            !width || !height) {
-            tinta_str16_destroy(&path);
-            return layout_image_placeholder(app, element, y, left);
-        }
-        tinta_str16_destroy(&path);
-    }
-    if (app->max_image_pixels && (uint64_t)width * height > app->max_image_pixels) {
-        IWICBitmapSource_Release(bitmap_source);
+    resource = TINTA_VEC_PTR(
+        TintaImageResource, app->image_resources, resource_index);
+    if (!resource->source || !resource->width || !resource->height)
         return layout_image_placeholder(app, element, y, left);
-    }
-    ratio = minf(1, (right - left) / width);
-    item.source = bitmap_source; item.bitmap = NULL;
+    ratio = minf(1, (right - left) / resource->width);
+    item.resource_index = resource_index;
     item.rect.left = (LONG)left; item.rect.top = (LONG)*y;
-    item.rect.right = (LONG)(left + width * ratio); item.rect.bottom = (LONG)(*y + height * ratio);
-    if (!tinta_vec_push(&app->bitmaps, &item)) { IWICBitmapSource_Release(bitmap_source); return false; }
+    item.rect.right = (LONG)(left + resource->width * ratio);
+    item.rect.bottom = (LONG)(*y + resource->height * ratio);
+    if (!tinta_vec_push(&app->bitmaps, &item)) return false;
     app->content_width = maxf(app->content_width, (float)item.rect.right);
     *y = (float)item.rect.bottom + scale(app, 16); return true;
 }
@@ -2007,16 +1917,21 @@ void tinta_render(TintaApp *app) {
         }
         for (i = 0; i < app->bitmaps.len; i++) {
             TintaDrawBitmap *item = TINTA_VEC_PTR(TintaDrawBitmap, app->bitmaps, i);
+            TintaImageResource *resource;
             D2D1_RECT_F destination = {vx + item->rect.left,
                                        item->rect.top - scroll,
                                        vx + item->rect.right,
                                        item->rect.bottom - scroll};
-            if (!item->bitmap)
+            if (item->resource_index >= app->image_resources.len) continue;
+            resource = TINTA_VEC_PTR(TintaImageResource,
+                app->image_resources, item->resource_index);
+            if (!resource->bitmap && resource->source)
                 app->render_target->lpVtbl->CreateBitmapFromWicBitmap(
-                    app->render_target, item->source, NULL, &item->bitmap);
-            if (item->bitmap)
+                    app->render_target, resource->source, NULL,
+                    &resource->bitmap);
+            if (resource->bitmap)
                 app->render_target->lpVtbl->DrawBitmap(
-                    app->render_target, item->bitmap, &destination, 1.0f,
+                    app->render_target, resource->bitmap, &destination, 1.0f,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
         }
         if (app->search_query.len && app->viewer_search_matches.len) {

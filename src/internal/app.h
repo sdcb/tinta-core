@@ -20,6 +20,7 @@ extern "C" {
 #define TINTA_TIMER_NOTIFICATION 3
 #define TINTA_TIMER_CURSOR 4
 #define TINTA_TIMER_ZOOM_APPLY 5
+#define TINTA_TIMER_STREAM 6
 #define TINTA_WM_LAYOUT_CHUNK (WM_APP + 1)
 #define TINTA_WM_IMAGE_READY (WM_APP + 2)
 #define TINTA_WM_UIA_INVOKE (WM_APP + 3)
@@ -103,8 +104,7 @@ typedef struct TintaDrawLine {
 } TintaDrawLine;
 
 typedef struct TintaDrawBitmap {
-    IWICBitmapSource *source;
-    ID2D1Bitmap *bitmap;
+    size_t resource_index;
     RECT rect;
 } TintaDrawBitmap;
 
@@ -120,11 +120,16 @@ typedef struct TintaHeading {
     float y;
 } TintaHeading;
 
-typedef struct TintaRemoteImage {
-    char *url;
+typedef struct TintaImageResource {
+    char *key;
+    wchar_t *resolved_uri;
     IWICBitmapSource *source;
+    ID2D1Bitmap *bitmap;
+    UINT width;
+    UINT height;
+    bool remote;
     int state;
-} TintaRemoteImage;
+} TintaImageResource;
 
 typedef enum TintaNoticeKind {
     TINTA_NOTICE_NONE,
@@ -216,7 +221,7 @@ struct TintaApp {
     TintaVec viewer_search_matches;
     int viewer_search_index;
     TintaStr16 search_query;
-    TintaVec remote_images;
+    TintaVec image_resources;
     TintaVec worker_handles;
     SRWLOCK remote_results_lock;
     TintaVec remote_results;
@@ -264,6 +269,8 @@ bool tinta_get_clipboard_text(HWND owner, TintaStr16 *output);
 
 bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *settings);
 void tinta_app_destroy(TintaApp *app);
+bool tinta_shared_graphics_initialize(void);
+void tinta_shared_graphics_uninitialize(void);
 bool tinta_app_create_device(TintaApp *app);
 void tinta_app_discard_device(TintaApp *app);
 bool tinta_app_update_formats(TintaApp *app);
@@ -272,6 +279,9 @@ void tinta_draw_text_layout(TintaApp *app, D2D1_POINT_2F origin,
                             D2D1_DRAW_TEXT_OPTIONS options);
 bool tinta_app_load_source(TintaApp *app, const char *source, size_t length,
                            const wchar_t *path);
+bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
+                             const wchar_t *path, bool new_document);
+void tinta_app_clear_image_resources(TintaApp *app);
 
 void tinta_layout_clear(TintaApp *app);
 bool tinta_layout_document(TintaApp *app);
@@ -297,9 +307,9 @@ void tinta_search_next(TintaApp *app);
 void tinta_viewer_update_search(TintaApp *app);
 bool tinta_jump_to_internal_link(TintaApp *app, const char *url);
 
-IWICBitmapSource *tinta_remote_image_request(TintaApp *app, const char *url,
-                                             bool *failed);
-void tinta_remote_image_complete(TintaApp *app);
+bool tinta_image_resource_get(TintaApp *app, const char *url,
+                              size_t *resource_index, bool *ready);
+bool tinta_remote_image_complete(TintaApp *app);
 
 #ifdef __cplusplus
 }

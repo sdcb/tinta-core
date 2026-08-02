@@ -27,6 +27,11 @@ typedef struct RemoteResult {
     bool success;
 } RemoteResult;
 
+static SRWLOCK g_graphics_lock = SRWLOCK_INIT;
+static ID2D1Factory *g_d2d_factory;
+static IDWriteFactory *g_dwrite_factory;
+static IDWriteFontFallback *g_font_fallback;
+
 static void remote_result_destroy(RemoteResult *result) {
     if (!result) return;
     free(result->pixels);
@@ -178,15 +183,17 @@ static void release_text_format(IDWriteTextFormat **value) {
     if (*value) { (*value)->lpVtbl->Release(*value); *value = NULL; }
 }
 
-static void remote_images_clear(TintaApp *app) {
+void tinta_app_clear_image_resources(TintaApp *app) {
     size_t i;
-    for (i = 0; i < app->remote_images.len; i++) {
-        TintaRemoteImage *image = TINTA_VEC_PTR(
-            TintaRemoteImage, app->remote_images, i);
-        free(image->url);
+    for (i = 0; i < app->image_resources.len; i++) {
+        TintaImageResource *image = TINTA_VEC_PTR(
+            TintaImageResource, app->image_resources, i);
+        free(image->key);
+        free(image->resolved_uri);
         if (image->source) IWICBitmapSource_Release(image->source);
+        if (image->bitmap) image->bitmap->lpVtbl->Release(image->bitmap);
     }
-    tinta_vec_clear(&app->remote_images);
+    tinta_vec_clear(&app->image_resources);
 }
 
 static IDWriteTextFormat *create_format(TintaApp *app, const wchar_t *family,
@@ -205,7 +212,8 @@ static IDWriteTextFormat *create_format(TintaApp *app, const wchar_t *family,
     return SUCCEEDED(hr) ? format : NULL;
 }
 
-static void create_font_fallback(TintaApp *app) {
+static void create_font_fallback(IDWriteFactory *dwrite_factory,
+                                 IDWriteFontFallback **font_fallback) {
     IDWriteFactory2 *factory2 = NULL;
     IDWriteFontFallbackBuilder *builder = NULL;
     IDWriteFontFallback *system_fallback = NULL;
@@ -230,8 +238,8 @@ static void create_font_fallback(TintaApp *app) {
         {0xff00, 0xff64}, {0xffa0, 0xffef}, {0x20000, 0x2fa1f}
     };
     TintaDWriteUnicodeRange full_range = {0, 0x10ffff};
-    if (FAILED(app->dwrite_factory->lpVtbl->QueryInterface(
-            app->dwrite_factory, &TINTA_IID_IDWRITE_FACTORY2,
+    if (FAILED(dwrite_factory->lpVtbl->QueryInterface(
+            dwrite_factory, &TINTA_IID_IDWRITE_FACTORY2,
             (void **)&factory2))) return;
     if (SUCCEEDED(factory2->lpVtbl->CreateFontFallbackBuilder(factory2, &builder))) {
         builder->lpVtbl->AddMapping(builder, jp_ranges, 7, jp_families, 3,
@@ -247,10 +255,75 @@ static void create_font_fallback(TintaApp *app) {
             builder->lpVtbl->AddMappings(builder, system_fallback);
             system_fallback->lpVtbl->Release(system_fallback);
         }
-        builder->lpVtbl->CreateFontFallback(builder, &app->font_fallback);
+        builder->lpVtbl->CreateFontFallback(builder, font_fallback);
         builder->lpVtbl->Release(builder);
     }
     factory2->lpVtbl->Release(factory2);
+}
+
+bool tinta_shared_graphics_initialize(void) {
+    HRESULT hr = S_OK;
+    AcquireSRWLockExclusive(&g_graphics_lock);
+    if (!g_d2d_factory) {
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED,
+            &IID_ID2D1Factory, NULL, (void **)&g_d2d_factory);
+        if (SUCCEEDED(hr))
+            hr = DWriteCreateFactory(TINTA_DWRITE_FACTORY_TYPE_SHARED,
+                &TINTA_IID_IDWRITE_FACTORY,
+                (IUnknown **)&g_dwrite_factory);
+        if (SUCCEEDED(hr))
+            create_font_fallback(g_dwrite_factory, &g_font_fallback);
+        if (FAILED(hr)) {
+            if (g_font_fallback) {
+                g_font_fallback->lpVtbl->Release(g_font_fallback);
+                g_font_fallback = NULL;
+            }
+            if (g_dwrite_factory) {
+                g_dwrite_factory->lpVtbl->Release(g_dwrite_factory);
+                g_dwrite_factory = NULL;
+            }
+            if (g_d2d_factory) {
+                g_d2d_factory->lpVtbl->Release(g_d2d_factory);
+                g_d2d_factory = NULL;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_graphics_lock);
+    return SUCCEEDED(hr);
+}
+
+void tinta_shared_graphics_uninitialize(void) {
+    AcquireSRWLockExclusive(&g_graphics_lock);
+    if (g_font_fallback) {
+        g_font_fallback->lpVtbl->Release(g_font_fallback);
+        g_font_fallback = NULL;
+    }
+    if (g_dwrite_factory) {
+        g_dwrite_factory->lpVtbl->Release(g_dwrite_factory);
+        g_dwrite_factory = NULL;
+    }
+    if (g_d2d_factory) {
+        g_d2d_factory->lpVtbl->Release(g_d2d_factory);
+        g_d2d_factory = NULL;
+    }
+    ReleaseSRWLockExclusive(&g_graphics_lock);
+}
+
+static bool acquire_shared_graphics(TintaApp *app) {
+    bool result = false;
+    AcquireSRWLockShared(&g_graphics_lock);
+    if (g_d2d_factory && g_dwrite_factory) {
+        g_d2d_factory->lpVtbl->AddRef(g_d2d_factory);
+        g_dwrite_factory->lpVtbl->AddRef(g_dwrite_factory);
+        if (g_font_fallback)
+            g_font_fallback->lpVtbl->AddRef(g_font_fallback);
+        app->d2d_factory = g_d2d_factory;
+        app->dwrite_factory = g_dwrite_factory;
+        app->font_fallback = g_font_fallback;
+        result = true;
+    }
+    ReleaseSRWLockShared(&g_graphics_lock);
+    return result;
 }
 
 static void configure_text_rendering(TintaApp *app) {
@@ -378,9 +451,13 @@ bool tinta_app_create_device(TintaApp *app) {
 
 void tinta_app_discard_device(TintaApp *app) {
     size_t i;
-    for (i = 0; i < app->bitmaps.len; i++) {
-        TintaDrawBitmap *item = TINTA_VEC_PTR(TintaDrawBitmap, app->bitmaps, i);
-        if (item->bitmap) { item->bitmap->lpVtbl->Release(item->bitmap); item->bitmap = NULL; }
+    for (i = 0; i < app->image_resources.len; i++) {
+        TintaImageResource *item = TINTA_VEC_PTR(
+            TintaImageResource, app->image_resources, i);
+        if (item->bitmap) {
+            item->bitmap->lpVtbl->Release(item->bitmap);
+            item->bitmap = NULL;
+        }
     }
     if (app->brush) { app->brush->lpVtbl->Release(app->brush); app->brush = NULL; }
     if (app->device_context) {
@@ -427,7 +504,7 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->scroll_anchors, sizeof(TintaScrollAnchor));
     tinta_vec_init(&app->hit_entries, sizeof(TintaHitEntry));
     app->hit_index_dirty = true;
-    tinta_vec_init(&app->remote_images, sizeof(TintaRemoteImage));
+    tinta_vec_init(&app->image_resources, sizeof(TintaImageResource));
     tinta_vec_init(&app->worker_handles, sizeof(HANDLE));
     InitializeSRWLock(&app->remote_results_lock);
     tinta_vec_init(&app->remote_results, sizeof(RemoteResult *));
@@ -436,20 +513,10 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
     app->com_initialized = SUCCEEDED(hr);
-    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                           &IID_ID2D1Factory, NULL, (void **)&app->d2d_factory);
-    if (FAILED(hr)) {
+    if (!acquire_shared_graphics(app)) {
         tinta_app_destroy(app);
         return false;
     }
-    hr = DWriteCreateFactory(TINTA_DWRITE_FACTORY_TYPE_SHARED,
-                             &TINTA_IID_IDWRITE_FACTORY,
-                             (IUnknown **)&app->dwrite_factory);
-    if (FAILED(hr)) {
-        tinta_app_destroy(app);
-        return false;
-    }
-    create_font_fallback(app);
     hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
                           &IID_IWICImagingFactory, (void **)&app->wic_factory);
     if (FAILED(hr)) {
@@ -468,10 +535,10 @@ void tinta_app_destroy(TintaApp *app) {
         WaitForSingleObject(handle,INFINITE); CloseHandle(handle);
     }
     remote_results_clear(app);
-    remote_images_clear(app);
+    tinta_app_clear_image_resources(app);
     tinta_layout_clear(app);
     tinta_parse_result_destroy(&app->document);
-    tinta_vec_destroy(&app->remote_images);
+    tinta_vec_destroy(&app->image_resources);
     tinta_vec_destroy(&app->worker_handles);
     tinta_vec_destroy(&app->remote_results);
     tinta_vec_destroy(&app->viewer_search_matches);
@@ -589,108 +656,183 @@ static void reap_worker_handles(TintaApp *app) {
     }
 }
 
-static IWICBitmapSource *remote_image_request_failed(TintaApp *app,
-                                                     size_t image_index,
-                                                     bool *failed) {
-    TINTA_VEC_AT(TintaRemoteImage, app->remote_images, image_index).state = -1;
-    if (failed) *failed = true;
-    return NULL;
+static bool decode_local_image(TintaApp *app, TintaImageResource *image) {
+    IWICBitmapDecoder *decoder = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICFormatConverter *converter = NULL;
+    HRESULT hr = IWICImagingFactory_CreateDecoderFromFilename(
+        app->wic_factory, image->resolved_uri, NULL, GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+    if (SUCCEEDED(hr))
+        hr = IWICBitmapFrameDecode_GetSize(frame, &image->width, &image->height);
+    if (SUCCEEDED(hr) && (!image->width || !image->height ||
+        (app->max_image_pixels &&
+         (uint64_t)image->width * image->height > app->max_image_pixels)))
+        hr = E_FAIL;
+    if (SUCCEEDED(hr))
+        hr = IWICImagingFactory_CreateFormatConverter(
+            app->wic_factory, &converter);
+    if (SUCCEEDED(hr))
+        hr = IWICFormatConverter_Initialize(
+            converter, (IWICBitmapSource *)frame,
+            &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+            NULL, 0, WICBitmapPaletteTypeCustom);
+    if (SUCCEEDED(hr)) {
+        image->source = (IWICBitmapSource *)converter;
+        converter = NULL;
+        image->state = 2;
+    } else {
+        image->state = -1;
+    }
+    if (converter) IWICFormatConverter_Release(converter);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (decoder) IWICBitmapDecoder_Release(decoder);
+    return image->state == 2;
 }
 
-IWICBitmapSource *tinta_remote_image_request(TintaApp *app, const char *url,
-                                             bool *failed) {
-    size_t i;
-    size_t image_index;
-    TintaRemoteImage image = {0};
-    RemoteWork *work = NULL;
+static bool start_remote_image(TintaApp *app, size_t image_index) {
+    TintaImageResource *image;
+    RemoteWork *work;
     uintptr_t thread;
-    TintaStr16 wide = {0};
     HANDLE handle;
-    if (!app || !url) {
-        if (failed) *failed = true;
-        return NULL;
-    }
     reap_worker_handles(app);
-    if (failed) *failed = false;
-    for (i = 0; i < app->remote_images.len; i++) {
-        TintaRemoteImage *cached = TINTA_VEC_PTR(
-            TintaRemoteImage, app->remote_images, i);
-        if (!strcmp(cached->url, url)) {
-            if (failed) *failed = cached->state < 0;
-            return cached->state > 0 ? cached->source : NULL;
-        }
-    }
+    if (image_index >= app->image_resources.len) return false;
+    image = TINTA_VEC_PTR(TintaImageResource, app->image_resources, image_index);
+    if (image->state != 0) return image->state > 0;
     if (app->max_concurrent_downloads &&
         app->worker_handles.len >= app->max_concurrent_downloads)
-        return NULL;
-    image.url = tinta_str8_dup(url, strlen(url));
-    if (!image.url || !tinta_vec_push(&app->remote_images, &image)) {
-        free(image.url);
-        if (failed) *failed = true;
-        return NULL;
-    }
-    image_index = app->remote_images.len - 1;
+        return true;
     if (!tinta_vec_reserve(&app->worker_handles,
-                           app->worker_handles.len + 1))
-        return remote_image_request_failed(app, image_index, failed);
+                           app->worker_handles.len + 1)) {
+        image->state = -1;
+        return false;
+    }
     work = (RemoteWork *)calloc(1, sizeof(*work));
-    if (!work || !tinta_utf8_to_utf16(url, strlen(url), &wide)) {
-        free(work);
-        tinta_str16_destroy(&wide);
-        return remote_image_request_failed(app, image_index, failed);
+    if (!work) {
+        image->state = -1;
+        return false;
     }
     work->app = app;
     work->index = image_index;
     work->generation = InterlockedCompareExchange(
         &app->document_generation, 0, 0);
-    work->url = tinta_wcsdup_n(wide.data, wide.len);
-    tinta_str16_destroy(&wide);
+    work->url = tinta_wcsdup_n(image->resolved_uri,
+                               wcslen(image->resolved_uri));
     if (!work->url) {
         free(work);
-        return remote_image_request_failed(app, image_index, failed);
+        image->state = -1;
+        return false;
     }
+    image->state = 1;
     thread = _beginthreadex(NULL, 0, remote_worker, work, 0, NULL);
     if (!thread) {
+        image->state = -1;
         free(work->url);
         free(work);
-        return remote_image_request_failed(app, image_index, failed);
+        return false;
     }
     handle = (HANDLE)thread;
-    tinta_vec_push(&app->worker_handles, &handle);
-    return NULL;
+    if (!tinta_vec_push(&app->worker_handles, &handle)) {
+        CloseHandle(handle);
+    }
+    return true;
 }
 
-void tinta_remote_image_complete(TintaApp *app) {
+bool tinta_image_resource_get(TintaApp *app, const char *url,
+                              size_t *resource_index, bool *ready) {
+    size_t i;
+    TintaImageResource image = {0};
+    TintaStr16 resolved = {0};
+    bool remote = false;
+    bool blocked = false;
+    if (!app || !url || !resource_index || !ready) return false;
+    *ready = false;
+    for (i = 0; i < app->image_resources.len; i++) {
+        TintaImageResource *cached = TINTA_VEC_PTR(
+            TintaImageResource, app->image_resources, i);
+        if (!strcmp(cached->key, url)) {
+            if (cached->remote && cached->state == 0)
+                start_remote_image(app, i);
+            *resource_index = i;
+            *ready = cached->state == 2;
+            return true;
+        }
+    }
+    if (app->max_image_resources &&
+        app->image_resources.len >= app->max_image_resources)
+        return true;
+    if (app->resolve_image) {
+        if (!app->resolve_image(app, url, &resolved, &remote, &blocked))
+            return false;
+    } else {
+        if (!tinta_utf8_to_utf16(url, strlen(url), &resolved)) return false;
+        remote = !_strnicmp(url, "http://", 7) ||
+                 !_strnicmp(url, "https://", 8);
+    }
+    image.key = tinta_str8_dup(url, strlen(url));
+    image.resolved_uri = resolved.data ?
+        tinta_wcsdup_n(resolved.data, resolved.len) : NULL;
+    image.remote = remote;
+    image.state = blocked || !image.resolved_uri ? -1 : 0;
+    tinta_str16_destroy(&resolved);
+    if (!image.key || (!blocked && !image.resolved_uri) ||
+        !tinta_vec_push(&app->image_resources, &image)) {
+        free(image.key);
+        free(image.resolved_uri);
+        return false;
+    }
+    i = app->image_resources.len - 1;
+    *resource_index = i;
+    if (image.state == 0) {
+        TintaImageResource *stored = TINTA_VEC_PTR(
+            TintaImageResource, app->image_resources, i);
+        if (stored->remote) start_remote_image(app, i);
+        else decode_local_image(app, stored);
+        *ready = stored->state == 2;
+    }
+    return true;
+}
+
+bool tinta_remote_image_complete(TintaApp *app) {
     RemoteResult *result;
+    bool changed = false;
     while ((result = remote_result_dequeue(app)) != NULL) {
         if (result->generation == InterlockedCompareExchange(
                 &app->document_generation, 0, 0) &&
-            result->index < app->remote_images.len) {
-            TintaRemoteImage *image = TINTA_VEC_PTR(
-                TintaRemoteImage, app->remote_images, result->index);
+            result->index < app->image_resources.len) {
+            TintaImageResource *image = TINTA_VEC_PTR(
+                TintaImageResource, app->image_resources, result->index);
             IWICBitmap *bitmap = NULL;
             if (result->success && result->pixels &&
+                (!app->max_image_pixels ||
+                 (uint64_t)result->width * result->height <=
+                    app->max_image_pixels) &&
                 SUCCEEDED(IWICImagingFactory_CreateBitmapFromMemory(
                     app->wic_factory, result->width, result->height,
                     &GUID_WICPixelFormat32bppPBGRA, result->stride,
                     result->buffer_size, result->pixels, &bitmap))) {
                 if (image->source) IWICBitmapSource_Release(image->source);
                 image->source = (IWICBitmapSource *)bitmap;
-                image->state = 1;
+                image->width = result->width;
+                image->height = result->height;
+                image->state = 2;
             } else {
                 image->state = -1;
             }
             app->layout_dirty = true;
             InvalidateRect(app->hwnd, NULL, FALSE);
+            changed = true;
         }
         remote_result_destroy(result);
     }
     reap_worker_handles(app);
+    return changed;
 }
 
 
-bool tinta_app_load_source(TintaApp *app, const char *source, size_t length,
-                           const wchar_t *path) {
+bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
+                             const wchar_t *path, bool new_document) {
     TintaStr8 path8 = {0};
     TintaStr8 new_source = {0};
     TintaStr16 new_file = {0};
@@ -743,16 +885,25 @@ bool tinta_app_load_source(TintaApp *app, const char *source, size_t length,
     app->source = new_source;
     tinta_str16_destroy(&app->current_file);
     app->current_file = new_file;
-    InterlockedIncrement(&app->document_generation);
-    remote_images_clear(app);
+    if (new_document) {
+        InterlockedIncrement(&app->document_generation);
+        tinta_app_clear_image_resources(app);
+    }
     app->layout_dirty = true;
     app->focus_mermaid_on_next_layout = focus_mermaid;
-    app->scroll_y = 0;
-    app->scroll_x = 0;
-    app->selection_anchor = 0;
-    app->selection_focus = 0;
-    app->viewer_search_index = -1;
-    tinta_vec_clear(&app->viewer_search_matches);
+    if (new_document) {
+        app->scroll_y = 0;
+        app->scroll_x = 0;
+        app->selection_anchor = 0;
+        app->selection_focus = 0;
+        app->viewer_search_index = -1;
+        tinta_vec_clear(&app->viewer_search_matches);
+    }
     InvalidateRect(app->hwnd, NULL, FALSE);
     return true;
+}
+
+bool tinta_app_load_source(TintaApp *app, const char *source, size_t length,
+                           const wchar_t *path) {
+    return tinta_app_update_source(app, source, length, path, true);
 }

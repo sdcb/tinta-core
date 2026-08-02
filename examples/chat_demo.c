@@ -47,8 +47,10 @@ typedef struct ChatApp {
     size_t message_capacity;
     size_t active_message;
     const wchar_t *active_template;
+    char *active_utf8;
+    size_t active_utf8_length;
     size_t stream_position;
-    size_t stream_step;
+    size_t stream_delta;
     size_t next_template;
     UINT next_control_id;
     int scroll_y;
@@ -56,12 +58,17 @@ typedef struct ChatApp {
     int wheel_remainder;
     bool follow_bottom;
     bool streaming;
+    wchar_t stream_base_uri[MAX_PATH * 2];
+    wchar_t local_image_path[MAX_PATH * 2];
 } ChatApp;
 
 static ChatApp g_app;
 
-static const wchar_t ASSISTANT_PREFIX[] = L"**Assistant**\n\n";
 static const wchar_t USER_PREFIX[] = L"**You**\n\n";
+static const char ASSISTANT_STREAM_PREFIX[] =
+    "**Assistant**\n\n"
+    "![Bundled local image](chat-stream.bmp)\n\n"
+    "![Remote image](https://httpbin.org/image/png)\n\n";
 
 static const wchar_t TEMPLATE_WORD[] =
     L"# Word Explorer: `serendipity`\n\n"
@@ -121,6 +128,81 @@ static const wchar_t *const RESPONSE_TEMPLATES[] = {
     TEMPLATE_MERMAID
 };
 
+static void put_u16(unsigned char *data, size_t offset, unsigned int value) {
+    data[offset] = (unsigned char)value;
+    data[offset + 1] = (unsigned char)(value >> 8);
+}
+
+static void put_u32(unsigned char *data, size_t offset, unsigned long value) {
+    data[offset] = (unsigned char)value;
+    data[offset + 1] = (unsigned char)(value >> 8);
+    data[offset + 2] = (unsigned char)(value >> 16);
+    data[offset + 3] = (unsigned char)(value >> 24);
+}
+
+static bool write_all(HANDLE file, const void *data, DWORD length) {
+    const unsigned char *bytes = (const unsigned char *)data;
+    while (length) {
+        DWORD written = 0;
+        if (!WriteFile(file, bytes, length, &written, NULL) || !written)
+            return false;
+        bytes += written;
+        length -= written;
+    }
+    return true;
+}
+
+static bool prepare_local_image(void) {
+    enum { WIDTH = 96, HEIGHT = 48, ROW_BYTES = WIDTH * 3 };
+    wchar_t temporary[MAX_PATH];
+    wchar_t directory[MAX_PATH * 2];
+    unsigned char header[54] = {0};
+    unsigned char row[ROW_BYTES];
+    HANDLE file;
+    int y;
+    if (!GetTempPathW(_countof(temporary), temporary)) return false;
+    _snwprintf_s(directory, _countof(directory), _TRUNCATE,
+                 L"%sTintaCoreChatDemo", temporary);
+    if (!CreateDirectoryW(directory, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    _snwprintf_s(g_app.local_image_path, _countof(g_app.local_image_path),
+                 _TRUNCATE, L"%s\\chat-stream.bmp", directory);
+    _snwprintf_s(g_app.stream_base_uri, _countof(g_app.stream_base_uri),
+                 _TRUNCATE, L"%s\\chat.md", directory);
+    file = CreateFileW(g_app.local_image_path, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    header[0] = 'B';
+    header[1] = 'M';
+    put_u32(header, 2, 54 + ROW_BYTES * HEIGHT);
+    put_u32(header, 10, 54);
+    put_u32(header, 14, 40);
+    put_u32(header, 18, WIDTH);
+    put_u32(header, 22, HEIGHT);
+    put_u16(header, 26, 1);
+    put_u16(header, 28, 24);
+    put_u32(header, 34, ROW_BYTES * HEIGHT);
+    if (!write_all(file, header, sizeof(header))) {
+        CloseHandle(file);
+        return false;
+    }
+    for (y = 0; y < HEIGHT; y++) {
+        int x;
+        for (x = 0; x < WIDTH; x++) {
+            row[x * 3] = (unsigned char)(80 + x);
+            row[x * 3 + 1] = (unsigned char)(70 + y * 3);
+            row[x * 3 + 2] = (unsigned char)(220 - x);
+        }
+        if (!write_all(file, row, sizeof(row))) {
+            CloseHandle(file);
+            return false;
+        }
+    }
+    CloseHandle(file);
+    return true;
+}
+
 static int scale_value(HWND hwnd, int value) {
     return MulDiv(value, (int)GetDpiForWindow(hwnd), 96);
 }
@@ -167,18 +249,6 @@ static bool assign_markdown(ChatMessage *message, const wchar_t *text) {
     if (length) memcpy(message->markdown, text, length * sizeof(*text));
     message->markdown[length] = 0;
     message->length = length;
-    return true;
-}
-
-static bool append_markdown(ChatMessage *message, const wchar_t *text,
-                            size_t length) {
-    if (!reserve_markdown(message, message->length + length + 1)) return false;
-    if (length) {
-        memcpy(message->markdown + message->length, text,
-               length * sizeof(*text));
-    }
-    message->length += length;
-    message->markdown[message->length] = 0;
     return true;
 }
 
@@ -309,6 +379,18 @@ static void size_message_to_content(ChatMessage *message) {
     layout_history(false);
 }
 
+static void size_message_from_content(ChatMessage *message,
+                                      const TintaContentSize *size) {
+    int height;
+    if (!message || !size) return;
+    height = maximum_int(scale_value(message->view, 68),
+                         (int)(size->height + 1.999f));
+    if (height == message->height) return;
+    message->height = height;
+    update_round_region(message);
+    layout_history(false);
+}
+
 static void apply_message_theme(HWND view, ChatRole role) {
     TintaThemeSpec theme;
     memset(&theme, 0, sizeof(theme));
@@ -358,9 +440,7 @@ static void configure_message_options(HWND view) {
     memset(&options, 0, sizeof(options));
     options.cb_size = sizeof(options);
     if (!SendMessageW(view, TMM_GETOPTIONS, 0, (LPARAM)&options)) return;
-    options.flags &= ~(TINTA_OPTION_LOCAL_IMAGES |
-                       TINTA_OPTION_REMOTE_IMAGES |
-                       TINTA_OPTION_MOUSE_ZOOM);
+    options.flags &= ~TINTA_OPTION_MOUSE_ZOOM;
     SendMessageW(view, TMM_SETOPTIONS, 0, (LPARAM)&options);
 }
 
@@ -409,7 +489,7 @@ static ChatMessage *create_message(ChatRole role, const wchar_t *markdown) {
     configure_message_options(view);
     apply_message_theme(view, role);
     update_round_region(message);
-    SetWindowTextW(view, message->markdown);
+    if (role == CHAT_ROLE_USER) SetWindowTextW(view, message->markdown);
     layout_history(true);
     return message;
 }
@@ -470,51 +550,105 @@ static void finish_stream(void) {
     KillTimer(g_app.main_window, TIMER_STREAM);
     g_app.streaming = false;
     g_app.active_template = NULL;
+    free(g_app.active_utf8);
+    g_app.active_utf8 = NULL;
+    g_app.active_utf8_length = 0;
     EnableWindow(g_app.send, TRUE);
 }
 
 static void stream_next_chunk(void) {
-    static const size_t chunk_sizes[] = {5, 9, 4, 12, 7, 15, 6, 11};
     ChatMessage *message;
-    size_t total;
-    size_t remaining;
-    size_t count;
-    if (!g_app.streaming || !g_app.active_template ||
+    size_t end;
+    TintaStreamChunk chunk;
+    if (!g_app.streaming || !g_app.active_utf8 ||
         g_app.active_message >= g_app.message_count) {
         finish_stream();
         return;
     }
     message = &g_app.messages[g_app.active_message];
-    total = wcslen(g_app.active_template);
-    remaining = total - g_app.stream_position;
-    count = chunk_sizes[g_app.stream_step % _countof(chunk_sizes)];
-    if (count > remaining) count = remaining;
-    if (!append_markdown(message,
-            g_app.active_template + g_app.stream_position, count)) {
+    if (g_app.stream_delta >= 128) {
+        if (!SendMessageW(message->view, TMM_STREAM_END, 0, 0))
+            SendMessageW(message->view, TMM_STREAM_CANCEL, 0, 0);
+        finish_stream();
+        return;
+    }
+    end = g_app.stream_delta == 127 ? g_app.active_utf8_length :
+        (g_app.active_utf8_length * (g_app.stream_delta + 1)) / 128;
+    while (end < g_app.active_utf8_length &&
+           ((unsigned char)g_app.active_utf8[end] & 0xc0) == 0x80)
+        end++;
+    if (end <= g_app.stream_position) {
+        end = g_app.stream_position + 1;
+        while (end < g_app.active_utf8_length &&
+               ((unsigned char)g_app.active_utf8[end] & 0xc0) == 0x80)
+            end++;
+    }
+    memset(&chunk, 0, sizeof(chunk));
+    chunk.cb_size = sizeof(chunk);
+    chunk.utf8 = g_app.active_utf8 + g_app.stream_position;
+    chunk.utf8_length = end - g_app.stream_position;
+    if (!SendMessageW(message->view, TMM_STREAM_APPEND, 0, (LPARAM)&chunk)) {
+        SendMessageW(message->view, TMM_STREAM_CANCEL, 0, 0);
         MessageBoxW(g_app.main_window, L"Unable to append the demo response.",
                     L"Tinta Core Chat Demo", MB_OK | MB_ICONERROR);
         finish_stream();
         return;
     }
-    g_app.stream_position += count;
-    g_app.stream_step++;
-    SetWindowTextW(message->view, message->markdown);
-    if (g_app.stream_position >= total) finish_stream();
+    g_app.stream_position = end;
+    g_app.stream_delta++;
+}
+
+static char *utf8_from_wide(const wchar_t *text, size_t *length) {
+    int required;
+    char *result;
+    required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1,
+                                   NULL, 0, NULL, NULL);
+    if (required <= 1) return NULL;
+    result = (char *)malloc((size_t)required);
+    if (!result) return NULL;
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1,
+                             result, required, NULL, NULL)) {
+        free(result);
+        return NULL;
+    }
+    *length = (size_t)required - 1;
+    return result;
 }
 
 static bool begin_assistant_response(void) {
+    TintaStreamBegin begin;
+    TintaStreamChunk prefix;
     ChatMessage *assistant = create_message(
-        CHAT_ROLE_ASSISTANT, ASSISTANT_PREFIX);
+        CHAT_ROLE_ASSISTANT, L"");
     if (!assistant) return false;
     g_app.active_message = g_app.message_count - 1;
     g_app.active_template = RESPONSE_TEMPLATES[g_app.next_template];
     g_app.next_template = (g_app.next_template + 1) %
         _countof(RESPONSE_TEMPLATES);
+    g_app.active_utf8 = utf8_from_wide(
+        g_app.active_template, &g_app.active_utf8_length);
+    if (!g_app.active_utf8 || g_app.active_utf8_length < 128) return false;
+    memset(&begin, 0, sizeof(begin));
+    begin.cb_size = sizeof(begin);
+    begin.base_uri = g_app.stream_base_uri;
+    begin.format = TINTA_FORMAT_MARKDOWN;
+    begin.refresh_interval_ms = 0;
+    if (!SendMessageW(assistant->view, TMM_STREAM_BEGIN, 0, (LPARAM)&begin))
+        return false;
+    memset(&prefix, 0, sizeof(prefix));
+    prefix.cb_size = sizeof(prefix);
+    prefix.utf8 = ASSISTANT_STREAM_PREFIX;
+    prefix.utf8_length = strlen(ASSISTANT_STREAM_PREFIX);
+    if (!SendMessageW(assistant->view, TMM_STREAM_APPEND, 0,
+                      (LPARAM)&prefix)) {
+        SendMessageW(assistant->view, TMM_STREAM_CANCEL, 0, 0);
+        return false;
+    }
     g_app.stream_position = 0;
-    g_app.stream_step = 0;
+    g_app.stream_delta = 0;
     g_app.streaming = true;
     EnableWindow(g_app.send, FALSE);
-    return SetTimer(g_app.main_window, TIMER_STREAM, 50, NULL) != 0;
+    return SetTimer(g_app.main_window, TIMER_STREAM, 20, NULL) != 0;
 }
 
 static void send_input(void) {
@@ -576,6 +710,20 @@ static LRESULT handle_history_notify(LPARAM lparam) {
         size_message_to_content(find_message(header->hwndFrom));
         return TRUE;
     }
+    if (header->code == TMN_STREAMUPDATED) {
+        const TintaStreamUpdateNotify *update =
+            (const TintaStreamUpdateNotify *)header;
+        size_message_from_content(find_message(header->hwndFrom),
+                                  &update->content_size);
+        return TRUE;
+    }
+    if (header->code == TMN_CONTENTUPDATED) {
+        const TintaContentUpdateNotify *update =
+            (const TintaContentUpdateNotify *)header;
+        size_message_from_content(find_message(header->hwndFrom),
+                                  &update->content_size);
+        return TRUE;
+    }
     if (header->code == TMN_LINKACTIVATE) {
         const TintaLinkNotify *link = (const TintaLinkNotify *)header;
         wchar_t text[1200];
@@ -584,7 +732,7 @@ static LRESULT handle_history_notify(LPARAM lparam) {
         MessageBoxW(g_app.main_window, text, L"Tinta Core Chat Demo", MB_OK);
         return TRUE;
     }
-    if (header->code == TMN_RESOURCEOPENING) return TINTA_RESOURCE_BLOCK;
+    if (header->code == TMN_RESOURCEOPENING) return TINTA_RESOURCE_DEFAULT;
     if (header->code == TMN_REQUESTFIND) {
         MessageBeep(MB_OK);
         return TRUE;
@@ -782,6 +930,8 @@ static void cleanup_app(void) {
     for (index = 0; index < g_app.message_count; index++)
         free(g_app.messages[index].markdown);
     free(g_app.messages);
+    free(g_app.active_utf8);
+    if (g_app.local_image_path[0]) DeleteFileW(g_app.local_image_path);
     if (g_app.ui_font) DeleteObject(g_app.ui_font);
     memset(&g_app, 0, sizeof(g_app));
 }
@@ -801,6 +951,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous,
     SetProcessDPIAware();
     memset(&g_app, 0, sizeof(g_app));
     g_app.instance = instance;
+    if (!prepare_local_image()) return 1;
     common.dwSize = sizeof(common);
     common.dwICC = ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&common);

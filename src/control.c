@@ -25,6 +25,24 @@ typedef struct TintaControl {
     bool use_system_theme;
     bool redraw_enabled;
     bool ready_notified;
+    TintaStr8 stream_buffer;
+    TintaDocumentFormat stream_format;
+    UINT stream_refresh_ms;
+    ULONGLONG stream_next_due;
+    ULONGLONG stream_layout_started;
+    uint64_t stream_revision;
+    uint64_t stream_displayed_revision;
+    size_t stream_complete_length;
+    size_t stream_layout_length;
+    size_t stream_displayed_length;
+    uint32_t stream_utf8_codepoint;
+    uint32_t stream_utf8_minimum;
+    unsigned int stream_utf8_expected;
+    bool stream_active;
+    bool stream_dirty;
+    bool stream_layout_in_flight;
+    bool stream_ending;
+    bool content_update_pending;
 } TintaControl;
 
 static SRWLOCK g_class_lock = SRWLOCK_INIT;
@@ -201,30 +219,186 @@ static bool path_has_extension(const wchar_t *path, const wchar_t *extension) {
            !_wcsicmp(path + path_length - extension_length, extension);
 }
 
+static const wchar_t *control_document_path(TintaControl *control,
+                                             TintaDocumentFormat format,
+                                             TintaStr16 *synthetic) {
+    const wchar_t *path = control->base_uri.len ? control->base_uri.data : NULL;
+    if (format == TINTA_FORMAT_MERMAID &&
+        (!path || !path_has_extension(path, L".mmd"))) {
+        if (!tinta_str16_assign(synthetic, L"document.mmd", 12)) return NULL;
+        path = synthetic->data;
+    } else if (format == TINTA_FORMAT_MARKDOWN &&
+               path && path_has_extension(path, L".mmd")) {
+        if (!tinta_str16_assign(synthetic, L"document.md", 11)) return NULL;
+        path = synthetic->data;
+    }
+    return path;
+}
+
+static void control_stream_stop(TintaControl *control) {
+    if (!control) return;
+    KillTimer(control->view.hwnd, TINTA_TIMER_STREAM);
+    control->stream_active = false;
+    control->stream_dirty = false;
+    control->stream_layout_in_flight = false;
+    control->stream_ending = false;
+    control->stream_utf8_expected = 0;
+}
+
+static bool control_validate_stream_chunk(TintaControl *control,
+                                          const char *bytes, size_t length,
+                                          unsigned int *new_expected,
+                                          uint32_t *new_codepoint,
+                                          uint32_t *new_minimum,
+                                          size_t *new_complete_length) {
+    unsigned int expected = control->stream_utf8_expected;
+    uint32_t codepoint = control->stream_utf8_codepoint;
+    uint32_t minimum = control->stream_utf8_minimum;
+    size_t complete = control->stream_complete_length;
+    size_t index;
+    size_t base = control->stream_buffer.len;
+    for (index = 0; index < length; index++) {
+        unsigned char value = (unsigned char)bytes[index];
+        if (!expected) {
+            if (value <= 0x7f) {
+                complete = base + index + 1;
+            } else if (value >= 0xc2 && value <= 0xdf) {
+                expected = 1;
+                codepoint = value & 0x1f;
+                minimum = 0x80;
+            } else if (value >= 0xe0 && value <= 0xef) {
+                expected = 2;
+                codepoint = value & 0x0f;
+                minimum = 0x800;
+            } else if (value >= 0xf0 && value <= 0xf4) {
+                expected = 3;
+                codepoint = value & 0x07;
+                minimum = 0x10000;
+            } else {
+                return false;
+            }
+        } else {
+            if ((value & 0xc0) != 0x80) return false;
+            codepoint = (codepoint << 6) | (value & 0x3f);
+            expected--;
+            if (!expected) {
+                if (codepoint < minimum || codepoint > 0x10ffff ||
+                    (codepoint >= 0xd800 && codepoint <= 0xdfff))
+                    return false;
+                complete = base + index + 1;
+            }
+        }
+    }
+    *new_expected = expected;
+    *new_codepoint = codepoint;
+    *new_minimum = minimum;
+    *new_complete_length = complete;
+    return true;
+}
+
+static void notify_stream_updated(TintaControl *control) {
+    TintaStreamUpdateNotify notice;
+    memset(&notice, 0, sizeof(notice));
+    notice.hdr.code = TMN_STREAMUPDATED;
+    notice.revision = control->stream_displayed_revision;
+    notice.utf8_length = control->stream_displayed_length;
+    notice.content_size.cb_size = sizeof(notice.content_size);
+    notice.content_size.width = control->view.content_width;
+    notice.content_size.height = control->view.content_height;
+    notify_parent(control, &notice.hdr);
+}
+
+static void notify_content_updated(TintaControl *control) {
+    TintaContentUpdateNotify notice;
+    memset(&notice, 0, sizeof(notice));
+    notice.hdr.code = TMN_CONTENTUPDATED;
+    notice.flags = TINTA_CONTENT_UPDATE_RESOURCE;
+    notice.revision = control->stream_displayed_revision;
+    notice.utf8_length = control->stream_displayed_length;
+    notice.content_size.cb_size = sizeof(notice.content_size);
+    notice.content_size.width = control->view.content_width;
+    notice.content_size.height = control->view.content_height;
+    notify_parent(control, &notice.hdr);
+}
+
+static bool control_stream_flush(TintaControl *control, bool force) {
+    TintaStr16 synthetic = {0};
+    const wchar_t *path;
+    ULONGLONG now;
+    if (!control || !control->stream_active ||
+        control->stream_layout_in_flight || !control->stream_dirty)
+        return true;
+    now = GetTickCount64();
+    if (!force && now < control->stream_next_due) return true;
+    path = control_document_path(control, control->stream_format, &synthetic);
+    if (!tinta_app_update_source(&control->view,
+            control->stream_buffer.data ? control->stream_buffer.data : "",
+            control->stream_complete_length, path, false)) {
+        tinta_str16_destroy(&synthetic);
+        notify_error(control, E_FAIL, L"stream-parse",
+                     L"The streamed Markdown revision could not be parsed.");
+        return false;
+    }
+    tinta_str16_destroy(&synthetic);
+    control->stream_revision++;
+    control->stream_layout_length = control->stream_complete_length;
+    control->stream_layout_in_flight = true;
+    control->stream_dirty = false;
+    control->stream_layout_started = now;
+    control->stream_next_due = now + control->stream_refresh_ms;
+    return true;
+}
+
+static void control_layout_completed(TintaControl *control) {
+    ULONGLONG now;
+    ULONGLONG elapsed;
+    if (!control || !control->view.layout_complete) return;
+    if (control->stream_active && control->stream_layout_in_flight) {
+        now = GetTickCount64();
+        elapsed = now - control->stream_layout_started;
+        control->stream_displayed_revision = control->stream_revision;
+        control->stream_displayed_length = control->stream_layout_length;
+        control->stream_layout_in_flight = false;
+        if (elapsed > control->stream_refresh_ms)
+            control->stream_next_due = now + elapsed;
+        if (control->stream_ending && !control->stream_dirty &&
+            control->stream_displayed_length ==
+                control->stream_complete_length) {
+            control_stream_stop(control);
+            notify_code(control, TMN_DOCUMENTREADY);
+        } else {
+            notify_stream_updated(control);
+            if (control->stream_dirty)
+                control_stream_flush(control, control->stream_ending);
+        }
+        tinta_uia_raise_text_changed(&control->view);
+    } else if (!control->stream_active && !control->ready_notified) {
+        control->ready_notified = true;
+        notify_code(control, TMN_DOCUMENTREADY);
+        tinta_uia_raise_text_changed(&control->view);
+    }
+    if (control->content_update_pending) {
+        control->content_update_pending = false;
+        notify_content_updated(control);
+    }
+}
+
 static bool control_set_document(TintaControl *control,
                                  const char *utf8, size_t length,
                                  const wchar_t *base_uri,
                                  TintaDocumentFormat format) {
     TintaStr16 synthetic = {0};
-    const wchar_t *path = NULL;
+    const wchar_t *path;
     bool result;
     if (!control || (!utf8 && length)) return false;
+    control_stream_stop(control);
     if (length > control->limits.max_document_bytes) {
         notify_error(control, HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE),
                      L"set-document", L"The Markdown document exceeds the configured limit.");
         return false;
     }
     if (base_uri) control_store_base_uri(control, base_uri);
-    if (control->base_uri.len) path = control->base_uri.data;
-    if (format == TINTA_FORMAT_MERMAID &&
-        (!path || !path_has_extension(path, L".mmd"))) {
-        tinta_str16_assign(&synthetic, L"document.mmd", 12);
-        path = synthetic.data;
-    } else if (format == TINTA_FORMAT_MARKDOWN &&
-               path && path_has_extension(path, L".mmd")) {
-        tinta_str16_assign(&synthetic, L"document.md", 11);
-        path = synthetic.data;
-    }
+    path = control_document_path(control, format, &synthetic);
     result = tinta_app_load_source(&control->view, utf8 ? utf8 : "", length, path);
     tinta_str16_destroy(&synthetic);
     if (!result) {
@@ -541,6 +715,126 @@ static bool copy_heading_string(wchar_t *destination, size_t capacity,
     return true;
 }
 
+static bool control_stream_begin(TintaControl *control,
+                                 const TintaStreamBegin *begin) {
+    TintaStr16 synthetic = {0};
+    const wchar_t *path;
+    UINT interval;
+    if (!control || !begin || begin->cb_size < sizeof(*begin) || begin->flags)
+        return false;
+    interval = begin->refresh_interval_ms ? begin->refresh_interval_ms : 50;
+    if (interval < 20 || interval > 1000) return false;
+    control_stream_stop(control);
+    tinta_str8_clear(&control->stream_buffer);
+    control_store_base_uri(control, begin->base_uri);
+    control->stream_format = begin->format;
+    control->stream_refresh_ms = interval;
+    control->stream_next_due = GetTickCount64() + interval;
+    control->stream_revision = 0;
+    control->stream_displayed_revision = 0;
+    control->stream_complete_length = 0;
+    control->stream_layout_length = 0;
+    control->stream_displayed_length = 0;
+    control->stream_utf8_codepoint = 0;
+    control->stream_utf8_minimum = 0;
+    control->stream_utf8_expected = 0;
+    control->stream_dirty = false;
+    control->stream_layout_in_flight = false;
+    control->stream_ending = false;
+    control->content_update_pending = false;
+    path = control_document_path(control, begin->format, &synthetic);
+    if (!tinta_app_update_source(&control->view, "", 0, path, true)) {
+        tinta_str16_destroy(&synthetic);
+        notify_error(control, E_FAIL, L"stream-begin",
+                     L"The empty stream document could not be created.");
+        return false;
+    }
+    tinta_str16_destroy(&synthetic);
+    control->stream_active = true;
+    control->ready_notified = true;
+    if (!SetTimer(control->view.hwnd, TINTA_TIMER_STREAM,
+                  min(interval, 50u), NULL)) {
+        control_stream_stop(control);
+        return false;
+    }
+    return true;
+}
+
+static bool control_stream_append(TintaControl *control,
+                                  const TintaStreamChunk *chunk) {
+    unsigned int expected;
+    uint32_t codepoint;
+    uint32_t minimum;
+    size_t complete;
+    if (!control || !control->stream_active || control->stream_ending ||
+        !chunk || chunk->cb_size < sizeof(*chunk) || chunk->flags ||
+        (!chunk->utf8 && chunk->utf8_length))
+        return false;
+    if (chunk->utf8_length > control->limits.max_document_bytes -
+            min(control->stream_buffer.len,
+                control->limits.max_document_bytes)) {
+        notify_error(control, HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE),
+                     L"stream-append",
+                     L"The streamed Markdown document exceeds the configured limit.");
+        return false;
+    }
+    if (!control_validate_stream_chunk(control,
+            chunk->utf8 ? chunk->utf8 : "", chunk->utf8_length,
+            &expected, &codepoint, &minimum, &complete)) {
+        notify_error(control, HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION),
+                     L"stream-append", L"The stream chunk contains invalid UTF-8.");
+        return false;
+    }
+    if (chunk->utf8_length && !tinta_str8_append(
+            &control->stream_buffer, chunk->utf8, chunk->utf8_length)) {
+        notify_error(control, E_OUTOFMEMORY, L"stream-append",
+                     L"The stream chunk could not be copied.");
+        return false;
+    }
+    control->stream_utf8_expected = expected;
+    control->stream_utf8_codepoint = codepoint;
+    control->stream_utf8_minimum = minimum;
+    control->stream_complete_length = complete;
+    if (complete > (control->stream_layout_in_flight ?
+            control->stream_layout_length : control->stream_displayed_length))
+        control->stream_dirty = true;
+    return control_stream_flush(control, false);
+}
+
+static bool control_stream_end(TintaControl *control) {
+    if (!control || !control->stream_active) return false;
+    if (control->stream_utf8_expected) {
+        notify_error(control, HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION),
+                     L"stream-end",
+                     L"The stream ends with an incomplete UTF-8 character.");
+        return false;
+    }
+    control->stream_ending = true;
+    if (control->stream_dirty) return control_stream_flush(control, true);
+    if (!control->stream_layout_in_flight) {
+        control_stream_stop(control);
+        notify_code(control, TMN_DOCUMENTREADY);
+    }
+    return true;
+}
+
+static bool control_stream_cancel(TintaControl *control) {
+    TintaStr16 synthetic = {0};
+    const wchar_t *path;
+    bool result = true;
+    if (!control || !control->stream_active) return false;
+    if (control->view.source.len != control->stream_displayed_length) {
+        path = control_document_path(control, control->stream_format, &synthetic);
+        result = tinta_app_update_source(&control->view,
+            control->stream_buffer.data ? control->stream_buffer.data : "",
+            control->stream_displayed_length, path, false);
+        tinta_str16_destroy(&synthetic);
+    }
+    control_stream_stop(control);
+    control->ready_notified = true;
+    return result;
+}
+
 static LRESULT control_custom_message(TintaControl *control, UINT message,
                                       WPARAM wparam, LPARAM lparam) {
     TintaApp *view = &control->view;
@@ -552,6 +846,7 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
                 document->utf8_length, document->base_uri, document->format);
         }
         case TMM_SETBASEURI:
+            if (control->stream_active) return FALSE;
             control_store_base_uri(control, (const wchar_t *)lparam);
             return TRUE;
         case TMM_SETOPTIONS: {
@@ -693,6 +988,16 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
         }
         case TMM_REFRESHAPPEARANCE:
             return control_refresh_system_theme(control);
+        case TMM_STREAM_BEGIN:
+            return control_stream_begin(control,
+                (const TintaStreamBegin *)lparam);
+        case TMM_STREAM_APPEND:
+            return control_stream_append(control,
+                (const TintaStreamChunk *)lparam);
+        case TMM_STREAM_END:
+            return control_stream_end(control);
+        case TMM_STREAM_CANCEL:
+            return control_stream_cancel(control);
     }
     return 0;
 }
@@ -726,11 +1031,14 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
     control->use_system_theme = true;
     control->redraw_enabled = true;
     tinta_str16_init(&control->base_uri);
+    tinta_str8_init(&control->stream_buffer);
     return tinta_app_update_formats(&control->view);
 }
 
 static void control_destroy_state(TintaControl *control) {
     if (!control) return;
+    KillTimer(control->view.hwnd, TINTA_TIMER_STREAM);
+    tinta_str8_destroy(&control->stream_buffer);
     tinta_str16_destroy(&control->base_uri);
     tinta_app_destroy(&control->view);
 }
@@ -738,7 +1046,7 @@ static void control_destroy_state(TintaControl *control) {
 static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
                                            WPARAM wparam, LPARAM lparam) {
     TintaControl *control = control_from_window(hwnd);
-    if (message >= TMM_FIRST && message <= TMM_REFRESHAPPEARANCE && control)
+    if (message >= TMM_FIRST && message <= TMM_STREAM_CANCEL && control)
         return control_custom_message(control, message, wparam, lparam);
     switch (message) {
         case WM_NCCREATE: {
@@ -795,11 +1103,7 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
             BeginPaint(hwnd, &paint);
             if (control && control->redraw_enabled) {
                 tinta_render(&control->view);
-                if (control->view.layout_complete && !control->ready_notified) {
-                    control->ready_notified = true;
-                    notify_code(control, TMN_DOCUMENTREADY);
-                    tinta_uia_raise_text_changed(&control->view);
-                }
+                control_layout_completed(control);
             }
             EndPaint(hwnd, &paint);
             return 0;
@@ -988,23 +1292,24 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
                         !control->view.layout_dirty) {
                         control->view.layout_chunk_posted =
                             PostMessageW(hwnd, TINTA_WM_LAYOUT_CHUNK, 0, 0) != FALSE;
-                    } else if (control->view.layout_complete &&
-                               !control->ready_notified) {
-                        control->ready_notified = true;
-                        notify_code(control, TMN_DOCUMENTREADY);
-                        tinta_uia_raise_text_changed(&control->view);
-                    }
+                    } else if (control->view.layout_complete)
+                        control_layout_completed(control);
                 }
             }
             return 0;
         case TINTA_WM_IMAGE_READY:
-            if (control) tinta_remote_image_complete(&control->view);
+            if (control && tinta_remote_image_complete(&control->view))
+                control->content_update_pending = true;
             return 0;
         case TINTA_WM_UIA_INVOKE:
             if (control && lparam) control_activate_link(control, (const char *)lparam);
             free((void *)lparam);
             return 0;
         case WM_TIMER:
+            if (control && wparam == TINTA_TIMER_STREAM) {
+                control_stream_flush(control, false);
+                return 0;
+            }
             if (control && wparam == TINTA_TIMER_NOTIFICATION) {
                 KillTimer(hwnd, TINTA_TIMER_NOTIFICATION);
                 control->view.notice_kind = TINTA_NOTICE_NONE;
@@ -1022,6 +1327,7 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
                     if (!g_initialize_count && g_module) {
                         UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
                         g_module = NULL;
+                        tinta_shared_graphics_uninitialize();
                     }
                     ReleaseSRWLockExclusive(&g_class_lock);
                 }
@@ -1041,6 +1347,11 @@ HRESULT TintaCoreInitialize(void) {
         return S_FALSE;
     }
     g_module = (HINSTANCE)&__ImageBase;
+    if (!tinta_shared_graphics_initialize()) {
+        g_module = NULL;
+        ReleaseSRWLockExclusive(&g_class_lock);
+        return E_FAIL;
+    }
     memset(&window_class, 0, sizeof(window_class));
     window_class.cbSize = sizeof(window_class);
     window_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS | CS_GLOBALCLASS;
@@ -1054,6 +1365,10 @@ HRESULT TintaCoreInitialize(void) {
                  HRESULT_FROM_WIN32(error);
     }
     if (SUCCEEDED(result)) g_initialize_count = 1;
+    else {
+        tinta_shared_graphics_uninitialize();
+        g_module = NULL;
+    }
     ReleaseSRWLockExclusive(&g_class_lock);
     return result;
 }
@@ -1064,6 +1379,7 @@ void TintaCoreUninitialize(void) {
     if (!g_initialize_count && !g_live_controls && g_module) {
         UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
         g_module = NULL;
+        tinta_shared_graphics_uninitialize();
     }
     ReleaseSRWLockExclusive(&g_class_lock);
 }
