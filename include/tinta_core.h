@@ -19,8 +19,8 @@ extern "C" {
 #  define TINTA_CORE_API
 #endif
 
-#define TINTA_CORE_VERSION_MAJOR 0
-#define TINTA_CORE_VERSION_MINOR 3
+#define TINTA_CORE_VERSION_MAJOR 1
+#define TINTA_CORE_VERSION_MINOR 0
 #define TINTA_CORE_VERSION_PATCH 0
 
 /* Register this class with TintaCoreInitialize before calling CreateWindowExW. */
@@ -108,7 +108,11 @@ typedef struct TintaLimits {
     UINT cb_size;
     size_t max_document_bytes;    /* UTF-8 bytes, including buffered stream data. */
     size_t max_ast_nodes;
+    size_t max_ast_depth;
+    size_t max_mermaid_nodes;
+    size_t max_mermaid_edges;
     uint64_t max_image_pixels;    /* Per decoded image: width * height. */
+    uint64_t max_remote_image_bytes;
     UINT max_image_resources;
     UINT max_concurrent_downloads;
 } TintaLimits;
@@ -221,6 +225,13 @@ typedef struct TintaResourceNotify {
     const wchar_t *replacement_uri; /* Host output for TINTA_RESOURCE_REPLACE. */
 } TintaResourceNotify;
 
+typedef struct TintaResourceErrorNotify {
+    NMHDR hdr;
+    TintaResourceKind kind;
+    const wchar_t *resolved_uri;
+    HRESULT error;
+} TintaResourceErrorNotify;
+
 typedef struct TintaErrorNotify {
     NMHDR hdr;
     HRESULT error;
@@ -263,6 +274,40 @@ typedef struct TintaAutoSizeNotify {
     TintaContentSize content_size;
 } TintaAutoSizeNotify;
 
+enum {
+    TINTA_CAPABILITY_UIA = 0x0001,
+    TINTA_CAPABILITY_MERMAID = 0x0002,
+    TINTA_CAPABILITY_SYNTAX = 0x0004,
+    TINTA_CAPABILITY_REMOTE_IMAGES = 0x0008,
+    TINTA_CAPABILITY_LOCAL_IMAGES = 0x0010,
+    TINTA_CAPABILITY_STREAMING = 0x0020
+};
+
+typedef struct TintaVersionInfo {
+    UINT cb_size;
+    UINT major;
+    UINT minor;
+    UINT patch;
+} TintaVersionInfo;
+
+typedef struct TintaCapabilities {
+    UINT cb_size;
+    DWORD flags;
+    DWORD option_flags;           /* TintaOptions flags supported by this build. */
+} TintaCapabilities;
+
+typedef struct TintaStats {
+    UINT cb_size;
+    uint64_t document_revision;
+    size_t source_bytes;
+    size_t ast_nodes;
+    size_t text_runs;
+    size_t image_resources;
+    size_t parse_time_us;
+    size_t layout_time_us;
+    size_t draw_calls;
+} TintaStats;
+
 /*
  * Control messages. Unless described otherwise, wParam is zero and a mutating
  * message returns nonzero on success.
@@ -283,6 +328,9 @@ typedef struct TintaAutoSizeNotify {
  * TMM_GETHEADING        lParam = TintaHeadingInfo *.
  * TMM_SCROLLTOHEADING   wParam = zero-based heading index.
  * TMM_GETSELECTION      lParam = TintaSelection *.
+ * TMM_GETVERSION        lParam = TintaVersionInfo *.
+ * TMM_GETCAPABILITIES   lParam = TintaCapabilities *.
+ * TMM_GETSTATS          lParam = TintaStats *.
  */
 #define TMM_FIRST                 (WM_USER + 0x500)
 #define TMM_SETDOCUMENT           (TMM_FIRST + 0)
@@ -328,6 +376,9 @@ typedef struct TintaAutoSizeNotify {
 #define TMM_STREAM_CANCEL         (TMM_FIRST + 28)
 #define TMM_SETAUTOSIZE           (TMM_FIRST + 29)
 #define TMM_GETAUTOSIZE           (TMM_FIRST + 30)
+#define TMM_GETVERSION            (TMM_FIRST + 31)
+#define TMM_GETCAPABILITIES       (TMM_FIRST + 32)
+#define TMM_GETSTATS              (TMM_FIRST + 33)
 
 /*
  * WM_NOTIFY codes sent synchronously to the parent window.
@@ -336,6 +387,7 @@ typedef struct TintaAutoSizeNotify {
  * TMN_ERROR           lParam = const TintaErrorNotify *.
  * TMN_LINKACTIVATE    lParam = const TintaLinkNotify *; nonzero means handled.
  * TMN_RESOURCEOPENING lParam = TintaResourceNotify *; return TintaResourceAction.
+ * TMN_RESOURCEERROR   lParam = const TintaResourceErrorNotify *.
  * TMN_CONTEXTMENU     lParam = const TintaContextMenuNotify *.
  * TMN_STREAMUPDATED   lParam = const TintaStreamUpdateNotify *.
  * TMN_CONTENTUPDATED  lParam = const TintaContentUpdateNotify *; for example,

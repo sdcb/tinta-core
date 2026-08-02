@@ -15,7 +15,11 @@ typedef struct ParserContext {
     const char *input_start;
     bool failed;
     bool suppress_rp_text;
+    size_t max_depth;
 } ParserContext;
+
+static _Thread_local size_t current_node_limit;
+static _Thread_local size_t current_node_count;
 
 typedef struct ExtensionMatch {
     size_t start;
@@ -48,8 +52,11 @@ static bool is_space_char(char value) {
 static char *empty_string(void) { return tinta_str8_dup("", 0); }
 
 TintaElement *tinta_element_create(TintaElementType type) {
+    if (current_node_limit && current_node_count >= current_node_limit)
+        return NULL;
     TintaElement *element = (TintaElement *)calloc(1, sizeof(*element));
     if (!element) return NULL;
+    current_node_count++;
     element->type = type;
     element->start = 1;
     element->source_offset = SIZE_MAX;
@@ -131,7 +138,9 @@ static bool context_flush_text(ParserContext *context) {
 
 static bool context_push(ParserContext *context, TintaElement *element) {
     TintaElement *current = context_current(context);
-    if (!current || !tinta_element_add_child(current, element) ||
+    if (!current ||
+        (context->max_depth && context->stack.len >= context->max_depth) ||
+        !tinta_element_add_child(current, element) ||
         !tinta_vec_push(&context->stack, &element)) return false;
     return true;
 }
@@ -548,6 +557,8 @@ TintaMarkdownOptions tinta_markdown_default_options(void) {
     options.permissive_urls = true;
     options.tables = true;
     options.task_lists = true;
+    options.max_nodes = 0;
+    options.max_depth = 0;
     return options;
 }
 
@@ -563,6 +574,9 @@ TintaParseResult tinta_markdown_parse(const char *markdown, size_t length,
     memset(&result, 0, sizeof(result));
     memset(&context, 0, sizeof(context));
     if (!markdown && length) { result.error = tinta_str8_dup("Invalid markdown", 16); return result; }
+    current_node_limit = options.max_nodes;
+    current_node_count = 0;
+    context.max_depth = options.max_depth;
     context.root = tinta_element_create(TINTA_ELEMENT_DOCUMENT);
     tinta_vec_init(&context.stack, sizeof(TintaElement *));
     tinta_str8_init(&context.current_text);
@@ -593,12 +607,16 @@ TintaParseResult tinta_markdown_parse(const char *markdown, size_t length,
     result.success = true;
     tinta_vec_destroy(&context.stack);
     tinta_str8_destroy(&context.current_text);
+    current_node_limit = 0;
+    current_node_count = 0;
     return result;
 failed:
     tinta_element_destroy(context.root);
     tinta_vec_destroy(&context.stack);
     tinta_str8_destroy(&context.current_text);
     result.error = tinta_str8_dup("Failed to parse markdown", 24);
+    current_node_limit = 0;
+    current_node_count = 0;
     return result;
 }
 

@@ -1,0 +1,70 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        configuration: [full, trimmed]
+        shared: [OFF, ON]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        shell: pwsh
+        run: |
+          $flags = @()
+          if ('${{ matrix.configuration }}' -eq 'trimmed') {
+            $flags += '-DTINTA_ENABLE_UIA=OFF'
+            $flags += '-DTINTA_ENABLE_MERMAID=OFF'
+            $flags += '-DTINTA_ENABLE_SYNTAX=OFF'
+            $flags += '-DTINTA_ENABLE_REMOTE_IMAGES=OFF'
+            $flags += '-DTINTA_ENABLE_LOCAL_IMAGES=OFF'
+          }
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
+            -DBUILD_SHARED_LIBS=${{ matrix.shared }} `
+            -DBUILD_TESTING=ON -DTINTA_BUILD_EXAMPLES=ON @flags
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  parser-tools:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DBUILD_TESTING=ON -DTINTA_BUILD_FUZZERS=ON -DTINTA_BUILD_BENCHMARKS=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Parser smoke
+        shell: pwsh
+        run: |
+          Set-Content -Path sample.md -Value '# fuzz smoke`n`n**text**'
+          ./build/Release/tinta_markdown_fuzzer.exe sample.md
+          ./build/Release/tinta_benchmark.exe
+
+  c-package:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        shared: [OFF, ON]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and install C library
+        run: >-
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+          -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+          -DBUILD_TESTING=OFF -DTINTA_BUILD_EXAMPLES=OFF
+          -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
+      - run: cmake --build build --config Release --parallel
+      - run: cmake --install build --config Release
+      - name: Build C package consumer
+        run: >-
+          cmake -S tests/package_consumer -B consumer
+          -G "Visual Studio 18 2026" -A x64
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/install
+      - run: cmake --build consumer --config Release --parallel

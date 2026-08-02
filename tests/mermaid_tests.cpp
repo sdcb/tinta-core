@@ -94,6 +94,18 @@ void testSpecialCases() {
     auto attributes = parse("flowchart TD\nA@{ shape: rounded, label: \"Fancy\" } --> B[Plain]\n");
     check(!attributes.success, "v11 attributes rejected");
     tinta_mermaid_parse_result_destroy(&attributes);
+
+    auto node_limited = tinta_mermaid_parse_limited(
+        "flowchart LR\nA --> B\n", std::strlen("flowchart LR\nA --> B\n"),
+        1, 10);
+    check(!node_limited.success, "Mermaid node limit is enforced during parsing");
+    tinta_mermaid_parse_result_destroy(&node_limited);
+
+    auto edge_limited = tinta_mermaid_parse_limited(
+        "flowchart LR\nA --> B\nB --> C\n",
+        std::strlen("flowchart LR\nA --> B\nB --> C\n"), 10, 1);
+    check(!edge_limited.success, "Mermaid edge limit is enforced during parsing");
+    tinta_mermaid_parse_result_destroy(&edge_limited);
 }
 }
 

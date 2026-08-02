@@ -1,17 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
-project(TintaCore VERSION 0.3.0 LANGUAGES C CXX)
+project(TintaCore VERSION 1.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-include(CTest)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-option(TINTA_BUILD_EXAMPLES "Build Tinta Core examples" ON)
+set(TINTA_DEVELOPER_BUILD OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(TINTA_DEVELOPER_BUILD ON)
+endif()
+
+option(TINTA_BUILD_EXAMPLES "Build Tinta Core examples" ${TINTA_DEVELOPER_BUILD})
+option(BUILD_TESTING "Build Tinta Core tests" ${TINTA_DEVELOPER_BUILD})
+option(TINTA_BUILD_FUZZERS "Build parser fuzz targets" OFF)
+option(TINTA_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 option(TINTA_ENABLE_UIA "Enable the UI Automation provider" ON)
 option(TINTA_ENABLE_MERMAID "Enable Mermaid parsing and rendering" ON)
 option(TINTA_ENABLE_SYNTAX "Enable code-block syntax highlighting" ON)
@@ -26,11 +30,15 @@ set(TINTA_CORE_SOURCES
     src/document.c
     src/markdown.c
     src/renderer.c
+    src/stream_async.c
     src/themes.c
     src/win32_utils.c)
 
 if(TINTA_ENABLE_MERMAID)
     list(APPEND TINTA_CORE_SOURCES src/mermaid.c)
+endif()
+if(TINTA_ENABLE_REMOTE_IMAGES)
+    list(APPEND TINTA_CORE_SOURCES src/image_cache.c)
 endif()
 if(TINTA_ENABLE_SYNTAX)
     list(APPEND TINTA_CORE_SOURCES src/syntax.c)
@@ -97,7 +105,13 @@ if(TINTA_BUILD_EXAMPLES)
     endif()
 endif()
 
-if(BUILD_TESTING)
+if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
+    if(BUILD_TESTING)
+        enable_language(CXX)
+        set(CMAKE_CXX_STANDARD 17)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+        enable_testing()
+    endif()
     set(TINTA_TEST_SUPPORT_SOURCES
         vendor/md4c/src/md4c.c src/core.c src/document.c src/markdown.c)
     if(TINTA_ENABLE_MERMAID)
@@ -119,42 +133,65 @@ if(BUILD_TESTING)
             COMPILE_OPTIONS /W0)
     endif()
 
-    add_executable(core_tests tests/core_tests.cpp)
-    target_include_directories(core_tests PRIVATE src/internal)
-    target_link_libraries(core_tests PRIVATE tinta_test_support)
-    add_test(NAME core_containers COMMAND core_tests)
+    if(BUILD_TESTING)
+        add_executable(core_tests tests/core_tests.cpp)
+        target_include_directories(core_tests PRIVATE src/internal)
+        target_link_libraries(core_tests PRIVATE tinta_test_support)
+        add_test(NAME core_containers COMMAND core_tests)
 
-    if(TINTA_ENABLE_MERMAID)
-        add_executable(mermaid_tests tests/mermaid_tests.cpp)
-        target_include_directories(mermaid_tests PRIVATE src/internal)
-        target_link_libraries(mermaid_tests PRIVATE tinta_test_support)
-        add_test(NAME mermaid_parser COMMAND mermaid_tests)
+        if(TINTA_ENABLE_MERMAID)
+            add_executable(mermaid_tests tests/mermaid_tests.cpp)
+            target_include_directories(mermaid_tests PRIVATE src/internal)
+            target_link_libraries(mermaid_tests PRIVATE tinta_test_support)
+            add_test(NAME mermaid_parser COMMAND mermaid_tests)
+        endif()
+
+        add_executable(document_tests tests/document_tests.cpp)
+        target_include_directories(document_tests PRIVATE src/internal)
+        target_link_libraries(document_tests PRIVATE tinta_test_support)
+        target_compile_definitions(document_tests PRIVATE
+            TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>)
+        add_test(NAME document_types COMMAND document_tests)
+
+        if(TINTA_ENABLE_SYNTAX)
+            add_executable(syntax_tests tests/syntax_tests.cpp)
+            target_include_directories(syntax_tests PRIVATE src/internal)
+            target_link_libraries(syntax_tests PRIVATE tinta_test_support)
+            add_test(NAME syntax_highlighting COMMAND syntax_tests)
+        endif()
+
+        add_executable(control_tests tests/control_tests.cpp)
+        target_link_libraries(control_tests PRIVATE Tinta::Core)
+        if(TINTA_ENABLE_UIA)
+            target_link_libraries(control_tests PRIVATE
+                ole32 oleaut32 uiautomationcore)
+        endif()
+        target_compile_definitions(control_tests PRIVATE UNICODE _UNICODE
+            TINTA_ENABLE_UIA=$<BOOL:${TINTA_ENABLE_UIA}>
+            TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
+            TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
+        add_test(NAME markdown_control COMMAND control_tests)
+        if(TINTA_ENABLE_UIA)
+            add_executable(uia_tests tests/uia_tests.cpp)
+            target_link_libraries(uia_tests PRIVATE Tinta::Core
+                ole32 oleaut32 uiautomationcore)
+            target_compile_definitions(uia_tests PRIVATE UNICODE _UNICODE)
+            add_test(NAME uia_provider COMMAND uia_tests)
+        endif()
     endif()
+endif()
 
-    add_executable(document_tests tests/document_tests.cpp)
-    target_include_directories(document_tests PRIVATE src/internal)
-    target_link_libraries(document_tests PRIVATE tinta_test_support)
-    target_compile_definitions(document_tests PRIVATE
-        TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>)
-    add_test(NAME document_types COMMAND document_tests)
+if(TINTA_BUILD_FUZZERS)
+    add_executable(tinta_markdown_fuzzer tests/markdown_fuzzer.c)
+    target_include_directories(tinta_markdown_fuzzer PRIVATE
+        src/internal vendor/md4c/src)
+    target_link_libraries(tinta_markdown_fuzzer PRIVATE tinta_test_support)
+endif()
 
-    if(TINTA_ENABLE_SYNTAX)
-        add_executable(syntax_tests tests/syntax_tests.cpp)
-        target_include_directories(syntax_tests PRIVATE src/internal)
-        target_link_libraries(syntax_tests PRIVATE tinta_test_support)
-        add_test(NAME syntax_highlighting COMMAND syntax_tests)
-    endif()
-
-    add_executable(control_tests tests/control_tests.cpp)
-    target_link_libraries(control_tests PRIVATE Tinta::Core)
-    if(TINTA_ENABLE_UIA)
-        target_link_libraries(control_tests PRIVATE ole32 oleaut32 uiautomationcore)
-    endif()
-    target_compile_definitions(control_tests PRIVATE UNICODE _UNICODE
-        TINTA_ENABLE_UIA=$<BOOL:${TINTA_ENABLE_UIA}>
-        TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
-        TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
-    add_test(NAME markdown_control COMMAND control_tests)
+if(TINTA_BUILD_BENCHMARKS)
+    add_executable(tinta_benchmark tests/benchmark.c)
+    target_include_directories(tinta_benchmark PRIVATE src/internal)
+    target_link_libraries(tinta_benchmark PRIVATE tinta_test_support)
 endif()
 
 install(TARGETS tinta_core EXPORT TintaCoreTargets
@@ -162,6 +199,8 @@ install(TARGETS tinta_core EXPORT TintaCoreTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES include/tinta_core.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES LICENSE THIRD_PARTY_NOTICES.md README.md CHANGELOG.md
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/TintaCore)
 install(EXPORT TintaCoreTargets NAMESPACE Tinta::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TintaCore)
 

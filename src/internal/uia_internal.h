@@ -47,6 +47,7 @@ typedef struct TintaUiaChild {
     LONG references;
     TintaUiaRoot *root;
     size_t index;
+    uint64_t revision;
 } TintaUiaChild;
 
 typedef struct TintaUiaRange {
@@ -55,6 +56,7 @@ typedef struct TintaUiaRange {
     TintaUiaRoot *root;
     size_t start;
     size_t end;
+    uint64_t revision;
 } TintaUiaRange;
 
 struct TintaUiaRoot {
@@ -64,6 +66,7 @@ struct TintaUiaRoot {
     ITextProvider text;
     IScrollProvider scroll;
     LONG references;
+    CRITICAL_SECTION guard;
     TintaApp *app;
 };
 
@@ -130,6 +133,7 @@ static inline TintaUiaChild *child_from_invoke(IInvokeProvider *value) {
 }
 
 HRESULT tinta_uia_root_available(TintaUiaRoot *root, TintaApp **app);
+void tinta_uia_root_done(TintaUiaRoot *root);
 ULONG tinta_uia_root_add_ref(TintaUiaRoot *root);
 ULONG tinta_uia_root_release(TintaUiaRoot *root);
 HRESULT tinta_uia_root_query(TintaUiaRoot *root, REFIID iid, void **result);

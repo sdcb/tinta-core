@@ -33,10 +33,9 @@ static ULONG STDMETHODCALLTYPE root_fragment_root_release(
 }
 
 
-static size_t semantic_count(TintaUiaRoot *root) {
+static size_t semantic_count_unlocked(TintaUiaRoot *root) {
     size_t count;
     size_t i;
-    if (FAILED(tinta_uia_root_available(root, NULL))) return 0;
     count = root->app->headings.len;
     for (i = 0; i < root->app->text_runs.len; i++) {
         TintaTextRun *run = TINTA_VEC_PTR(TintaTextRun,
@@ -48,19 +47,17 @@ static size_t semantic_count(TintaUiaRoot *root) {
 
 bool tinta_uia_semantic_item(TintaUiaRoot *root, size_t index,
                           TintaSemanticItem *item) {
-    TintaApp *app;
+    TintaApp *app = root->app;
     size_t heading_count;
     size_t i;
-    if (!item || FAILED(tinta_uia_root_available(root, &app))) return false;
+    if (!item || !app) return false;
     memset(item, 0, sizeof(*item));
     heading_count = app->headings.len;
     if (index < heading_count) {
         TintaHeading *heading = TINTA_VEC_PTR(TintaHeading, app->headings, index);
-        const wchar_t *found = app->doc_text.data && heading->text ?
-            wcsstr(app->doc_text.data, heading->text) : NULL;
         item->name = heading->text;
-        item->start = found ? (size_t)(found - app->doc_text.data) : 0;
-        item->end = item->start + (heading->text ? wcslen(heading->text) : 0);
+        item->start = heading->doc_start;
+        item->end = heading->doc_start + heading->doc_length;
         item->left = 0;
         item->right = (float)app->width;
         item->top = heading->y - app->scroll_y;
@@ -90,16 +87,26 @@ bool tinta_uia_semantic_item(TintaUiaRoot *root, size_t index,
 
 static TintaUiaChild *child_create(TintaUiaRoot *root, size_t index) {
     TintaUiaChild *child;
-    if (index >= semantic_count(root)) return NULL;
+    TintaApp *app;
+    if (FAILED(tinta_uia_root_available(root, &app))) return NULL;
+    if (index >= semantic_count_unlocked(root)) {
+        tinta_uia_root_done(root);
+        return NULL;
+    }
     child = (TintaUiaChild *)calloc(1, sizeof(*child));
-    if (!child) return NULL;
+    if (!child) {
+        tinta_uia_root_done(root);
+        return NULL;
+    }
     child->simple.lpVtbl = &tinta_uia_child_simple_vtable;
     child->fragment.lpVtbl = &tinta_uia_child_fragment_vtable;
     child->invoke.lpVtbl = &tinta_uia_child_invoke_vtable;
     child->references = 1;
     child->root = root;
     child->index = index;
+    child->revision = app->document_revision;
     tinta_uia_root_add_ref(root);
+    tinta_uia_root_done(root);
     return child;
 }
 
@@ -116,9 +123,26 @@ static ULONG child_release(TintaUiaChild *child) {
     return (ULONG)value;
 }
 
+static HRESULT child_lock(TintaUiaChild *child, TintaApp **out_app) {
+    TintaApp *current = NULL;
+    HRESULT hr;
+    if (!child) return E_INVALIDARG;
+    hr = tinta_uia_root_available(child->root, &current);
+    if (FAILED(hr)) return hr;
+    if (child->revision != current->document_revision) {
+        tinta_uia_root_done(child->root);
+        return UIA_E_ELEMENTNOTAVAILABLE;
+    }
+    if (out_app) *out_app = current;
+    return S_OK;
+}
+
 static HRESULT child_query(TintaUiaChild *child, REFIID iid, void **result) {
     TintaSemanticItem item;
+    HRESULT hr;
     if (!result) return E_POINTER;
+    hr = child_lock(child, NULL);
+    if (FAILED(hr)) return hr;
     *result = NULL;
     if (IsEqualIID(iid, &IID_IUnknown) ||
         IsEqualIID(iid, &IID_IRawElementProviderSimple))
@@ -128,9 +152,12 @@ static HRESULT child_query(TintaUiaChild *child, REFIID iid, void **result) {
     else if (IsEqualIID(iid, &IID_IInvokeProvider) &&
              tinta_uia_semantic_item(child->root, child->index, &item) && item.link)
         *result = &child->invoke;
-    else
+    else {
+        tinta_uia_root_done(child->root);
         return E_NOINTERFACE;
+    }
     child_add_ref(child);
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -181,7 +208,8 @@ static HRESULT STDMETHODCALLTYPE child_get_provider_options(
     IRawElementProviderSimple *self, enum ProviderOptions *result) {
     (void)self;
     if (!result) return E_POINTER;
-    *result = ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading;
+    *result = ProviderOptions_ServerSideProvider |
+              ProviderOptions_UseComThreading;
     return S_OK;
 }
 
@@ -189,13 +217,17 @@ static HRESULT STDMETHODCALLTYPE child_get_pattern(
     IRawElementProviderSimple *self, PATTERNID pattern, IUnknown **result) {
     TintaUiaChild *child = child_from_simple(self);
     TintaSemanticItem item;
+    HRESULT hr;
     if (!result) return E_POINTER;
+    hr = child_lock(child, NULL);
+    if (FAILED(hr)) return hr;
     *result = NULL;
     if (pattern == UIA_InvokePatternId &&
         tinta_uia_semantic_item(child->root, child->index, &item) && item.link) {
         *result = (IUnknown *)&child->invoke;
         child_add_ref(child);
     }
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -203,16 +235,23 @@ static HRESULT STDMETHODCALLTYPE child_get_property(
     IRawElementProviderSimple *self, PROPERTYID property, VARIANT *result) {
     TintaUiaChild *child = child_from_simple(self);
     TintaSemanticItem item;
+    TintaApp *app;
+    HRESULT hr;
+    HRESULT result_hr = S_OK;
     if (!result) return E_POINTER;
+    hr = child_lock(child, &app);
+    if (FAILED(hr)) return hr;
     VariantInit(result);
-    if (!tinta_uia_semantic_item(child->root, child->index, &item))
+    if (!tinta_uia_semantic_item(child->root, child->index, &item)) {
+        tinta_uia_root_done(child->root);
         return UIA_E_ELEMENTNOTAVAILABLE;
+    }
     if (property == UIA_ControlTypePropertyId) {
         V_VT(result) = VT_I4;
         V_I4(result) = item.link ? UIA_HyperlinkControlTypeId :
                                   UIA_HeaderControlTypeId;
     } else if (property == UIA_NamePropertyId) {
-        return tinta_uia_variant_bstr(result, item.name);
+        result_hr = tinta_uia_variant_bstr(result, item.name);
     } else if (property == UIA_IsControlElementPropertyId ||
                property == UIA_IsContentElementPropertyId ||
                property == UIA_IsEnabledPropertyId) {
@@ -222,21 +261,25 @@ static HRESULT STDMETHODCALLTYPE child_get_property(
         V_VT(result) = VT_BOOL;
         V_BOOL(result) = VARIANT_FALSE;
     } else if (property == UIA_IsOffscreenPropertyId) {
-        TintaApp *app = child->root->app;
         V_VT(result) = VT_BOOL;
         V_BOOL(result) = item.bottom < 0 || item.top > app->height ?
                          VARIANT_TRUE : VARIANT_FALSE;
     }
-    return S_OK;
+    tinta_uia_root_done(child->root);
+    return result_hr;
 }
 
 
 
 static HRESULT STDMETHODCALLTYPE child_get_host(
     IRawElementProviderSimple *self, IRawElementProviderSimple **result) {
-    (void)self;
+    TintaUiaChild *child = child_from_simple(self);
+    HRESULT hr;
     if (!result) return E_POINTER;
+    hr = child_lock(child, NULL);
+    if (FAILED(hr)) return hr;
     *result = NULL;
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -245,12 +288,17 @@ static HRESULT STDMETHODCALLTYPE child_navigate(
     IRawElementProviderFragment **result) {
     TintaUiaChild *child = child_from_fragment(self);
     TintaUiaChild *other = NULL;
-    size_t count = semantic_count(child->root);
+    size_t count;
+    HRESULT hr;
     if (!result) return E_POINTER;
+    hr = child_lock(child, NULL);
+    if (FAILED(hr)) return hr;
+    count = semantic_count_unlocked(child->root);
     *result = NULL;
     if (direction == NavigateDirection_Parent) {
         *result = &child->root->fragment;
         tinta_uia_root_add_ref(child->root);
+        tinta_uia_root_done(child->root);
         return S_OK;
     }
     if (direction == NavigateDirection_NextSibling && child->index + 1 < count)
@@ -258,6 +306,7 @@ static HRESULT STDMETHODCALLTYPE child_navigate(
     else if (direction == NavigateDirection_PreviousSibling && child->index)
         other = child_create(child->root, child->index - 1);
     if (other) *result = &other->fragment;
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -267,13 +316,20 @@ static HRESULT STDMETHODCALLTYPE child_runtime_id(
     LONG values[2] = {UiaAppendRuntimeId, (LONG)(child->index + 1)};
     LONG index;
     SAFEARRAY *array;
+    HRESULT hr;
     if (!result) return E_POINTER;
+    hr = child_lock(child, NULL);
+    if (FAILED(hr)) return hr;
     *result = NULL;
     array = SafeArrayCreateVector(VT_I4, 0, 2);
-    if (!array) return E_OUTOFMEMORY;
+    if (!array) {
+        tinta_uia_root_done(child->root);
+        return E_OUTOFMEMORY;
+    }
     for (index = 0; index < 2; index++)
         SafeArrayPutElement(array, &index, &values[index]);
     *result = array;
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -281,15 +337,22 @@ static HRESULT STDMETHODCALLTYPE child_bounding_rectangle(
     IRawElementProviderFragment *self, struct UiaRect *result) {
     TintaUiaChild *child = child_from_fragment(self);
     TintaSemanticItem item;
+    TintaApp *app;
+    HRESULT hr;
     POINT origin = {0, 0};
     if (!result) return E_POINTER;
-    if (!tinta_uia_semantic_item(child->root, child->index, &item))
+    hr = child_lock(child, &app);
+    if (FAILED(hr)) return hr;
+    if (!tinta_uia_semantic_item(child->root, child->index, &item)) {
+        tinta_uia_root_done(child->root);
         return UIA_E_ELEMENTNOTAVAILABLE;
-    ClientToScreen(child->root->app->hwnd, &origin);
+    }
+    ClientToScreen(app->hwnd, &origin);
     result->left = origin.x + item.left;
     result->top = origin.y + item.top;
     result->width = item.right - item.left;
     result->height = item.bottom - item.top;
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -304,9 +367,11 @@ static HRESULT STDMETHODCALLTYPE child_embedded_roots(
 static HRESULT STDMETHODCALLTYPE child_set_focus(
     IRawElementProviderFragment *self) {
     TintaUiaChild *child = child_from_fragment(self);
-    if (FAILED(tinta_uia_root_available(child->root, NULL)))
-        return UIA_E_ELEMENTNOTAVAILABLE;
-    SetFocus(child->root->app->hwnd);
+    TintaApp *app;
+    HRESULT hr = child_lock(child, &app);
+    if (FAILED(hr)) return hr;
+    SetFocus(app->hwnd);
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -314,19 +379,29 @@ static HRESULT STDMETHODCALLTYPE child_get_fragment_root(
     IRawElementProviderFragment *self,
     IRawElementProviderFragmentRoot **result) {
     TintaUiaChild *child = child_from_fragment(self);
+    HRESULT hr;
     if (!result) return E_POINTER;
+    hr = child_lock(child, NULL);
+    if (FAILED(hr)) return hr;
     *result = &child->root->fragment_root;
     tinta_uia_root_add_ref(child->root);
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE child_invoke_action(IInvokeProvider *self) {
     TintaUiaChild *child = child_from_invoke(self);
     TintaSemanticItem item;
-    if (!tinta_uia_semantic_item(child->root, child->index, &item) || !item.link)
+    TintaApp *app;
+    HRESULT hr = child_lock(child, &app);
+    if (FAILED(hr)) return hr;
+    if (!tinta_uia_semantic_item(child->root, child->index, &item) ||
+        !item.link) {
+        tinta_uia_root_done(child->root);
         return UIA_E_ELEMENTNOTAVAILABLE;
-    if (child->root->app->invoke_link)
-        child->root->app->invoke_link(child->root->app, item.url);
+    }
+    if (app->invoke_link) app->invoke_link(app, item.url);
+    tinta_uia_root_done(child->root);
     return S_OK;
 }
 
@@ -335,14 +410,19 @@ static HRESULT STDMETHODCALLTYPE root_fragment_navigate(
     IRawElementProviderFragment **result) {
     TintaUiaRoot *root = root_from_fragment(self);
     TintaUiaChild *child = NULL;
-    size_t count = semantic_count(root);
+    size_t count;
+    HRESULT hr;
     if (!result) return E_POINTER;
     *result = NULL;
+    hr = tinta_uia_root_available(root, NULL);
+    if (FAILED(hr)) return hr;
+    count = semantic_count_unlocked(root);
     if (direction == NavigateDirection_FirstChild && count)
         child = child_create(root, 0);
     else if (direction == NavigateDirection_LastChild && count)
         child = child_create(root, count - 1);
     if (child) *result = &child->fragment;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -365,6 +445,7 @@ static HRESULT STDMETHODCALLTYPE root_fragment_bounding_rectangle(
     result->top = rect.top;
     result->width = rect.right - rect.left;
     result->height = rect.bottom - rect.top;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -381,6 +462,7 @@ static HRESULT STDMETHODCALLTYPE root_fragment_set_focus(
     TintaUiaRoot *root = root_from_fragment(self);
     if (FAILED(tinta_uia_root_available(root, NULL))) return UIA_E_ELEMENTNOTAVAILABLE;
     SetFocus(root->app->hwnd);
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -388,9 +470,13 @@ static HRESULT STDMETHODCALLTYPE root_fragment_get_root(
     IRawElementProviderFragment *self,
     IRawElementProviderFragmentRoot **result) {
     TintaUiaRoot *root = root_from_fragment(self);
+    HRESULT hr;
     if (!result) return E_POINTER;
+    hr = tinta_uia_root_available(root, NULL);
+    if (FAILED(hr)) return hr;
     *result = &root->fragment_root;
     tinta_uia_root_add_ref(root);
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -398,12 +484,13 @@ static HRESULT STDMETHODCALLTYPE root_element_from_point(
     IRawElementProviderFragmentRoot *self, double x, double y,
     IRawElementProviderFragment **result) {
     TintaUiaRoot *root = root_from_fragment_root(self);
-    size_t count = semantic_count(root);
+    size_t count;
     size_t i;
     POINT origin = {0, 0};
     if (!result) return E_POINTER;
     *result = NULL;
     if (FAILED(tinta_uia_root_available(root, NULL))) return UIA_E_ELEMENTNOTAVAILABLE;
+    count = semantic_count_unlocked(root);
     ClientToScreen(root->app->hwnd, &origin);
     for (i = 0; i < count; i++) {
         TintaSemanticItem item;
@@ -411,11 +498,15 @@ static HRESULT STDMETHODCALLTYPE root_element_from_point(
             x >= origin.x + item.left && x <= origin.x + item.right &&
             y >= origin.y + item.top && y <= origin.y + item.bottom) {
             TintaUiaChild *child = child_create(root, i);
-            if (!child) return E_OUTOFMEMORY;
+            if (!child) {
+                tinta_uia_root_done(root);
+                return E_OUTOFMEMORY;
+            }
             *result = &child->fragment;
             break;
         }
     }
+    tinta_uia_root_done(root);
     return S_OK;
 }
 

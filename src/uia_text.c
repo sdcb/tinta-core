@@ -26,13 +26,18 @@ static TintaUiaRange *range_create(TintaUiaRoot *root,
     if (end > length) end = length;
     if (start > end) start = end;
     range = (TintaUiaRange *)calloc(1, sizeof(*range));
-    if (!range) return NULL;
+    if (!range) {
+        tinta_uia_root_done(root);
+        return NULL;
+    }
     range->iface.lpVtbl = &tinta_uia_range_vtable;
     range->references = 1;
     range->root = root;
     range->start = start;
     range->end = end;
+    range->revision = root->app->document_revision;
     tinta_uia_root_add_ref(root);
+    tinta_uia_root_done(root);
     return range;
 }
 
@@ -65,9 +70,13 @@ static HRESULT STDMETHODCALLTYPE text_get_selection(ITextProvider *self,
     range = range_create(root,
         min(app->selection_anchor, app->selection_focus),
         max(app->selection_anchor, app->selection_focus));
-    if (!range) return E_OUTOFMEMORY;
+    if (!range) {
+        tinta_uia_root_done(root);
+        return E_OUTOFMEMORY;
+    }
     hr = range_array(range, result);
     ITextRangeProvider_Release(&range->iface);
+    tinta_uia_root_done(root);
     return hr;
 }
 
@@ -93,9 +102,13 @@ static HRESULT STDMETHODCALLTYPE text_get_visible_ranges(ITextProvider *self,
         }
     }
     range = range_create(root, start, end);
-    if (!range) return E_OUTOFMEMORY;
+    if (!range) {
+        tinta_uia_root_done(root);
+        return E_OUTOFMEMORY;
+    }
     hr = range_array(range, result);
     ITextRangeProvider_Release(&range->iface);
+    tinta_uia_root_done(root);
     return hr;
 }
 
@@ -105,15 +118,26 @@ static HRESULT STDMETHODCALLTYPE text_range_from_child(ITextProvider *self,
     TintaUiaChild *semantic;
     TintaSemanticItem item;
     TintaUiaRange *range;
+    HRESULT hr;
     if (!result) return E_POINTER;
     *result = NULL;
     if (!child || child->lpVtbl != &tinta_uia_child_simple_vtable) return E_INVALIDARG;
     semantic = child_from_simple(child);
-    if (semantic->root != root ||
-        !tinta_uia_semantic_item(root, semantic->index, &item)) return E_INVALIDARG;
+    if (semantic->root != root) return E_INVALIDARG;
+    hr = tinta_uia_root_available(root, NULL);
+    if (FAILED(hr)) return hr;
+    if (semantic->revision != root->app->document_revision ||
+        !tinta_uia_semantic_item(root, semantic->index, &item)) {
+        tinta_uia_root_done(root);
+        return E_INVALIDARG;
+    }
     range = range_create(root, item.start, item.end);
-    if (!range) return E_OUTOFMEMORY;
+    if (!range) {
+        tinta_uia_root_done(root);
+        return E_OUTOFMEMORY;
+    }
     *result = &range->iface;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -134,8 +158,12 @@ static HRESULT STDMETHODCALLTYPE text_range_from_point(ITextProvider *self,
     ScreenToClient(app->hwnd, &client);
     tinta_hit_test(app, (float)client.x, (float)client.y, &position, NULL);
     range = range_create(root, position, position);
-    if (!range) return E_OUTOFMEMORY;
+    if (!range) {
+        tinta_uia_root_done(root);
+        return E_OUTOFMEMORY;
+    }
     *result = &range->iface;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -149,8 +177,12 @@ static HRESULT STDMETHODCALLTYPE text_get_document_range(ITextProvider *self,
     hr = tinta_uia_root_available(root, NULL);
     if (FAILED(hr)) return hr;
     range = range_create(root, 0, root->app->doc_text.len);
-    if (!range) return E_OUTOFMEMORY;
+    if (!range) {
+        tinta_uia_root_done(root);
+        return E_OUTOFMEMORY;
+    }
     *result = &range->iface;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -194,7 +226,24 @@ static ULONG STDMETHODCALLTYPE range_release(ITextRangeProvider *self) {
 }
 
 static HRESULT range_valid(TintaUiaRange *range, TintaApp **app) {
-    return range ? tinta_uia_root_available(range->root, app) : E_INVALIDARG;
+    TintaApp *current = NULL;
+    HRESULT hr;
+    if (!range) return E_INVALIDARG;
+    hr = tinta_uia_root_available(range->root, &current);
+    if (FAILED(hr)) return hr;
+    if (range->revision != current->document_revision)
+    {
+        tinta_uia_root_done(range->root);
+        return UIA_E_ELEMENTNOTAVAILABLE;
+    }
+    if (range->start > current->doc_text.len ||
+        range->end > current->doc_text.len || range->start > range->end)
+    {
+        tinta_uia_root_done(range->root);
+        return UIA_E_ELEMENTNOTAVAILABLE;
+    }
+    if (app) *app = current;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE range_clone(ITextRangeProvider *self,
@@ -205,8 +254,12 @@ static HRESULT STDMETHODCALLTYPE range_clone(ITextRangeProvider *self,
     *result = NULL;
     if (FAILED(range_valid(range, NULL))) return UIA_E_ELEMENTNOTAVAILABLE;
     copy = range_create(range->root, range->start, range->end);
-    if (!copy) return E_OUTOFMEMORY;
+    if (!copy) {
+        tinta_uia_root_done(range->root);
+        return E_OUTOFMEMORY;
+    }
     *result = &copy->iface;
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -214,10 +267,16 @@ static HRESULT STDMETHODCALLTYPE range_compare(ITextRangeProvider *self,
     ITextRangeProvider *other, BOOL *result) {
     TintaUiaRange *left = range_from_interface(self);
     TintaUiaRange *right;
-    if (!other || !result) return E_INVALIDARG;
+    if (!other || !result || other->lpVtbl != &tinta_uia_range_vtable)
+        return E_INVALIDARG;
     right = range_from_interface(other);
+    if (FAILED(range_valid(left, NULL)))
+        return UIA_E_ELEMENTNOTAVAILABLE;
+    tinta_uia_root_done(left->root);
+    if (FAILED(range_valid(right, NULL))) return UIA_E_ELEMENTNOTAVAILABLE;
     *result = left->root == right->root && left->start == right->start &&
               left->end == right->end;
+    tinta_uia_root_done(right->root);
     return S_OK;
 }
 
@@ -231,10 +290,17 @@ static HRESULT STDMETHODCALLTYPE range_compare_endpoints(ITextRangeProvider *sel
     enum TextPatternRangeEndpoint other_endpoint, int *result) {
     size_t left;
     size_t right;
-    if (!other || !result) return E_INVALIDARG;
+    if (!other || !result || other->lpVtbl != &tinta_uia_range_vtable)
+        return E_INVALIDARG;
+    if (FAILED(range_valid(range_from_interface(self), NULL)))
+        return UIA_E_ELEMENTNOTAVAILABLE;
+    tinta_uia_root_done(range_from_interface(self)->root);
+    if (FAILED(range_valid(range_from_interface(other), NULL)))
+        return UIA_E_ELEMENTNOTAVAILABLE;
     left = range_endpoint(range_from_interface(self), endpoint);
     right = range_endpoint(range_from_interface(other), other_endpoint);
     *result = left < right ? -1 : left > right ? 1 : 0;
+    tinta_uia_root_done(range_from_interface(other)->root);
     return S_OK;
 }
 
@@ -274,6 +340,7 @@ static HRESULT STDMETHODCALLTYPE range_expand(ITextRangeProvider *self,
         expand_line(app->doc_text.data, app->doc_text.len,
                     &range->start, &range->end);
     }
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -298,7 +365,10 @@ static HRESULT STDMETHODCALLTYPE range_find_text(ITextRangeProvider *self,
     hr = range_valid(range, &app);
     if (FAILED(hr)) return hr;
     if (!text || !(query_length = SysStringLen(text)) ||
-        query_length > range->end - range->start) return S_OK;
+        query_length > range->end - range->start) {
+        tinta_uia_root_done(range->root);
+        return S_OK;
+    }
     if (backward) {
         position = range->end - query_length;
         for (;;) {
@@ -306,7 +376,10 @@ static HRESULT STDMETHODCALLTYPE range_find_text(ITextRangeProvider *self,
                                          query_length) :
                                wcsncmp(app->doc_text.data + position, text,
                                        query_length)) == 0) break;
-            if (position == range->start) return S_OK;
+            if (position == range->start) {
+                tinta_uia_root_done(range->root);
+                return S_OK;
+            }
             position--;
         }
     } else {
@@ -317,14 +390,21 @@ static HRESULT STDMETHODCALLTYPE range_find_text(ITextRangeProvider *self,
                                wcsncmp(app->doc_text.data + position, text,
                                        query_length)) == 0) break;
         }
-        if (position + query_length > range->end) return S_OK;
+        if (position + query_length > range->end) {
+            tinta_uia_root_done(range->root);
+            return S_OK;
+        }
     }
     {
         TintaUiaRange *found = range_create(range->root, position,
                                             position + query_length);
-        if (!found) return E_OUTOFMEMORY;
+        if (!found) {
+            tinta_uia_root_done(range->root);
+            return E_OUTOFMEMORY;
+        }
         *result = &found->iface;
     }
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -356,7 +436,10 @@ static HRESULT STDMETHODCALLTYPE range_get_rectangles(ITextRangeProvider *self,
     hr = range_valid(range, &app);
     if (FAILED(hr)) return hr;
     array = SafeArrayCreateVector(VT_R8, 0, range->start == range->end ? 0 : 4);
-    if (!array) return E_OUTOFMEMORY;
+    if (!array) {
+        tinta_uia_root_done(range->root);
+        return E_OUTOFMEMORY;
+    }
     if (range->start != range->end) {
         GetWindowRect(app->hwnd, &rect);
         values[0] = rect.left;
@@ -369,6 +452,7 @@ static HRESULT STDMETHODCALLTYPE range_get_rectangles(ITextRangeProvider *self,
 
 
     *result = array;
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -379,6 +463,7 @@ static HRESULT STDMETHODCALLTYPE range_get_enclosing(ITextRangeProvider *self,
     if (FAILED(range_valid(range, NULL))) return UIA_E_ELEMENTNOTAVAILABLE;
     *result = &range->root->simple;
     tinta_uia_root_add_ref(range->root);
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -395,7 +480,9 @@ static HRESULT STDMETHODCALLTYPE range_get_text(ITextRangeProvider *self,
     length = range->end - range->start;
     if (maximum >= 0 && length > (size_t)maximum) length = (size_t)maximum;
     *result = SysAllocStringLen(app->doc_text.data + range->start, (UINT)length);
-    return *result || !length ? S_OK : E_OUTOFMEMORY;
+    hr = *result || !length ? S_OK : E_OUTOFMEMORY;
+    tinta_uia_root_done(range->root);
+    return hr;
 }
 
 static size_t move_position(const wchar_t *text, size_t length,
@@ -442,6 +529,7 @@ static HRESULT STDMETHODCALLTYPE range_move(ITextRangeProvider *self,
     }
     range->start = range->end = position;
     *moved = actual;
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -473,6 +561,7 @@ static HRESULT STDMETHODCALLTYPE range_move_endpoint(ITextRangeProvider *self,
         if (range->end < range->start) range->start = range->end;
     }
     *moved = actual;
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -483,10 +572,16 @@ static HRESULT STDMETHODCALLTYPE range_move_endpoint_range(
     TintaUiaRange *range = range_from_interface(self);
     TintaUiaRange *target;
     size_t position;
-    if (!other) return E_INVALIDARG;
+    if (!other || other->lpVtbl != &tinta_uia_range_vtable)
+        return E_INVALIDARG;
     target = range_from_interface(other);
     if (range->root != target->root) return E_INVALIDARG;
+    if (FAILED(range_valid(range, NULL)))
+        return UIA_E_ELEMENTNOTAVAILABLE;
+    tinta_uia_root_done(range->root);
+    if (FAILED(range_valid(target, NULL))) return UIA_E_ELEMENTNOTAVAILABLE;
     position = range_endpoint(target, other_endpoint);
+    tinta_uia_root_done(target->root);
     if (endpoint == TextPatternRangeEndpoint_Start) {
         range->start = position;
         if (range->start > range->end) range->end = range->start;
@@ -507,6 +602,7 @@ static HRESULT STDMETHODCALLTYPE range_select(ITextRangeProvider *self) {
     InvalidateRect(app->hwnd, NULL, FALSE);
     UiaRaiseAutomationEvent(&range->root->simple,
                             UIA_Text_TextSelectionChangedEventId);
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 
@@ -538,6 +634,7 @@ static HRESULT STDMETHODCALLTYPE range_scroll_into_view(ITextRangeProvider *self
             break;
         }
     }
+    tinta_uia_root_done(range->root);
     return S_OK;
 }
 

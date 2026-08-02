@@ -140,6 +140,14 @@ int main() {
     }
     tinta_parse_result_destroy(&fenced);
 
+    TintaMarkdownOptions limited = tinta_markdown_default_options();
+    limited.max_nodes = 1000;
+    limited.max_depth = 3;
+    const char *deep = "> one\n>> two\n>>> three\n>>>> four\n";
+    auto too_deep = tinta_markdown_parse(deep, std::strlen(deep), &limited);
+    check(!too_deep.success, "Markdown nesting depth limit is enforced during parsing");
+    tinta_parse_result_destroy(&too_deep);
+
     if (failures) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

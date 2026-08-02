@@ -1,6 +1,7 @@
 #include "../include/tinta_core.h"
 #include "app.h"
 #include "features.h"
+#include "stream_async.h"
 #include "uia_provider.h"
 
 #include <math.h>
@@ -15,6 +16,7 @@
 extern IMAGE_DOS_HEADER __ImageBase;
 
 typedef struct TintaControl {
+    LONG references;
     TintaApp view;
     TintaOptions options;
     TintaLimits limits;
@@ -32,6 +34,7 @@ typedef struct TintaControl {
     ULONGLONG stream_next_due;
     ULONGLONG stream_layout_started;
     uint64_t stream_revision;
+    uint64_t stream_layout_revision;
     uint64_t stream_displayed_revision;
     size_t stream_complete_length;
     size_t stream_layout_length;
@@ -41,10 +44,13 @@ typedef struct TintaControl {
     unsigned int stream_utf8_expected;
     bool stream_active;
     bool stream_dirty;
+    bool stream_parse_in_flight;
     bool stream_layout_in_flight;
     bool stream_ending;
     bool content_update_pending;
     TintaAutoSize auto_size;
+    unsigned int notification_depth;
+    TintaStreamAsync *stream_async;
 } TintaControl;
 
 static SRWLOCK g_class_lock = SRWLOCK_INIT;
@@ -54,7 +60,21 @@ static HINSTANCE g_module;
 
 static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
                                            WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
+                                                WPARAM wparam, LPARAM lparam);
+static void control_destroy_state(TintaControl *control);
 static void control_activate_link(TintaControl *control, const char *url);
+
+static void control_add_ref(TintaControl *control) {
+    if (control) InterlockedIncrement(&control->references);
+}
+
+static void control_release(TintaControl *control) {
+    if (control && !InterlockedDecrement(&control->references)) {
+        control_destroy_state(control);
+        free(control);
+    }
+}
 
 static void control_invoke_link(TintaApp *app, const char *url) {
     char *copy;
@@ -89,8 +109,11 @@ static DWORD default_option_flags(void) {
 }
 
 static DWORD supported_option_flags(void) {
-    DWORD flags = ~(DWORD)(TINTA_OPTION_LOCAL_IMAGES |
-                           TINTA_OPTION_REMOTE_IMAGES);
+    DWORD flags = TINTA_OPTION_SELECTION |
+                  TINTA_OPTION_KEYBOARD_NAVIGATION |
+                  TINTA_OPTION_MOUSE_ZOOM |
+                  TINTA_OPTION_CODE_COPY_BUTTON |
+                  TINTA_OPTION_OPEN_UNHANDLED_LINKS;
 #if TINTA_ENABLE_LOCAL_IMAGES
     flags |= TINTA_OPTION_LOCAL_IMAGES;
 #endif
@@ -106,7 +129,11 @@ static TintaLimits default_limits(void) {
     limits.cb_size = sizeof(limits);
     limits.max_document_bytes = 64u * 1024u * 1024u;
     limits.max_ast_nodes = 1000000u;
+    limits.max_ast_depth = 256u;
+    limits.max_mermaid_nodes = 10000u;
+    limits.max_mermaid_edges = 20000u;
     limits.max_image_pixels = 64ull * 1024ull * 1024ull;
+    limits.max_remote_image_bytes = 64ull * 1024ull * 1024ull;
     limits.max_image_resources = 512;
     limits.max_concurrent_downloads = 4;
     return limits;
@@ -124,12 +151,39 @@ static bool system_uses_dark_mode(void) {
 
 static LRESULT notify_parent(TintaControl *control, NMHDR *header) {
     HWND parent;
+    LRESULT result;
     if (!control || !header) return 0;
     parent = GetParent(control->view.hwnd);
     if (!parent) return 0;
     header->hwndFrom = control->view.hwnd;
     header->idFrom = (UINT_PTR)GetDlgCtrlID(control->view.hwnd);
-    return SendMessageW(parent, WM_NOTIFY, header->idFrom, (LPARAM)header);
+    control->notification_depth++;
+    result = SendMessageW(parent, WM_NOTIFY, header->idFrom, (LPARAM)header);
+    control->notification_depth--;
+    return result;
+}
+
+static bool control_reentrant_message_allowed(UINT message) {
+    switch (message) {
+        case TMM_GETOPTIONS:
+        case TMM_GETLIMITS:
+        case TMM_GETZOOM:
+        case TMM_GETSCROLLPOS:
+        case TMM_GETCONTENTSIZE:
+        case TMM_GETFINDSTATE:
+        case TMM_GETSELECTION:
+        case TMM_GETAUTOSIZE:
+        case TMM_GETVERSION:
+        case TMM_GETCAPABILITIES:
+        case TMM_GETSTATS:
+        case WM_GETTEXT:
+        case WM_GETTEXTLENGTH:
+        case WM_SIZE:
+        case WM_NCDESTROY:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static void notify_code(TintaControl *control, UINT code) {
@@ -147,6 +201,23 @@ static void notify_error(TintaControl *control, HRESULT error,
     notice.error = error;
     notice.operation = operation;
     notice.message = message;
+    notify_parent(control, &notice.hdr);
+}
+
+static void control_resource_error(TintaApp *app, bool remote,
+                                   const wchar_t *resolved_uri,
+                                   HRESULT error) {
+    TintaControl *control;
+    TintaResourceErrorNotify notice;
+    if (!app) return;
+    control = (TintaControl *)app->resource_context;
+    if (!control) return;
+    memset(&notice, 0, sizeof(notice));
+    notice.hdr.code = TMN_RESOURCEERROR;
+    notice.kind = remote ? TINTA_RESOURCE_REMOTE_IMAGE :
+                           TINTA_RESOURCE_LOCAL_IMAGE;
+    notice.resolved_uri = resolved_uri;
+    notice.error = error;
     notify_parent(control, &notice.hdr);
 }
 
@@ -220,13 +291,16 @@ static bool control_set_custom_theme(TintaControl *control,
     return true;
 }
 
-static void control_store_base_uri(TintaControl *control,
+static bool control_store_base_uri(TintaControl *control,
                                    const wchar_t *base_uri) {
-    if (!control) return;
+    if (!control) return false;
     if (base_uri)
-        tinta_str16_assign(&control->base_uri, base_uri, wcslen(base_uri));
-    else
+        return tinta_str16_assign(
+            &control->base_uri, base_uri, wcslen(base_uri));
+    else {
         tinta_str16_clear(&control->base_uri);
+        return true;
+    }
 }
 
 static bool path_has_extension(const wchar_t *path, const wchar_t *extension) {
@@ -239,10 +313,10 @@ static bool path_has_extension(const wchar_t *path, const wchar_t *extension) {
            !_wcsicmp(path + path_length - extension_length, extension);
 }
 
-static const wchar_t *control_document_path(TintaControl *control,
+static const wchar_t *control_document_path(const TintaStr16 *base_uri,
                                              TintaDocumentFormat format,
                                              TintaStr16 *synthetic) {
-    const wchar_t *path = control->base_uri.len ? control->base_uri.data : NULL;
+    const wchar_t *path = base_uri && base_uri->len ? base_uri->data : NULL;
     if (format == TINTA_FORMAT_MERMAID &&
         (!path || !path_has_extension(path, L".mmd"))) {
         if (!tinta_str16_assign(synthetic, L"document.mmd", 12)) return NULL;
@@ -258,8 +332,11 @@ static const wchar_t *control_document_path(TintaControl *control,
 static void control_stream_stop(TintaControl *control) {
     if (!control) return;
     KillTimer(control->view.hwnd, TINTA_TIMER_STREAM);
+    tinta_stream_async_close(control->stream_async);
+    control->stream_async = NULL;
     control->stream_active = false;
     control->stream_dirty = false;
+    control->stream_parse_in_flight = false;
     control->stream_layout_in_flight = false;
     control->stream_ending = false;
     control->stream_utf8_expected = 0;
@@ -394,27 +471,58 @@ static bool control_stream_flush(TintaControl *control, bool force) {
     const wchar_t *path;
     ULONGLONG now;
     if (!control || !control->stream_active ||
-        control->stream_layout_in_flight || !control->stream_dirty)
+        control->stream_parse_in_flight || !control->stream_dirty)
         return true;
     now = GetTickCount64();
     if (!force && now < control->stream_next_due) return true;
-    path = control_document_path(control, control->stream_format, &synthetic);
-    if (!tinta_app_update_source(&control->view,
+    path = control_document_path(&control->base_uri, control->stream_format,
+                                 &synthetic);
+    control->stream_revision++;
+    if (!tinta_stream_async_submit(control->stream_async,
+            control->stream_revision,
             control->stream_buffer.data ? control->stream_buffer.data : "",
-            control->stream_complete_length, path, false)) {
+            control->stream_complete_length, path,
+            control->view.max_ast_nodes, control->view.max_ast_depth)) {
+        control->stream_revision--;
         tinta_str16_destroy(&synthetic);
-        notify_error(control, E_FAIL, L"stream-parse",
-                     L"The streamed Markdown revision could not be parsed.");
+        notify_error(control, E_OUTOFMEMORY, L"stream-submit",
+                     L"The streamed Markdown revision could not be queued.");
         return false;
     }
     tinta_str16_destroy(&synthetic);
-    control->stream_revision++;
-    control->stream_layout_length = control->stream_complete_length;
-    control->stream_layout_in_flight = true;
+    control->stream_parse_in_flight = true;
     control->stream_dirty = false;
     control->stream_layout_started = now;
     control->stream_next_due = now + control->stream_refresh_ms;
     return true;
+}
+
+static void control_stream_parsed(TintaControl *control) {
+    TintaStreamParseResult *result;
+    if (!control || !control->stream_active ||
+        control->stream_layout_in_flight || !control->stream_async)
+        return;
+    result = tinta_stream_async_take(control->stream_async);
+    if (!result) return;
+    control->stream_parse_in_flight = false;
+    if (!result->success) {
+        notify_error(control, E_FAIL, L"stream-parse",
+                     L"The streamed Markdown revision could not be parsed.");
+        if (control->stream_ending && !control->stream_dirty)
+            control_stream_stop(control);
+        else
+            control_stream_flush(control, control->stream_ending);
+        tinta_stream_parse_result_destroy(result);
+        return;
+    }
+    tinta_app_commit_prepared_source(&control->view, &result->prepared, false);
+    control->stream_layout_length = result->utf8_length;
+    control->stream_layout_revision = result->revision;
+    control->stream_layout_in_flight = true;
+    control->stream_layout_started = GetTickCount64();
+    tinta_stream_parse_result_destroy(result);
+    if (control->stream_dirty)
+        control_stream_flush(control, control->stream_ending);
 }
 
 static void control_layout_completed(TintaControl *control) {
@@ -425,12 +533,13 @@ static void control_layout_completed(TintaControl *control) {
     if (control->stream_active && control->stream_layout_in_flight) {
         now = GetTickCount64();
         elapsed = now - control->stream_layout_started;
-        control->stream_displayed_revision = control->stream_revision;
+        control->stream_displayed_revision = control->stream_layout_revision;
         control->stream_displayed_length = control->stream_layout_length;
         control->stream_layout_in_flight = false;
         if (elapsed > control->stream_refresh_ms)
             control->stream_next_due = now + elapsed;
         if (control->stream_ending && !control->stream_dirty &&
+            !control->stream_parse_in_flight &&
             control->stream_displayed_length ==
                 control->stream_complete_length) {
             control_stream_stop(control);
@@ -440,6 +549,7 @@ static void control_layout_completed(TintaControl *control) {
             if (control->stream_dirty)
                 control_stream_flush(control, control->stream_ending);
         }
+        control_stream_parsed(control);
         tinta_uia_raise_text_changed(&control->view);
     } else if (!control->stream_active && !control->ready_notified) {
         control->ready_notified = true;
@@ -455,25 +565,35 @@ static void control_layout_completed(TintaControl *control) {
 static bool control_set_document(TintaControl *control,
                                  const char *utf8, size_t length,
                                  const wchar_t *base_uri,
-                                 TintaDocumentFormat format) {
+                                 TintaDocumentFormat format,
+                                 bool replace_base_uri) {
+    TintaStr16 proposed_base = {0};
     TintaStr16 synthetic = {0};
     const wchar_t *path;
     bool result;
     if (!control || (!utf8 && length)) return false;
-    control_stream_stop(control);
     if (length > control->limits.max_document_bytes) {
         notify_error(control, HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE),
                      L"set-document", L"The Markdown document exceeds the configured limit.");
         return false;
     }
-    if (base_uri) control_store_base_uri(control, base_uri);
-    path = control_document_path(control, format, &synthetic);
+    if (!tinta_str16_assign(&proposed_base,
+            replace_base_uri ? (base_uri ? base_uri : L"") :
+            (control->base_uri.data ? control->base_uri.data : L""),
+            replace_base_uri ? (base_uri ? wcslen(base_uri) : 0) :
+            control->base_uri.len))
+        return false;
+    path = control_document_path(&proposed_base, format, &synthetic);
     result = tinta_app_load_source(&control->view, utf8 ? utf8 : "", length, path);
     tinta_str16_destroy(&synthetic);
     if (!result) {
+        tinta_str16_destroy(&proposed_base);
         notify_error(control, E_FAIL, L"parse", L"The Markdown document could not be parsed.");
         return false;
     }
+    control_stream_stop(control);
+    tinta_str16_destroy(&control->base_uri);
+    control->base_uri = proposed_base;
     control->ready_notified = false;
     return true;
 }
@@ -484,7 +604,7 @@ static bool control_set_text(TintaControl *control, const wchar_t *text) {
     if (!text) text = L"";
     if (!tinta_utf16_to_utf8(text, wcslen(text), &utf8)) return false;
     result = control_set_document(control, utf8.data, utf8.len, NULL,
-                                  TINTA_FORMAT_MARKDOWN);
+                                  TINTA_FORMAT_MARKDOWN, false);
     tinta_str8_destroy(&utf8);
     return result;
 }
@@ -566,9 +686,9 @@ static bool control_find(TintaControl *control, const TintaFindRequest *request)
         (!request->text && request->text_length)) return false;
     if ((control->view.layout_dirty || !control->view.layout_complete) &&
         !tinta_layout_document(&control->view)) return false;
-    tinta_str16_assign(&control->view.search_query,
-                       request->text ? request->text : L"",
-                       request->text_length);
+    if (!tinta_str16_assign(&control->view.search_query,
+            request->text ? request->text : L"", request->text_length))
+        return false;
     control->find_flags = request->flags;
     tinta_vec_clear(&control->view.viewer_search_matches);
     control->view.viewer_search_index = -1;
@@ -741,6 +861,15 @@ static bool control_resolve_image(TintaApp *app, const char *source,
     }
     chosen = action == TINTA_RESOURCE_REPLACE && notice.replacement_uri ?
              notice.replacement_uri : initial;
+    is_remote = !_wcsnicmp(chosen, L"http://", 7) ||
+                !_wcsnicmp(chosen, L"https://", 8);
+    if ((is_remote && !(control->options.flags & TINTA_OPTION_REMOTE_IMAGES)) ||
+        (!is_remote && !(control->options.flags & TINTA_OPTION_LOCAL_IMAGES))) {
+        *blocked = true;
+        free(initial);
+        tinta_str16_destroy(&original);
+        return true;
+    }
     if (!tinta_str16_assign(resolved, chosen, wcslen(chosen))) {
         free(initial);
         tinta_str16_destroy(&original);
@@ -786,20 +915,38 @@ static bool copy_heading_string(wchar_t *destination, size_t capacity,
 
 static bool control_stream_begin(TintaControl *control,
                                  const TintaStreamBegin *begin) {
+    TintaStr16 proposed_base = {0};
     TintaStr16 synthetic = {0};
     const wchar_t *path;
     UINT interval;
-    if (!control || !begin || begin->cb_size < sizeof(*begin) || begin->flags)
+    if (!control || !begin || begin->cb_size < sizeof(*begin) || begin->flags ||
+        begin->format < TINTA_FORMAT_AUTO ||
+        begin->format > TINTA_FORMAT_MERMAID)
         return false;
     interval = begin->refresh_interval_ms ? begin->refresh_interval_ms : 50;
     if (interval < 20 || interval > 1000) return false;
+    if (!tinta_str16_assign(&proposed_base,
+            begin->base_uri ? begin->base_uri : L"",
+            begin->base_uri ? wcslen(begin->base_uri) : 0))
+        return false;
+    path = control_document_path(&proposed_base, begin->format, &synthetic);
+    if (!tinta_app_update_source(&control->view, "", 0, path, true)) {
+        tinta_str16_destroy(&synthetic);
+        tinta_str16_destroy(&proposed_base);
+        notify_error(control, E_FAIL, L"stream-begin",
+                     L"The empty stream document could not be created.");
+        return false;
+    }
+    tinta_str16_destroy(&synthetic);
     control_stream_stop(control);
     tinta_str8_clear(&control->stream_buffer);
-    control_store_base_uri(control, begin->base_uri);
+    tinta_str16_destroy(&control->base_uri);
+    control->base_uri = proposed_base;
     control->stream_format = begin->format;
     control->stream_refresh_ms = interval;
     control->stream_next_due = GetTickCount64() + interval;
     control->stream_revision = 0;
+    control->stream_layout_revision = 0;
     control->stream_displayed_revision = 0;
     control->stream_complete_length = 0;
     control->stream_layout_length = 0;
@@ -808,17 +955,12 @@ static bool control_stream_begin(TintaControl *control,
     control->stream_utf8_minimum = 0;
     control->stream_utf8_expected = 0;
     control->stream_dirty = false;
+    control->stream_parse_in_flight = false;
     control->stream_layout_in_flight = false;
     control->stream_ending = false;
     control->content_update_pending = false;
-    path = control_document_path(control, begin->format, &synthetic);
-    if (!tinta_app_update_source(&control->view, "", 0, path, true)) {
-        tinta_str16_destroy(&synthetic);
-        notify_error(control, E_FAIL, L"stream-begin",
-                     L"The empty stream document could not be created.");
-        return false;
-    }
-    tinta_str16_destroy(&synthetic);
+    control->stream_async = tinta_stream_async_create(control->view.hwnd);
+    if (!control->stream_async) return false;
     control->stream_active = true;
     control->ready_notified = true;
     if (!SetTimer(control->view.hwnd, TINTA_TIMER_STREAM,
@@ -880,7 +1022,8 @@ static bool control_stream_end(TintaControl *control) {
     }
     control->stream_ending = true;
     if (control->stream_dirty) return control_stream_flush(control, true);
-    if (!control->stream_layout_in_flight) {
+    if (!control->stream_layout_in_flight &&
+        !control->stream_parse_in_flight) {
         control_stream_stop(control);
         notify_code(control, TMN_DOCUMENTREADY);
     }
@@ -893,7 +1036,8 @@ static bool control_stream_cancel(TintaControl *control) {
     bool result = true;
     if (!control || !control->stream_active) return false;
     if (control->view.source.len != control->stream_displayed_length) {
-        path = control_document_path(control, control->stream_format, &synthetic);
+        path = control_document_path(&control->base_uri,
+                                     control->stream_format, &synthetic);
         result = tinta_app_update_source(&control->view,
             control->stream_buffer.data ? control->stream_buffer.data : "",
             control->stream_displayed_length, path, false);
@@ -910,19 +1054,40 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
     switch (message) {
         case TMM_SETDOCUMENT: {
             const TintaDocument *document = (const TintaDocument *)lparam;
-            if (!document || document->cb_size < sizeof(*document)) return FALSE;
+            if (!document || document->cb_size < sizeof(*document) ||
+                document->flags || document->format < TINTA_FORMAT_AUTO ||
+                document->format > TINTA_FORMAT_MERMAID)
+                return FALSE;
             return control_set_document(control, document->utf8,
-                document->utf8_length, document->base_uri, document->format);
+                document->utf8_length, document->base_uri, document->format,
+                true);
         }
-        case TMM_SETBASEURI:
+        case TMM_SETBASEURI: {
             if (control->stream_active) return FALSE;
-            control_store_base_uri(control, (const wchar_t *)lparam);
+            if (!control_store_base_uri(control, (const wchar_t *)lparam))
+                return FALSE;
+            tinta_app_invalidate_image_requests(view);
+            tinta_app_clear_image_resources(view);
+            view->layout_dirty = true;
+            InvalidateRect(view->hwnd, NULL, FALSE);
             return TRUE;
+        }
         case TMM_SETOPTIONS: {
             const TintaOptions *options = (const TintaOptions *)lparam;
+            DWORD old_flags;
             if (!options || options->cb_size < sizeof(*options)) return FALSE;
+            old_flags = control->options.flags;
             control->options = *options;
             control->options.flags &= supported_option_flags();
+            if ((old_flags ^ control->options.flags) &
+                (TINTA_OPTION_LOCAL_IMAGES | TINTA_OPTION_REMOTE_IMAGES)) {
+                tinta_app_invalidate_image_requests(view);
+                tinta_app_clear_image_resources(view);
+                view->layout_dirty = true;
+                InvalidateRect(view->hwnd, NULL, FALSE);
+            }
+            if (!(control->options.flags & TINTA_OPTION_SELECTION))
+                view->selection_anchor = view->selection_focus = 0;
             return TRUE;
         }
         case TMM_GETOPTIONS: {
@@ -935,13 +1100,25 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             const TintaLimits *limits = (const TintaLimits *)lparam;
             if (!limits || limits->cb_size < sizeof(*limits) ||
                 !limits->max_document_bytes || !limits->max_ast_nodes ||
+                !limits->max_ast_depth || !limits->max_mermaid_nodes ||
+                !limits->max_mermaid_edges ||
                 !limits->max_image_pixels || !limits->max_image_resources ||
+                !limits->max_remote_image_bytes ||
                 !limits->max_concurrent_downloads) return FALSE;
             control->limits = *limits;
             view->max_ast_nodes = limits->max_ast_nodes;
+            view->max_ast_depth = limits->max_ast_depth;
+            view->max_mermaid_nodes = limits->max_mermaid_nodes;
+            view->max_mermaid_edges = limits->max_mermaid_edges;
             view->max_image_pixels = limits->max_image_pixels;
+            view->max_remote_image_bytes = limits->max_remote_image_bytes;
             view->max_image_resources = limits->max_image_resources;
             view->max_concurrent_downloads = limits->max_concurrent_downloads;
+#if TINTA_ENABLE_MERMAID
+            tinta_app_clear_mermaid_cache(view);
+#endif
+            view->layout_dirty = true;
+            InvalidateRect(view->hwnd, NULL, FALSE);
             return TRUE;
         }
         case TMM_GETLIMITS: {
@@ -979,6 +1156,7 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             if (!position || position->cb_size < sizeof(*position)) return FALSE;
             view->scroll_x = fmaxf(0, position->x);
             view->scroll_y = fmaxf(0, position->y);
+            view->scroll_anchor_pending = false;
             InvalidateRect(view->hwnd, NULL, FALSE);
             notify_code(control, TMN_SCROLLCHANGED);
             return TRUE;
@@ -1094,6 +1272,54 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             *auto_size = control->auto_size;
             return TRUE;
         }
+        case TMM_GETVERSION: {
+            TintaVersionInfo *version = (TintaVersionInfo *)lparam;
+            if (!version || version->cb_size < sizeof(*version)) return FALSE;
+            version->cb_size = sizeof(*version);
+            version->major = TINTA_CORE_VERSION_MAJOR;
+            version->minor = TINTA_CORE_VERSION_MINOR;
+            version->patch = TINTA_CORE_VERSION_PATCH;
+            return TRUE;
+        }
+        case TMM_GETCAPABILITIES: {
+            TintaCapabilities *capabilities = (TintaCapabilities *)lparam;
+            DWORD flags = TINTA_CAPABILITY_STREAMING;
+            if (!capabilities || capabilities->cb_size < sizeof(*capabilities))
+                return FALSE;
+#if TINTA_ENABLE_UIA
+            flags |= TINTA_CAPABILITY_UIA;
+#endif
+#if TINTA_ENABLE_MERMAID
+            flags |= TINTA_CAPABILITY_MERMAID;
+#endif
+#if TINTA_ENABLE_SYNTAX
+            flags |= TINTA_CAPABILITY_SYNTAX;
+#endif
+#if TINTA_ENABLE_REMOTE_IMAGES
+            flags |= TINTA_CAPABILITY_REMOTE_IMAGES;
+#endif
+#if TINTA_ENABLE_LOCAL_IMAGES
+            flags |= TINTA_CAPABILITY_LOCAL_IMAGES;
+#endif
+            capabilities->cb_size = sizeof(*capabilities);
+            capabilities->flags = flags;
+            capabilities->option_flags = supported_option_flags();
+            return TRUE;
+        }
+        case TMM_GETSTATS: {
+            TintaStats *stats = (TintaStats *)lparam;
+            if (!stats || stats->cb_size < sizeof(*stats)) return FALSE;
+            stats->cb_size = sizeof(*stats);
+            stats->document_revision = view->document_revision;
+            stats->source_bytes = view->source.len;
+            stats->ast_nodes = view->ast_node_count;
+            stats->text_runs = view->text_runs.len;
+            stats->image_resources = view->image_resources.len;
+            stats->parse_time_us = view->parse_time_us;
+            stats->layout_time_us = view->layout_time_us;
+            stats->draw_calls = view->draw_calls;
+            return TRUE;
+        }
     }
     return 0;
 }
@@ -1117,12 +1343,18 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
     control->options.flags = default_option_flags();
     control->limits = default_limits();
     control->view.max_ast_nodes = control->limits.max_ast_nodes;
+    control->view.max_ast_depth = control->limits.max_ast_depth;
+    control->view.max_mermaid_nodes = control->limits.max_mermaid_nodes;
+    control->view.max_mermaid_edges = control->limits.max_mermaid_edges;
     control->view.max_image_pixels = control->limits.max_image_pixels;
+    control->view.max_remote_image_bytes =
+        control->limits.max_remote_image_bytes;
     control->view.max_image_resources = control->limits.max_image_resources;
     control->view.max_concurrent_downloads =
         control->limits.max_concurrent_downloads;
     control->view.resolve_image = control_resolve_image;
     control->view.invoke_link = control_invoke_link;
+    control->view.resource_error = control_resource_error;
     control->view.resource_context = control;
     control->use_system_theme = true;
     control->redraw_enabled = true;
@@ -1135,20 +1367,26 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
 static void control_destroy_state(TintaControl *control) {
     if (!control) return;
     KillTimer(control->view.hwnd, TINTA_TIMER_STREAM);
+    tinta_stream_async_close(control->stream_async);
+    control->stream_async = NULL;
     tinta_str8_destroy(&control->stream_buffer);
     tinta_str16_destroy(&control->base_uri);
     tinta_app_destroy(&control->view);
 }
 
-static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
-                                           WPARAM wparam, LPARAM lparam) {
+static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
+                                                WPARAM wparam, LPARAM lparam) {
     TintaControl *control = control_from_window(hwnd);
-    if (message >= TMM_FIRST && message <= TMM_GETAUTOSIZE && control)
+    if (control && control->notification_depth &&
+        !control_reentrant_message_allowed(message))
+        return FALSE;
+    if (message >= TMM_FIRST && message <= TMM_GETSTATS && control)
         return control_custom_message(control, message, wparam, lparam);
     switch (message) {
         case WM_NCCREATE: {
             TintaControl *created = (TintaControl *)calloc(1, sizeof(*created));
             if (!created) return FALSE;
+            created->references = 1;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)created);
             if (!control_initialize_state(created, hwnd)) {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1371,15 +1609,23 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
         case WM_CONTEXTMENU:
             if (control) {
                 TintaContextMenuNotify notice;
+                const char *url = NULL;
+                wchar_t *resolved = NULL;
                 memset(&notice, 0, sizeof(notice));
                 notice.hdr.code = TMN_CONTEXTMENU;
                 notice.screen.x = GET_X_LPARAM(lparam);
                 notice.screen.y = GET_Y_LPARAM(lparam);
                 notice.has_selection = control->view.selection_anchor !=
                                        control->view.selection_focus;
+                if (tinta_text_at(&control->view,
+                        (float)control->view.mouse_x,
+                        (float)control->view.mouse_y, &url) && url)
+                    resolved = control_resolve_link(control, url);
+                notice.link_uri = resolved;
                 notice.over_code_block = tinta_code_block_at(&control->view,
                     control->view.mouse_x, control->view.mouse_y) >= 0;
                 notify_parent(control, &notice.hdr);
+                free(resolved);
             }
             return 0;
         case TINTA_WM_LAYOUT_CHUNK:
@@ -1400,6 +1646,9 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
             if (control && tinta_remote_image_complete(&control->view))
                 control->content_update_pending = true;
             return 0;
+        case TINTA_WM_STREAM_PARSED:
+            control_stream_parsed(control);
+            return 0;
         case TINTA_WM_UIA_INVOKE:
             if (control && lparam) control_activate_link(control, (const char *)lparam);
             free((void *)lparam);
@@ -1419,8 +1668,6 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
             if (control) {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 tinta_uia_disconnect(&control->view);
-                control_destroy_state(control);
-                free(control);
                 if (!InterlockedDecrement(&g_live_controls)) {
                     AcquireSRWLockExclusive(&g_class_lock);
                     if (!g_initialize_count && g_module) {
@@ -1430,10 +1677,26 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
                     }
                     ReleaseSRWLockExclusive(&g_class_lock);
                 }
+                control_release(control);
             }
             break;
     }
     return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
+                                           WPARAM wparam, LPARAM lparam) {
+    TintaControl *control = control_from_window(hwnd);
+    LRESULT result;
+    void *uia_lock;
+    if (!control || message == WM_NCCREATE)
+        return tinta_control_proc_impl(hwnd, message, wparam, lparam);
+    control_add_ref(control);
+    uia_lock = tinta_uia_lock_app(&control->view);
+    result = tinta_control_proc_impl(hwnd, message, wparam, lparam);
+    tinta_uia_unlock_app(uia_lock);
+    control_release(control);
+    return result;
 }
 
 HRESULT TintaCoreInitialize(void) {
@@ -1460,8 +1723,18 @@ HRESULT TintaCoreInitialize(void) {
     window_class.lpszClassName = TINTA_MARKDOWN_VIEW_CLASSW;
     if (!RegisterClassExW(&window_class)) {
         DWORD error = GetLastError();
-        result = error == ERROR_CLASS_ALREADY_EXISTS ? S_FALSE :
-                 HRESULT_FROM_WIN32(error);
+        if (error == ERROR_CLASS_ALREADY_EXISTS) {
+            WNDCLASSEXW existing;
+            memset(&existing, 0, sizeof(existing));
+            existing.cbSize = sizeof(existing);
+            if (GetClassInfoExW(NULL, TINTA_MARKDOWN_VIEW_CLASSW, &existing) &&
+                existing.lpfnWndProc == tinta_control_proc)
+                result = S_FALSE;
+            else
+                result = HRESULT_FROM_WIN32(ERROR_CLASS_ALREADY_EXISTS);
+        } else {
+            result = HRESULT_FROM_WIN32(error);
+        }
     }
     if (SUCCEEDED(result)) g_initialize_count = 1;
     else {

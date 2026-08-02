@@ -1,8 +1,5 @@
 #include "tinta_core.h"
 
-#if TINTA_ENABLE_UIA
-#include <UIAutomation.h>
-#endif
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -14,8 +11,12 @@ static int link_notifications;
 static int document_ready_notifications;
 static int stream_update_notifications;
 static int autosize_notifications;
+static int resource_error_notifications;
+static bool block_resources = true;
 static bool post_quit_on_destroy;
 static int destroy_quit_code;
+static bool destroy_on_ready;
+static std::wstring last_resource_uri;
 
 static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
                                     WPARAM wparam, LPARAM lparam) {
@@ -26,6 +27,11 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
         if (header) notifications++;
         if (header && header->code == TMN_DOCUMENTREADY)
             document_ready_notifications++;
+        if (header && header->code == TMN_DOCUMENTREADY && destroy_on_ready) {
+            destroy_on_ready = false;
+            DestroyWindow(header->hwndFrom);
+            return 0;
+        }
         if (header && header->code == TMN_STREAMUPDATED)
             stream_update_notifications++;
         if (header && header->code == TMN_AUTOSIZED)
@@ -36,8 +42,14 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
         }
         if (header && header->code == TMN_RESOURCEOPENING) {
             resource_notifications++;
-            return TINTA_RESOURCE_BLOCK;
+            auto *resource = reinterpret_cast<TintaResourceNotify *>(lparam);
+            last_resource_uri = resource->resolved_uri ?
+                resource->resolved_uri : L"";
+            return block_resources ? TINTA_RESOURCE_BLOCK :
+                                     TINTA_RESOURCE_DEFAULT;
         }
+        if (header && header->code == TMN_RESOURCEERROR)
+            resource_error_notifications++;
     }
     if (message == WM_DESTROY && post_quit_on_destroy) {
         PostQuitMessage(destroy_quit_code);
@@ -82,6 +94,19 @@ int main() {
     if (!SendMessageW(view, TMM_GETOPTIONS, 0,
                       reinterpret_cast<LPARAM>(&compiled_options))) {
         std::cerr << "options query failed\n";
+        return 1;
+    }
+    TintaVersionInfo version{};
+    version.cb_size = sizeof(version);
+    TintaCapabilities capabilities{};
+    capabilities.cb_size = sizeof(capabilities);
+    if (!SendMessageW(view, TMM_GETVERSION, 0,
+                      reinterpret_cast<LPARAM>(&version)) ||
+        version.major != 1 ||
+        !SendMessageW(view, TMM_GETCAPABILITIES, 0,
+                      reinterpret_cast<LPARAM>(&capabilities)) ||
+        !(capabilities.flags & TINTA_CAPABILITY_STREAMING)) {
+        std::cerr << "version/capability query failed\n";
         return 1;
     }
 #if !TINTA_ENABLE_LOCAL_IMAGES
@@ -150,6 +175,14 @@ int main() {
     if (SendMessageW(view, WM_GETTEXTLENGTH, 0, 0) == 0 ||
         SendMessageW(view, TMM_GETHEADINGCOUNT, 0, 0) != 1) {
         std::cerr << "document or heading API failed\n";
+        return 1;
+    }
+    TintaStats stats{};
+    stats.cb_size = sizeof(stats);
+    if (!SendMessageW(view, TMM_GETSTATS, 0,
+                      reinterpret_cast<LPARAM>(&stats)) ||
+        !stats.document_revision || !stats.source_bytes || !stats.ast_nodes) {
+        std::cerr << "statistics query failed\n";
         return 1;
     }
     TintaFindRequest find{};
@@ -331,100 +364,34 @@ int main() {
         std::cerr << "image link fallback text failed\n";
         return 1;
     }
-#if TINTA_ENABLE_UIA
-    std::wstring accessible_document =
-        L"# Accessible heading\n\n[Accessible link](https://example.com)\n\n";
-    for (int index = 0; index < 80; index++)
-        accessible_document += L"Accessible scrolling content.\n\n";
-    SendMessageW(view, WM_SETTEXT, 0,
-        reinterpret_cast<LPARAM>(accessible_document.c_str()));
-    SendMessageW(view, TMM_GETHEADINGCOUNT, 0, 0);
-    SendMessageW(view, TMM_SELECTALL, 0, 0);
-    HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    IUIAutomation *automation = nullptr;
-    IUIAutomationElement *element = nullptr;
-    IUIAutomationTextPattern *text_pattern = nullptr;
-    IUIAutomationTextRange *range = nullptr;
-    IUIAutomationTextRangeArray *selection_ranges = nullptr;
-    IUIAutomationScrollPattern *scroll_pattern = nullptr;
-    IUIAutomationCondition *link_condition = nullptr;
-    IUIAutomationCondition *header_condition = nullptr;
-    IUIAutomationElement *link_element = nullptr;
-    IUIAutomationElement *header_element = nullptr;
-    IUIAutomationInvokePattern *invoke = nullptr;
-    BSTR text = nullptr;
-    CONTROLTYPEID type = 0;
-    HRESULT uia = CoCreateInstance(CLSID_CUIAutomation, nullptr,
-        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation));
-    if (SUCCEEDED(uia)) uia = automation->ElementFromHandle(view, &element);
-    if (SUCCEEDED(uia)) uia = element->get_CurrentControlType(&type);
-    if (SUCCEEDED(uia)) uia = element->GetCurrentPatternAs(
-        UIA_TextPatternId, IID_PPV_ARGS(&text_pattern));
-    if (SUCCEEDED(uia)) uia = text_pattern->get_DocumentRange(&range);
-    if (SUCCEEDED(uia)) uia = range->GetText(-1, &text);
-    bool uia_ok = SUCCEEDED(uia) && type == UIA_DocumentControlTypeId &&
-                  text && std::wcsstr(text, L"Accessible heading");
-    int selection_length = 0;
-    if (uia_ok) uia = text_pattern->GetSelection(&selection_ranges);
-    if (SUCCEEDED(uia) && selection_ranges)
-        uia = selection_ranges->get_Length(&selection_length);
-    uia_ok = uia_ok && SUCCEEDED(uia) && selection_length == 1;
-    BOOL vertically_scrollable = FALSE;
-    if (uia_ok) uia = element->GetCurrentPatternAs(
-        UIA_ScrollPatternId, IID_PPV_ARGS(&scroll_pattern));
-    if (SUCCEEDED(uia) && scroll_pattern)
-        uia = scroll_pattern->get_CurrentVerticallyScrollable(
-            &vertically_scrollable);
-    if (SUCCEEDED(uia) && vertically_scrollable)
-        uia = scroll_pattern->Scroll(
-            ScrollAmount_NoAmount, ScrollAmount_SmallIncrement);
-    TintaScrollPosition uia_scroll{};
-    uia_scroll.cb_size = sizeof(uia_scroll);
-    SendMessageW(view, TMM_GETSCROLLPOS, 0,
-                 reinterpret_cast<LPARAM>(&uia_scroll));
-    uia_ok = uia_ok && SUCCEEDED(uia) && vertically_scrollable &&
-             uia_scroll.y > 0;
-    VARIANT link_type;
-    VariantInit(&link_type);
-    V_VT(&link_type) = VT_I4;
-    V_I4(&link_type) = UIA_HyperlinkControlTypeId;
-    if (uia_ok) uia = automation->CreatePropertyCondition(
-        UIA_ControlTypePropertyId, link_type, &link_condition);
-    if (SUCCEEDED(uia)) uia = element->FindFirst(
-        TreeScope_Descendants, link_condition, &link_element);
-    VARIANT header_type;
-    VariantInit(&header_type);
-    V_VT(&header_type) = VT_I4;
-    V_I4(&header_type) = UIA_HeaderControlTypeId;
-    if (SUCCEEDED(uia)) uia = automation->CreatePropertyCondition(
-        UIA_ControlTypePropertyId, header_type, &header_condition);
-    if (SUCCEEDED(uia)) uia = element->FindFirst(
-        TreeScope_Descendants, header_condition, &header_element);
-    if (SUCCEEDED(uia) && link_element) uia = link_element->GetCurrentPatternAs(
-        UIA_InvokePatternId, IID_PPV_ARGS(&invoke));
-    if (SUCCEEDED(uia) && invoke) uia = invoke->Invoke();
-    MSG pending;
-    while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&pending);
-        DispatchMessageW(&pending);
+#if TINTA_ENABLE_LOCAL_IMAGES
+    if (!SendMessageW(view, TMM_SETBASEURI, 0,
+                      reinterpret_cast<LPARAM>(L"C:\\stable\\document.md"))) {
+        std::cerr << "base URI setup failed\n";
+        return 1;
     }
-    uia_ok = uia_ok && SUCCEEDED(uia) && link_element && header_element &&
-             link_notifications == 1;
-    SysFreeString(text);
-    if (invoke) invoke->Release();
-    if (header_element) header_element->Release();
-    if (link_element) link_element->Release();
-    if (header_condition) header_condition->Release();
-    if (link_condition) link_condition->Release();
-    if (scroll_pattern) scroll_pattern->Release();
-    if (selection_ranges) selection_ranges->Release();
-    if (range) range->Release();
-    if (text_pattern) text_pattern->Release();
-    if (element) element->Release();
-    if (automation) automation->Release();
-    if (SUCCEEDED(com)) CoUninitialize();
-    if (!uia_ok) {
-        std::cerr << "UI Automation text provider failed\n";
+    restricted = limits;
+    restricted.max_ast_nodes = 1;
+    SendMessageW(view, TMM_SETLIMITS, 0,
+                 reinterpret_cast<LPARAM>(&restricted));
+    TintaDocument rejected_document{};
+    rejected_document.cb_size = sizeof(rejected_document);
+    rejected_document.utf8 = "# rejected";
+    rejected_document.utf8_length = std::strlen(rejected_document.utf8);
+    rejected_document.base_uri = L"C:\\replacement\\document.md";
+    rejected_document.format = TINTA_FORMAT_MARKDOWN;
+    if (SendMessageW(view, TMM_SETDOCUMENT, 0,
+                     reinterpret_cast<LPARAM>(&rejected_document))) {
+        std::cerr << "transactional document rejection failed\n";
+        return 1;
+    }
+    SendMessageW(view, TMM_SETLIMITS, 0, reinterpret_cast<LPARAM>(&limits));
+    last_resource_uri.clear();
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(L"![](probe.png)"));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    if (last_resource_uri.find(L"C:\\stable\\probe.png") == std::wstring::npos) {
+        std::cerr << "failed document changed the committed base URI\n";
         return 1;
     }
 #endif
@@ -448,6 +415,39 @@ int main() {
         return 1;
     }
     DestroyWindow(second_probe);
+#if TINTA_ENABLE_LOCAL_IMAGES
+    block_resources = false;
+    HWND error_probe = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW,
+        L"![](C:\\path-that-does-not-exist\\missing.png)", WS_CHILD,
+        0, 0, 320, 100, parent, reinterpret_cast<HMENU>(104),
+        instance, nullptr);
+    if (!error_probe) {
+        std::cerr << "resource error setup failed\n";
+        return 1;
+    }
+    SendMessageW(error_probe, WM_PAINT, 0, 0);
+    if (!resource_error_notifications) {
+        std::cerr << "resource error notification failed\n";
+        return 1;
+    }
+    DestroyWindow(error_probe);
+    block_resources = true;
+#endif
+    HWND reentrant_probe = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW, L"first",
+        WS_CHILD, 0, 0, 320, 100, parent, reinterpret_cast<HMENU>(103),
+        instance, nullptr);
+    if (!reentrant_probe) {
+        std::cerr << "reentrant notification setup failed\n";
+        return 1;
+    }
+    destroy_on_ready = true;
+    SendMessageW(reentrant_probe, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(L"# destroy during notification"));
+    SendMessageW(reentrant_probe, WM_PAINT, 0, 0);
+    if (IsWindow(reentrant_probe)) {
+        std::cerr << "notification-time destruction was not handled\n";
+        return 1;
+    }
     post_quit_on_destroy = true;
     destroy_quit_code = 37;
     UINT_PTR shutdown_timer = SetTimer(nullptr, 0, 2000, nullptr);

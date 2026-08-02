@@ -18,16 +18,12 @@
 extern "C" {
 #endif
 
-#define TINTA_TIMER_FILE_WATCH 1
-#define TINTA_TIMER_REPARSE 2
 #define TINTA_TIMER_NOTIFICATION 3
-#define TINTA_TIMER_CURSOR 4
-#define TINTA_TIMER_ZOOM_APPLY 5
 #define TINTA_TIMER_STREAM 6
 #define TINTA_WM_LAYOUT_CHUNK (WM_APP + 1)
 #define TINTA_WM_IMAGE_READY (WM_APP + 2)
 #define TINTA_WM_UIA_INVOKE (WM_APP + 3)
-#define TINTA_APP_NAME L"Tinta C"
+#define TINTA_WM_STREAM_PARSED (WM_APP + 4)
 
 typedef struct TintaTheme {
     const wchar_t *name;
@@ -121,6 +117,8 @@ typedef struct TintaHeading {
     wchar_t *slug;
     int level;
     float y;
+    size_t doc_start;
+    size_t doc_length;
 } TintaHeading;
 
 typedef struct TintaImageResource {
@@ -163,11 +161,28 @@ typedef struct TintaScrollAnchor {
     float rendered_y;
 } TintaScrollAnchor;
 
+#if TINTA_ENABLE_MERMAID
+typedef struct TintaMermaidCacheEntry {
+    const TintaElement *element;
+    TintaMermaidParseResult parsed;
+} TintaMermaidCacheEntry;
+#endif
+
 typedef struct TintaApp TintaApp;
+typedef struct TintaImageAsync TintaImageAsync;
+typedef struct TintaPreparedSource {
+    TintaParseResult document;
+    TintaStr8 source;
+    size_t ast_nodes;
+    bool focus_mermaid;
+} TintaPreparedSource;
 typedef bool (*TintaResolveImageFn)(TintaApp *app, const char *source,
                                     TintaStr16 *resolved, bool *remote,
                                     bool *blocked);
 typedef void (*TintaInvokeLinkFn)(TintaApp *app, const char *url);
+typedef void (*TintaResourceErrorFn)(TintaApp *app, bool remote,
+                                     const wchar_t *resolved_uri,
+                                     HRESULT error);
 
 struct TintaApp {
     HINSTANCE instance;
@@ -176,8 +191,6 @@ struct TintaApp {
     int height;
     float dpi_scale;
     float zoom;
-    float format_zoom;
-    bool zoom_apply_pending;
     bool com_initialized;
     float scroll_y;
     float scroll_x;
@@ -202,9 +215,8 @@ struct TintaApp {
     IDWriteTextFormat *ui_format;
 
     TintaParseResult document;
+    uint64_t document_revision;
     TintaStr8 source;
-    TintaStr16 current_file;
-    FILETIME file_time;
     bool layout_dirty;
     bool layout_complete;
     bool layout_chunk_posted;
@@ -218,6 +230,9 @@ struct TintaApp {
     TintaVec code_blocks;
     TintaVec headings;
     TintaVec scroll_anchors;
+    bool scroll_anchor_pending;
+    size_t pending_scroll_source_offset;
+    float pending_scroll_delta;
     TintaVec hit_entries;
     bool hit_index_dirty;
     TintaStr16 doc_text;
@@ -225,16 +240,20 @@ struct TintaApp {
     int viewer_search_index;
     TintaStr16 search_query;
     TintaVec image_resources;
-    TintaVec worker_handles;
-    SRWLOCK remote_results_lock;
-    TintaVec remote_results;
-    volatile LONG closing;
-    volatile LONG document_generation;
+#if TINTA_ENABLE_MERMAID
+    TintaVec mermaid_cache;
+#endif
+    TintaImageAsync *image_async;
     TintaResolveImageFn resolve_image;
     TintaInvokeLinkFn invoke_link;
+    TintaResourceErrorFn resource_error;
     void *resource_context;
     size_t max_ast_nodes;
+    size_t max_ast_depth;
+    size_t max_mermaid_nodes;
+    size_t max_mermaid_edges;
     uint64_t max_image_pixels;
+    uint64_t max_remote_image_bytes;
     size_t max_image_resources;
     size_t max_concurrent_downloads;
     void *uia_provider;
@@ -258,6 +277,7 @@ struct TintaApp {
     float h_scrollbar_drag_start_scroll;
 
     size_t parse_time_us;
+    size_t ast_node_count;
     size_t layout_time_us;
     size_t draw_calls;
 };
@@ -284,7 +304,21 @@ bool tinta_app_load_source(TintaApp *app, const char *source, size_t length,
                            const wchar_t *path);
 bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
                              const wchar_t *path, bool new_document);
+bool tinta_app_prepare_source(const char *source, size_t length,
+                              const wchar_t *path, size_t max_nodes,
+                              size_t max_depth, TintaPreparedSource *prepared);
+void tinta_app_destroy_prepared_source(TintaPreparedSource *prepared);
+void tinta_app_commit_prepared_source(TintaApp *app,
+                                      TintaPreparedSource *prepared,
+                                      bool new_document);
 void tinta_app_clear_image_resources(TintaApp *app);
+void tinta_app_invalidate_image_requests(TintaApp *app);
+#if TINTA_ENABLE_MERMAID
+void tinta_app_clear_mermaid_cache(TintaApp *app);
+const TintaMermaidParseResult *tinta_app_mermaid_parse(
+    TintaApp *app, const TintaElement *element,
+    const char *source, size_t length);
+#endif
 
 void tinta_layout_clear(TintaApp *app);
 bool tinta_layout_document(TintaApp *app);
@@ -306,8 +340,6 @@ void tinta_copy_selection(TintaApp *app);
 bool tinta_copy_code_at(TintaApp *app, int x, int y);
 int tinta_code_block_at(const TintaApp *app, int x, int y);
 bool tinta_code_button_at(const TintaApp *app, int x, int y);
-void tinta_search_next(TintaApp *app);
-void tinta_viewer_update_search(TintaApp *app);
 bool tinta_jump_to_internal_link(TintaApp *app, const char *url);
 
 bool tinta_image_resource_get(TintaApp *app, const char *url,

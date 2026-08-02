@@ -3,10 +3,18 @@
 /* Root provider lifetime, window properties, and the custom scroll pattern. */
 
 HRESULT tinta_uia_root_available(TintaUiaRoot *root, TintaApp **app) {
-    if (!root || !root->app || !IsWindow(root->app->hwnd))
+    if (!root) return UIA_E_ELEMENTNOTAVAILABLE;
+    EnterCriticalSection(&root->guard);
+    if (!root->app || !IsWindow(root->app->hwnd)) {
+        LeaveCriticalSection(&root->guard);
         return UIA_E_ELEMENTNOTAVAILABLE;
+    }
     if (app) *app = root->app;
     return S_OK;
+}
+
+void tinta_uia_root_done(TintaUiaRoot *root) {
+    if (root) LeaveCriticalSection(&root->guard);
 }
 
 ULONG tinta_uia_root_add_ref(TintaUiaRoot *root) {
@@ -15,7 +23,10 @@ ULONG tinta_uia_root_add_ref(TintaUiaRoot *root) {
 
 ULONG tinta_uia_root_release(TintaUiaRoot *root) {
     LONG value = InterlockedDecrement(&root->references);
-    if (!value) free(root);
+    if (!value) {
+        DeleteCriticalSection(&root->guard);
+        free(root);
+    }
     return (ULONG)value;
 }
 
@@ -80,8 +91,11 @@ static HRESULT STDMETHODCALLTYPE root_get_provider_options(
 static HRESULT STDMETHODCALLTYPE root_get_pattern(
     IRawElementProviderSimple *self, PATTERNID pattern, IUnknown **result) {
     TintaUiaRoot *root = root_from_simple(self);
+    HRESULT hr;
     if (!result) return E_POINTER;
     *result = NULL;
+    hr = tinta_uia_root_available(root, NULL);
+    if (FAILED(hr)) return hr;
     if (pattern == UIA_TextPatternId) {
         *result = (IUnknown *)&root->text;
         tinta_uia_root_add_ref(root);
@@ -89,6 +103,7 @@ static HRESULT STDMETHODCALLTYPE root_get_pattern(
         *result = (IUnknown *)&root->scroll;
         tinta_uia_root_add_ref(root);
     }
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -103,6 +118,7 @@ static HRESULT STDMETHODCALLTYPE root_get_property(
     TintaUiaRoot *root = root_from_simple(self);
     TintaApp *app;
     HRESULT hr;
+    HRESULT result_hr = S_OK;
     if (!result) return E_POINTER;
     VariantInit(result);
     hr = tinta_uia_root_available(root, &app);
@@ -111,13 +127,13 @@ static HRESULT STDMETHODCALLTYPE root_get_property(
         V_VT(result) = VT_I4;
         V_I4(result) = UIA_DocumentControlTypeId;
     } else if (property == UIA_NamePropertyId) {
-        return tinta_uia_variant_bstr(result, L"Markdown document");
+        result_hr = tinta_uia_variant_bstr(result, L"Markdown document");
     } else if (property == UIA_AutomationIdPropertyId) {
-        return tinta_uia_variant_bstr(result, L"Tinta.MarkdownView");
+        result_hr = tinta_uia_variant_bstr(result, L"Tinta.MarkdownView");
     } else if (property == UIA_FrameworkIdPropertyId) {
-        return tinta_uia_variant_bstr(result, L"Tinta");
+        result_hr = tinta_uia_variant_bstr(result, L"Tinta");
     } else if (property == UIA_ClassNamePropertyId) {
-        return tinta_uia_variant_bstr(result, L"Tinta.MarkdownView");
+        result_hr = tinta_uia_variant_bstr(result, L"Tinta.MarkdownView");
     } else if (property == UIA_IsKeyboardFocusablePropertyId ||
                property == UIA_IsControlElementPropertyId ||
                property == UIA_IsContentElementPropertyId ||
@@ -131,7 +147,8 @@ static HRESULT STDMETHODCALLTYPE root_get_property(
         V_VT(result) = VT_I4;
         V_I4(result) = (LONG)(LONG_PTR)app->hwnd;
     }
-    return S_OK;
+    tinta_uia_root_done(root);
+    return result_hr;
 }
 
 static HRESULT STDMETHODCALLTYPE root_get_host(
@@ -143,7 +160,9 @@ static HRESULT STDMETHODCALLTYPE root_get_host(
     *result = NULL;
     hr = tinta_uia_root_available(root, &app);
     if (FAILED(hr)) return hr;
-    return UiaHostProviderFromHwnd(app->hwnd, result);
+    hr = UiaHostProviderFromHwnd(app->hwnd, result);
+    tinta_uia_root_done(root);
+    return hr;
 }
 
 
@@ -173,6 +192,7 @@ static HRESULT STDMETHODCALLTYPE scroll_action(IScrollProvider *self,
     app->scroll_y = max(0.0f, min(app->scroll_y + dy,
         max(0.0f, app->content_height - app->height)));
     InvalidateRect(app->hwnd, NULL, FALSE);
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -189,62 +209,69 @@ static HRESULT STDMETHODCALLTYPE scroll_set_percent(IScrollProvider *self,
         app->scroll_y = (float)(max(0.0, min(vertical, 100.0)) / 100.0 *
             max(0.0f, app->content_height - app->height));
     InvalidateRect(app->hwnd, NULL, FALSE);
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE scroll_get_horizontal_percent(
     IScrollProvider *self, double *result) {
     TintaUiaRoot *root = root_from_scroll(self); TintaApp *app;
-    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     if (!result) return E_POINTER;
+    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     *result = scroll_percent(app->scroll_x, app->content_width, (float)app->width);
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE scroll_get_vertical_percent(
     IScrollProvider *self, double *result) {
     TintaUiaRoot *root = root_from_scroll(self); TintaApp *app;
-    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     if (!result) return E_POINTER;
+    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     *result = scroll_percent(app->scroll_y, app->content_height, (float)app->height);
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE scroll_get_horizontal_view(
     IScrollProvider *self, double *result) {
     TintaUiaRoot *root = root_from_scroll(self); TintaApp *app;
-    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     if (!result) return E_POINTER;
+    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     *result = app->content_width > 0 ? min(100.0,
         app->width / app->content_width * 100.0) : 100.0;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE scroll_get_vertical_view(
     IScrollProvider *self, double *result) {
     TintaUiaRoot *root = root_from_scroll(self); TintaApp *app;
-    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     if (!result) return E_POINTER;
+    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     *result = app->content_height > 0 ? min(100.0,
         app->height / app->content_height * 100.0) : 100.0;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE scroll_get_horizontal_scrollable(
     IScrollProvider *self, BOOL *result) {
     TintaUiaRoot *root = root_from_scroll(self); TintaApp *app;
-    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     if (!result) return E_POINTER;
+    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     *result = app->content_width > app->width;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE scroll_get_vertical_scrollable(
     IScrollProvider *self, BOOL *result) {
     TintaUiaRoot *root = root_from_scroll(self); TintaApp *app;
-    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     if (!result) return E_POINTER;
+    HRESULT hr = tinta_uia_root_available(root, &app); if (FAILED(hr)) return hr;
     *result = app->content_height > app->height;
+    tinta_uia_root_done(root);
     return S_OK;
 }
 
@@ -270,6 +297,7 @@ static TintaUiaRoot *root_create(TintaApp *app) {
     root->text.lpVtbl = &tinta_uia_text_vtable;
     root->scroll.lpVtbl = &root_scroll_vtable;
     root->references = 1;
+    InitializeCriticalSection(&root->guard);
     root->app = app;
     return root;
 }
@@ -292,19 +320,61 @@ void tinta_uia_disconnect(TintaApp *app) {
     if (!app || !app->uia_provider) return;
     root = (TintaUiaRoot *)app->uia_provider;
     app->uia_provider = NULL;
-    UiaDisconnectProvider(&root->simple);
     root->app = NULL;
+    LeaveCriticalSection(&root->guard);
+    UiaDisconnectProvider(&root->simple);
+    EnterCriticalSection(&root->guard);
+    tinta_uia_root_release(root);
+}
+
+typedef struct TintaUiaEventWork {
+    TintaUiaRoot *root;
+    EVENTID event_id;
+} TintaUiaEventWork;
+
+static DWORD CALLBACK raise_event_worker(void *parameter) {
+    TintaUiaEventWork *work = (TintaUiaEventWork *)parameter;
+    UiaRaiseAutomationEvent(&work->root->simple, work->event_id);
+    tinta_uia_root_release(work->root);
+    free(work);
+    return 0;
+}
+
+static void queue_event(TintaUiaRoot *root, EVENTID event_id) {
+    TintaUiaEventWork *work;
+    if (!root) return;
+    work = (TintaUiaEventWork *)malloc(sizeof(*work));
+    if (!work) return;
+    work->root = root;
+    work->event_id = event_id;
+    tinta_uia_root_add_ref(root);
+    if (!QueueUserWorkItem(raise_event_worker, work, WT_EXECUTEDEFAULT)) {
+        tinta_uia_root_release(root);
+        free(work);
+    }
+}
+
+void *tinta_uia_lock_app(TintaApp *app) {
+    TintaUiaRoot *root;
+    if (!app || !(root = (TintaUiaRoot *)app->uia_provider)) return NULL;
+    tinta_uia_root_add_ref(root);
+    EnterCriticalSection(&root->guard);
+    return root;
+}
+
+void tinta_uia_unlock_app(void *lock) {
+    TintaUiaRoot *root = (TintaUiaRoot *)lock;
+    if (!root) return;
+    LeaveCriticalSection(&root->guard);
     tinta_uia_root_release(root);
 }
 
 void tinta_uia_raise_text_changed(TintaApp *app) {
     TintaUiaRoot *root = app ? (TintaUiaRoot *)app->uia_provider : NULL;
-    if (root) UiaRaiseAutomationEvent(&root->simple,
-                                      UIA_Text_TextChangedEventId);
+    queue_event(root, UIA_Text_TextChangedEventId);
 }
 
 void tinta_uia_raise_selection_changed(TintaApp *app) {
     TintaUiaRoot *root = app ? (TintaUiaRoot *)app->uia_provider : NULL;
-    if (root) UiaRaiseAutomationEvent(&root->simple,
-                                      UIA_Text_TextSelectionChangedEventId);
+    queue_event(root, UIA_Text_TextSelectionChangedEventId);
 }

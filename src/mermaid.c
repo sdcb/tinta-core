@@ -40,6 +40,8 @@ typedef struct ParseState {
     TintaStringMap node_ids;
     TintaStringMap class_ids;
     TintaMermaidDirection direction;
+    size_t max_nodes;
+    size_t max_edges;
 } ParseState;
 
 typedef struct IndexList {
@@ -533,6 +535,8 @@ static bool ensure_node(ParseState *state, const NodeSpec *spec, size_t *index) 
     }
     {
         TintaMermaidNode node;
+        if (state->max_nodes && state->nodes.len >= state->max_nodes)
+            return false;
         memset(&node, 0, sizeof(node));
         node.id = tinta_str8_dup(spec->id.data, spec->id.len);
         node.label = tinta_str8_dup(spec->label.data, spec->label.len);
@@ -632,7 +636,8 @@ static TintaMermaidParseResult fail_result(ParseState *state, char *normalized,
     return result;
 }
 
-TintaMermaidParseResult tinta_mermaid_parse(const char *source, size_t length) {
+TintaMermaidParseResult tinta_mermaid_parse_limited(
+    const char *source, size_t length, size_t max_nodes, size_t max_edges) {
     TintaMermaidParseResult result;
     ParseState state;
     char *normalized;
@@ -648,6 +653,8 @@ TintaMermaidParseResult tinta_mermaid_parse(const char *source, size_t length) {
         result.error = tinta_str8_dup("Out of memory", 13);
         return result;
     }
+    state.max_nodes = max_nodes;
+    state.max_edges = max_edges;
     normalized = tinta_str8_dup(source ? source : "", length);
     if (!normalized) return fail_result(&state, NULL, 0, NULL);
     normalize_statements(normalized, length);
@@ -784,7 +791,9 @@ TintaMermaidParseResult tinta_mermaid_parse(const char *source, size_t length) {
                     edge.stroke_scale = arrow.stroke_scale;
                     arrow_spec_destroy(&arrow);
                     node_spec_destroy(&next);
-                    if (!edge.label || !tinta_vec_push(&state.edges, &edge)) {
+                    if ((state.max_edges &&
+                         state.edges.len >= state.max_edges) ||
+                        !edge.label || !tinta_vec_push(&state.edges, &edge)) {
                         edge_destroy(&edge);
                         return fail_result(&state, normalized, line_number, error);
                     }
@@ -816,6 +825,10 @@ TintaMermaidParseResult tinta_mermaid_parse(const char *source, size_t length) {
     free(normalized);
     result.success = true;
     return result;
+}
+
+TintaMermaidParseResult tinta_mermaid_parse(const char *source, size_t length) {
+    return tinta_mermaid_parse_limited(source, length, 0, 0);
 }
 
 void tinta_mermaid_parse_result_destroy(TintaMermaidParseResult *result) {
@@ -1034,4 +1047,3 @@ void tinta_mermaid_layout_destroy(TintaMermaidLayout *layout) {
     free(layout->ranks);
     memset(layout, 0, sizeof(*layout));
 }
-

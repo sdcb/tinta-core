@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.0
+
+- Stabilized the public Win32 control ABI and added runtime version,
+  capability, statistics, and resource-error reporting.
+- Moved streamed Markdown parsing to a latest-only background pipeline while
+  retaining HWND-thread document commits and incremental layout.
+- Added document revisions for UI Automation ranges and semantic children,
+  notification-time lifetime protection, transactional document/base-URI
+  changes, and deterministic image-worker shutdown.
+- Enforced Markdown depth/node, Mermaid node/edge, remote download byte, image
+  pixel, resource-count, and download-concurrency limits before expensive work.
+- Added process-wide bounded remote-image pixel caching and per-document
+  Mermaid parse caching.
+- Improved long-paragraph wrapping, search highlighting, viewport draw
+  culling, scroll anchoring, duplicate-heading accessibility mapping, and
+  theme font consistency.
+- Added optional UIA/Mermaid/syntax/local-image/remote-image feature trimming,
+  a pure-C normal build, package-consumer checks, parser fuzz/benchmark tools,
+  and full/trimmed CI coverage.
+
 ## 0.3.0
 
 - Added opt-in height autosizing with optional minimum and maximum heights.

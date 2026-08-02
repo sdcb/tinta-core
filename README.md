@@ -49,6 +49,10 @@ provides a scrolling left/right conversation layout, and sends 128 simulated
 SSE deltas through the streaming API. Its first response also demonstrates a
 cached local image and an optional remote image.
 
+For parser hardening and performance work, configure
+`TINTA_BUILD_FUZZERS=ON` and/or `TINTA_BUILD_BENCHMARKS=ON`. These targets are
+off by default and do not add C++ to a normal library build.
+
 ## Minimal use
 
 ```c
@@ -69,7 +73,8 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   UTF-8, a Markdown/Mermaid format, and an optional local or HTTP base URI.
 - `TMM_STREAM_BEGIN`, `TMM_STREAM_APPEND`, `TMM_STREAM_END` and
   `TMM_STREAM_CANCEL` accept arbitrary UTF-8 delta boundaries. The control
-  copies each delta, coalesces full parse/layout revisions at 20 Hz by default,
+  copies each delta, coalesces revisions at 20 Hz by default, parses the latest
+  snapshot on a worker thread, commits it transactionally on the HWND thread,
   and reports displayed revisions with `TMN_STREAMUPDATED`.
 - `TMM_SETAUTOSIZE` can fit the control height to its content and optionally
   cap it at a maximum height. Overflow continues to use the control's internal
@@ -84,10 +89,19 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   return default, block, or replace the resource URI.
 - Local and remote image resolution, download failures, decoded WIC sources,
   and device-specific Direct2D bitmaps are cached per control for the lifetime
-  of a streamed document. Image reflow sends `TMN_CONTENTUPDATED`.
-- The default limits are 64 MiB of Markdown, one million AST nodes, 64 million
-  decoded pixels per image, 512 image resources and four concurrent downloads.
+  of a streamed document. Successfully decoded remote pixel data also uses a
+  bounded process cache so later controls do not download/decode it again.
+  Image failures send `TMN_RESOURCEERROR`; image reflow sends
+  `TMN_CONTENTUPDATED`.
+- The default limits are 64 MiB of Markdown, one million AST nodes, an AST
+  depth of 256, 10,000 Mermaid nodes, 20,000 Mermaid edges, 64 MiB per remote
+  image, 64 million decoded pixels per image, 512 image resources and four
+  concurrent downloads.
+- `TMM_GETVERSION`, `TMM_GETCAPABILITIES`, and `TMM_GETSTATS` let hosts inspect
+  the loaded build and current document without relying on compile-time
+  assumptions.
 
 `Tinta.MarkdownView` exposes the UI Automation Document, Text and Scroll
 patterns. Headings and links appear as semantic children, and links implement
-the Invoke pattern.
+the Invoke pattern. Text ranges carry their source revision and become
+unavailable after the document is replaced instead of reading unrelated text.

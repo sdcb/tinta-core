@@ -232,6 +232,47 @@ void tinta_layout_clear(TintaApp *app) {
     app->hovered_code_block = -1;
 }
 
+static void capture_scroll_anchor(TintaApp *app) {
+    size_t i;
+    const TintaScrollAnchor *chosen = NULL;
+    if (!app || app->scroll_anchor_pending || app->scroll_y <= 0)
+        return;
+    for (i = 0; i < app->scroll_anchors.len; i++) {
+        const TintaScrollAnchor *anchor = TINTA_VEC_PTR(
+            TintaScrollAnchor, app->scroll_anchors, i);
+        if (anchor->rendered_y > app->scroll_y) break;
+        chosen = anchor;
+    }
+    if (chosen) {
+        app->scroll_anchor_pending = true;
+        app->pending_scroll_source_offset = chosen->source_offset;
+        app->pending_scroll_delta = app->scroll_y - chosen->rendered_y;
+    }
+}
+
+static void restore_scroll_anchor(TintaApp *app, bool layout_complete) {
+    size_t i;
+    const TintaScrollAnchor *chosen = NULL;
+    if (!app || !app->scroll_anchor_pending) return;
+    for (i = 0; i < app->scroll_anchors.len; i++) {
+        const TintaScrollAnchor *anchor = TINTA_VEC_PTR(
+            TintaScrollAnchor, app->scroll_anchors, i);
+        if (anchor->source_offset > app->pending_scroll_source_offset) break;
+        chosen = anchor;
+    }
+    if (chosen && (layout_complete ||
+        app->scroll_anchors.len &&
+        TINTA_VEC_AT(TintaScrollAnchor, app->scroll_anchors,
+                     app->scroll_anchors.len - 1).source_offset >=
+            app->pending_scroll_source_offset)) {
+        app->scroll_y = maxf(0, chosen->rendered_y +
+                                  app->pending_scroll_delta);
+        app->scroll_anchor_pending = false;
+    } else if (layout_complete) {
+        app->scroll_anchor_pending = false;
+    }
+}
+
 static void apply_font_fallback(TintaApp *app, IDWriteTextLayout *layout) {
     if (app->font_fallback) {
         IDWriteTextLayout2 *layout2 = NULL;
@@ -457,81 +498,90 @@ static bool flatten_ruby(const TintaElement *element, TintaStr8 *base,
     return true;
 }
 
-static size_t fit_text(TintaApp *app, IDWriteTextFormat *format,
-                       const wchar_t *text, size_t length, float max_width,
-                       size_t *natural_break) {
+static bool text_clusters(TintaApp *app, IDWriteTextFormat *format,
+                          const wchar_t *text, size_t length,
+                          TintaDWriteClusterMetrics **clusters,
+                          UINT32 *count) {
     IDWriteTextLayout *layout = NULL;
     TintaDWriteTextMetrics text_metrics;
-    TintaDWriteClusterMetrics *clusters = NULL;
-    UINT32 count = 0;
-    UINT32 i;
-    size_t consumed = 0;
-    float width = 0;
-    if (natural_break) *natural_break = 0;
+    *clusters = NULL;
+    *count = 0;
     if (!create_text_layout(app, format, text, length, 100000.0f,
-                            &layout, &text_metrics)) return 0;
-    layout->lpVtbl->GetClusterMetrics(layout, NULL, 0, &count);
-    if (!count) {
+                            &layout, &text_metrics)) return false;
+    layout->lpVtbl->GetClusterMetrics(layout, NULL, 0, count);
+    if (!*count) {
         layout->lpVtbl->Release(layout);
-        return 0;
+        return true;
     }
-    clusters = (TintaDWriteClusterMetrics *)calloc(count, sizeof(*clusters));
-    if (!clusters || FAILED(layout->lpVtbl->GetClusterMetrics(
-            layout, clusters, count, &count))) {
-        free(clusters);
+    *clusters = (TintaDWriteClusterMetrics *)calloc(*count,
+                                                    sizeof(**clusters));
+    if (!*clusters || FAILED(layout->lpVtbl->GetClusterMetrics(
+            layout, *clusters, *count, count))) {
+        free(*clusters);
+        *clusters = NULL;
+        *count = 0;
         layout->lpVtbl->Release(layout);
-        return 0;
+        return false;
     }
-    for (i = 0; i < count; i++) {
-        if (width + clusters[i].width > max_width) {
-            if (!consumed) consumed = clusters[i].length;
-            break;
-        }
-        width += clusters[i].width;
-        consumed += clusters[i].length;
-        if (natural_break && clusters[i].canWrapLineAfter)
-            *natural_break = consumed;
-    }
-    free(clusters);
     layout->lpVtbl->Release(layout);
-    return consumed;
+    return true;
 }
 
 static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
                         size_t length, const InlineStyle *style) {
     size_t position = 0;
     while (position < length) {
-        size_t newline = position, fit, use, natural_break = 0;
-        float max_width = maxf(1, state->right - state->x);
+        size_t newline = position;
+        size_t line_position;
+        UINT32 cluster_index = 0;
+        UINT32 cluster_count = 0;
+        TintaDWriteClusterMetrics *clusters = NULL;
         while (newline < length && text[newline] != L'\n') newline++;
         if (newline == position) {
             const wchar_t nl = L'\n';
-            tinta_str16_append(&app->doc_text, &nl, 1);
+            if (!tinta_str16_append(&app->doc_text, &nl, 1)) return false;
             state->x = state->left; state->y += state->line_height;
             state->line_height = state->base_line_height; position++; continue;
         }
-        fit = fit_text(app, style->format, text + position,
-                       newline - position, max_width, &natural_break);
-        if (!fit) {
-            state->x = state->left; state->y += state->line_height;
-            state->line_height = state->base_line_height; continue;
-        }
-        use = fit;
-        if (position + fit < newline) {
-            if (natural_break) use = natural_break;
-            else if (state->x > state->left) {
+        if (!text_clusters(app, style->format, text + position,
+                           newline - position, &clusters, &cluster_count))
+            return false;
+        line_position = position;
+        while (cluster_index < cluster_count) {
+            UINT32 scan = cluster_index;
+            UINT32 natural_break = cluster_index;
+            size_t use = 0;
+            float width = 0;
+            float max_width = maxf(1, state->right - state->x);
+            TintaTextRun *run = NULL;
+            float offset = style->script < 0 ? -state->base_line_height * 0.18f :
+                           style->script > 0 ? state->base_line_height * 0.28f : 0;
+            while (scan < cluster_count &&
+                   width + clusters[scan].width <= max_width) {
+                width += clusters[scan].width;
+                if (clusters[scan].canWrapLineAfter) natural_break = scan + 1;
+                scan++;
+            }
+            if (scan == cluster_index && state->x > state->left) {
                 state->x = state->left;
                 state->y += state->line_height;
                 state->line_height = state->base_line_height;
                 continue;
             }
-        }
-        {
-            TintaTextRun *run = NULL;
-            float offset = style->script < 0 ? -state->base_line_height * 0.18f :
-                           style->script > 0 ? state->base_line_height * 0.28f : 0;
-            if (!append_run(app, text + position, use, style->format, style->color,
-                            state->x, state->y + offset, style->url, &run)) return false;
+            if (scan == cluster_index) scan++;
+            if (scan < cluster_count && natural_break > cluster_index)
+                scan = natural_break;
+            {
+                UINT32 index;
+                for (index = cluster_index; index < scan; index++)
+                    use += clusters[index].length;
+            }
+            if (!append_run(app, text + line_position, use,
+                            style->format, style->color, state->x,
+                            state->y + offset, style->url, &run)) {
+                free(clusters);
+                return false;
+            }
             run->underline = style->underline;
             run->strikethrough = style->strikethrough;
             if (style->highlight)
@@ -540,13 +590,27 @@ static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
                          app->theme->dark ? 0x665A18 : 0xFFF0A6,
                          scale(app, 2), false, 0);
             state->line_height = maxf(state->line_height, run->height + fabsf(offset));
-            position += use;
-            if (position < newline || position < length && text[position] == L'\n') {
-                while (position < newline && iswspace(text[position])) position++;
+            line_position += use;
+            cluster_index = scan;
+            if (cluster_index < cluster_count) {
+                while (cluster_index < cluster_count &&
+                       clusters[cluster_index].isWhitespace) {
+                    line_position += clusters[cluster_index].length;
+                    cluster_index++;
+                }
                 state->x = state->left; state->y += state->line_height;
                 state->line_height = state->base_line_height;
-                if (position < length && text[position] == L'\n') position++;
             } else state->x += run->width;
+        }
+        free(clusters);
+        position = newline;
+        if (position < length && text[position] == L'\n') {
+            const wchar_t nl = L'\n';
+            if (!tinta_str16_append(&app->doc_text, &nl, 1)) return false;
+            state->x = state->left;
+            state->y += state->line_height;
+            state->line_height = state->base_line_height;
+            position++;
         }
     }
     return true;
@@ -700,8 +764,7 @@ static bool layout_paragraph(TintaApp *app, const TintaElement *element,
     for (i = 0; i < element->child_count; i++)
         if (!layout_inline(app, element->children[i], &state, style)) return false;
     *y = state.y + state.line_height + scale(app, 14);
-    tinta_str16_append(&app->doc_text, L"\n\n", 2);
-    return true;
+    return tinta_str16_append(&app->doc_text, L"\n\n", 2);
 }
 
 static wchar_t *heading_slug(TintaApp *app, const wchar_t *text, size_t length) {
@@ -761,6 +824,7 @@ static bool layout_heading(TintaApp *app, const TintaElement *element,
     bool ok = flatten(element, &utf8) && tinta_utf8_to_utf16(utf8.data, utf8.len, &wide);
     if (ok) {
         float line_height;
+        heading.doc_start = app->doc_text.len;
         *y += scale(app, level == 1 ? 16.0f : 20.0f);
         line_height = format_line_height(app->heading_formats[level - 1]);
         state.left = state.x = left; state.right = right; state.y = *y;
@@ -774,6 +838,7 @@ static bool layout_heading(TintaApp *app, const TintaElement *element,
         heading.text = tinta_wcsdup_n(wide.data, wide.len);
         heading.slug = heading_slug(app, wide.data, wide.len);
         heading.level = level; heading.y = state.y;
+        heading.doc_length = app->doc_text.len - heading.doc_start;
         if (!heading.text || !heading.slug || !tinta_vec_push(&app->headings, &heading)) {
             free(heading.text); free(heading.slug); ok = false;
         }
@@ -785,7 +850,7 @@ static bool layout_heading(TintaApp *app, const TintaElement *element,
             *y += stroke;
         }
         *y += scale(app, 12);
-        tinta_str16_append(&app->doc_text, L"\n\n", 2);
+        if (!tinta_str16_append(&app->doc_text, L"\n\n", 2)) ok = false;
     }
     tinta_str8_destroy(&utf8); tinta_str16_destroy(&wide); return ok;
 }
@@ -935,7 +1000,8 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
                 size_t inline_index;
                 if (inline_active) {
                     *y = state.y + state.line_height;
-                    tinta_str16_append(&app->doc_text, L"\n", 1);
+                    if (!tinta_str16_append(&app->doc_text, L"\n", 1))
+                        return false;
                     inline_active = false;
                 }
                 state = (InlineState){item_left, right, item_left, *y,
@@ -948,7 +1014,8 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
                                        &state, style)) return false;
                 }
                 *y = state.y + state.line_height + scale(app, 4);
-                tinta_str16_append(&app->doc_text, L"\n", 1);
+                if (!tinta_str16_append(&app->doc_text, L"\n", 1))
+                    return false;
             } else if (content->type == TINTA_ELEMENT_TEXT ||
                        content->type == TINTA_ELEMENT_CODE ||
                        content->type == TINTA_ELEMENT_EMPHASIS ||
@@ -973,7 +1040,8 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
             } else {
                 if (inline_active) {
                     *y = state.y + state.line_height + scale(app, 4);
-                    tinta_str16_append(&app->doc_text, L"\n", 1);
+                    if (!tinta_str16_append(&app->doc_text, L"\n", 1))
+                        return false;
                     inline_active = false;
                 }
                 if (!layout_element(app, content, y, item_left, right)) return false;
@@ -981,10 +1049,10 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
         }
         if (inline_active) {
             *y = state.y + state.line_height;
-            tinta_str16_append(&app->doc_text, L"\n", 1);
+            if (!tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
         }
         *y = maxf(*y, item_start + scale(app, 28));
-        tinta_str16_append(&app->doc_text, L"\n", 1);
+        if (!tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
     }
     *y += scale(app, 8);
     return true;
@@ -1214,6 +1282,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                            float *y, float left, float right) {
     TintaStr8 source={0};
     TintaMermaidParseResult parsed;
+    const TintaMermaidParseResult *cached;
     TintaMermaidSize *sizes = NULL; TintaMermaidLayout graph; size_t i; float top = *y;
     TintaVec label_boxes;
     memset(&graph, 0, sizeof(graph));
@@ -1222,11 +1291,12 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
         tinta_vec_destroy(&label_boxes);
         return false;
     }
-    parsed=tinta_mermaid_parse(source.data,source.len);
+    cached = tinta_app_mermaid_parse(app, element, source.data, source.len);
+    if (!cached) goto failed;
+    parsed = *cached;
     if (!parsed.success) {
         bool fallback;
         app->focus_mermaid_on_next_layout = false;
-        tinta_mermaid_parse_result_destroy(&parsed);
         tinta_str8_destroy(&source);
         tinta_vec_destroy(&label_boxes);
         fallback = layout_code(app, element, y, left, right);
@@ -1489,9 +1559,9 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
         }
         *y = diagram_bottom + scale(app, 24);
     }
-    tinta_mermaid_layout_destroy(&graph); tinta_mermaid_parse_result_destroy(&parsed); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return true;
+    tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return true;
 failed:
-    tinta_mermaid_layout_destroy(&graph); tinta_mermaid_parse_result_destroy(&parsed); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return false;
+    tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return false;
 }
 #endif
 
@@ -1574,6 +1644,13 @@ static bool layout_element(TintaApp *app, const TintaElement *element,
     }
 }
 
+static void validate_document_positions(TintaApp *app) {
+    if (app->selection_anchor > app->doc_text.len)
+        app->selection_anchor = app->doc_text.len;
+    if (app->selection_focus > app->doc_text.len)
+        app->selection_focus = app->doc_text.len;
+}
+
 bool tinta_layout_document(TintaApp *app) {
     uint64_t start = performance_time_us();
     float width = viewport_width(app), margin = scale(app, 40), y = scale(app, 20);
@@ -1582,6 +1659,7 @@ bool tinta_layout_document(TintaApp *app) {
         app->layout_dirty = false;
         return true;
     }
+    capture_scroll_anchor(app);
     tinta_layout_clear(app); app->content_width = width;
     if (!layout_element(app, app->document.root, &y, margin, maxf(margin + 1, width - margin))) return false;
     app->content_height = y + scale(app, 40);
@@ -1591,6 +1669,8 @@ bool tinta_layout_document(TintaApp *app) {
     app->layout_complete = true;
     app->layout_chunk_posted = false;
     app->layout_dirty = false;
+    validate_document_positions(app);
+    restore_scroll_anchor(app, true);
     return true;
 }
 
@@ -1620,12 +1700,15 @@ static bool layout_incremental_chunk(TintaApp *app, DWORD time_budget_ms,
     app->layout_complete = app->layout_next_block >= root->child_count;
     app->content_height = app->layout_cursor_y + scale(app, 40);
     if (!laid_out_block && !root->child_count) app->layout_complete = true;
+    if (app->layout_complete) validate_document_positions(app);
+    restore_scroll_anchor(app, app->layout_complete);
     return true;
 }
 
 bool tinta_layout_document_viewport_first(TintaApp *app) {
     float width = viewport_width(app);
     float target_y = app->scroll_y + app->height * 2.0f;
+    capture_scroll_anchor(app);
     tinta_layout_clear(app);
     app->content_width = width;
     app->content_height = 0;
@@ -1721,6 +1804,7 @@ static void fill_color(TintaApp *app, const RECT *rect, uint32_t color) {
 static void draw_run(TintaApp *app, const TintaTextRun *run, float vx, float scroll) {
     D2D1_POINT_2F origin = {vx + run->x, run->y - scroll};
     D2D1_POINT_2F a, b;
+    if (origin.y + run->height < 0 || origin.y > app->height) return;
     set_brush_alpha(app, run->color, run->opacity);
     tinta_draw_text_layout(app, origin, run->layout,
                            (ID2D1Brush *)app->brush,
@@ -1741,7 +1825,10 @@ static void highlight_run(TintaApp *app, const TintaTextRun *run, float vx,
     FLOAT x1 = 0, y1 = 0, x2 = 0, y2 = 0;
     TintaDWriteHitTestMetrics metrics;
     RECT rect;
-    if (end <= run->doc_start || start >= run->doc_start + run->doc_length) return;
+    if (run->y - scroll + run->height < 0 ||
+        run->y - scroll > app->height ||
+        end <= run->doc_start || start >= run->doc_start + run->doc_length)
+        return;
     local_start = start > run->doc_start ? start - run->doc_start : 0;
     local_end = end < run->doc_start + run->doc_length ? end - run->doc_start : run->doc_length;
     if (local_start >= local_end || local_start > UINT32_MAX || local_end > UINT32_MAX) return;
@@ -1793,31 +1880,38 @@ static void immediate_text_ellipsis(TintaApp *app, IDWriteTextFormat *format,
     }
     while (low < high) {
         size_t middle = low + (high - low + 1) / 2;
-        SIZE part;
+        SIZE part = {0};
         if (keep_end) {
             TintaStr16 candidate = {0};
-            tinta_str16_append(&candidate, ellipsis, 1);
-            tinta_str16_append(&candidate, text + length - middle, middle);
-            part = measure(app, format, candidate.data, candidate.len);
+            if (!tinta_str16_append(&candidate, ellipsis, 1) ||
+                !tinta_str16_append(
+                    &candidate, text + length - middle, middle))
+                part.cx = INT_MAX;
+            else
+                part = measure(app, format, candidate.data, candidate.len);
             tinta_str16_destroy(&candidate);
         } else {
             TintaStr16 candidate = {0};
-            tinta_str16_append(&candidate, text, middle);
-            tinta_str16_append(&candidate, ellipsis, 1);
-            part = measure(app, format, candidate.data, candidate.len);
+            if (!tinta_str16_append(&candidate, text, middle) ||
+                !tinta_str16_append(&candidate, ellipsis, 1))
+                part.cx = INT_MAX;
+            else
+                part = measure(app, format, candidate.data, candidate.len);
             tinta_str16_destroy(&candidate);
         }
         if ((float)part.cx <= available) low = middle;
         else high = middle - 1;
     }
     if (keep_end) {
-        tinta_str16_append(&clipped, ellipsis, 1);
-        tinta_str16_append(&clipped, text + length - low, low);
+        if (!tinta_str16_append(&clipped, ellipsis, 1) ||
+            !tinta_str16_append(&clipped, text + length - low, low))
+            tinta_str16_clear(&clipped);
     } else {
-        tinta_str16_append(&clipped, text, low);
-        tinta_str16_append(&clipped, ellipsis, 1);
+        if (!tinta_str16_append(&clipped, text, low) ||
+            !tinta_str16_append(&clipped, ellipsis, 1))
+            tinta_str16_clear(&clipped);
     }
-    immediate_text(app, format, clipped.data ? clipped.data : ellipsis,
+    immediate_text(app, format, clipped.len ? clipped.data : ellipsis,
                    rect, color);
     tinta_str16_destroy(&clipped);
 }
@@ -1858,6 +1952,7 @@ static void draw_rect_item(TintaApp *app, const TintaDrawRect *item,
                         (FLOAT)item->rect.top - scroll,
                         (FLOAT)item->rect.right + vx,
                         (FLOAT)item->rect.bottom - scroll};
+    if (rect.bottom < 0 || rect.top > app->height) return;
     set_brush_alpha(app, item->color, item->opacity);
     if (item->shape == TINTA_DRAW_SHAPE_ELLIPSE) {
         D2D1_ELLIPSE ellipse = {{(rect.left + rect.right) * 0.5f,
@@ -1928,8 +2023,9 @@ void tinta_render(TintaApp *app) {
         app->layout_chunk_posted =
             PostMessageW(app->hwnd, TINTA_WM_LAYOUT_CHUNK, 0, 0) != FALSE;
     }
-    app->scroll_y = minf(maxf(app->scroll_y, 0),
-                         maxf(0, app->content_height - app->height));
+    if (app->layout_complete || !app->scroll_anchor_pending)
+        app->scroll_y = minf(maxf(app->scroll_y, 0),
+                             maxf(0, app->content_height - app->height));
     app->scroll_x = minf(maxf(app->scroll_x, 0),
                          maxf(0, app->content_width - viewport_width(app)));
     vx = viewport_x(app) - app->scroll_x;
@@ -1950,6 +2046,8 @@ void tinta_render(TintaApp *app) {
             TintaDrawLine item = TINTA_VEC_AT(TintaDrawLine, app->lines, i);
             D2D1_POINT_2F a = {vx + item.a.x, item.a.y - scroll};
             D2D1_POINT_2F b = {vx + item.b.x, item.b.y - scroll};
+            if (maxf(a.y, b.y) < 0 || minf(a.y, b.y) > app->height)
+                continue;
             set_brush_alpha(app, item.color, item.opacity);
             if (item.dashed) {
                 float dx=b.x-a.x,dy=b.y-a.y,length=sqrtf(dx*dx+dy*dy);
@@ -1980,6 +2078,8 @@ void tinta_render(TintaApp *app) {
                                        item->rect.top - scroll,
                                        vx + item->rect.right,
                                        item->rect.bottom - scroll};
+            if (destination.bottom < 0 || destination.top > app->height)
+                continue;
             if (item->resource_index >= app->image_resources.len) continue;
             resource = TINTA_VEC_PTR(TintaImageResource,
                 app->image_resources, item->resource_index);
@@ -1994,19 +2094,28 @@ void tinta_render(TintaApp *app) {
         }
 #endif
         if (app->search_query.len && app->viewer_search_matches.len) {
-            size_t match_index;
-            for (match_index = 0;
-                 match_index < app->viewer_search_matches.len;
-                 match_index++) {
-                TintaSearchMatch match = TINTA_VEC_AT(
-                    TintaSearchMatch, app->viewer_search_matches, match_index);
+            size_t match_index = 0;
+            size_t run_index = 0;
+            while (match_index < app->viewer_search_matches.len &&
+                   run_index < app->text_runs.len) {
+                TintaSearchMatch match = TINTA_VEC_AT(TintaSearchMatch,
+                    app->viewer_search_matches, match_index);
+                TintaTextRun *run = TINTA_VEC_PTR(
+                    TintaTextRun, app->text_runs, run_index);
+                size_t match_end = match.start + match.length;
+                size_t run_end = run->doc_start + run->doc_length;
                 uint32_t color = match_index == (size_t)app->viewer_search_index ?
                     0xF59E0B : 0xFACC15;
-                for (i = 0; i < app->text_runs.len; i++)
-                    highlight_run(app,
-                        TINTA_VEC_PTR(TintaTextRun, app->text_runs, i),
-                        vx, scroll, match.start, match.start + match.length,
-                        color);
+                if (match_end <= run->doc_start) {
+                    match_index++;
+                } else if (run_end <= match.start) {
+                    run_index++;
+                } else {
+                    highlight_run(app, run, vx, scroll, match.start,
+                                  match_end, color);
+                    if (run_end < match_end) run_index++;
+                    else match_index++;
+                }
             }
         } else if (app->selection_anchor != app->selection_focus) {
             size_t start = min(app->selection_anchor, app->selection_focus);
@@ -2328,8 +2437,13 @@ static void show_copied_notice(TintaApp *app) {
 }
 
 void tinta_copy_selection(TintaApp *app) {
-    size_t start = min(app->selection_anchor, app->selection_focus);
-    size_t end = max(app->selection_anchor, app->selection_focus);
+    size_t start;
+    size_t end;
+    if (!app) return;
+    start = min(app->selection_anchor, app->selection_focus);
+    end = max(app->selection_anchor, app->selection_focus);
+    if (start > app->doc_text.len) start = app->doc_text.len;
+    if (end > app->doc_text.len) end = app->doc_text.len;
     if (start == end) {
         start = 0;
         end = app->doc_text.len;
@@ -2347,68 +2461,6 @@ bool tinta_copy_code_at(TintaApp *app, int x, int y) {
     if (tinta_set_clipboard_text(app->hwnd, block->text, wcslen(block->text)))
         show_copied_notice(app);
     return true;
-}
-
-static void scroll_to_viewer_match(TintaApp *app,
-                                   const TintaSearchMatch *match) {
-    size_t index;
-    float viewport = viewport_width(app);
-    for (index = 0; index < app->text_runs.len; index++) {
-        TintaTextRun *run = TINTA_VEC_PTR(TintaTextRun, app->text_runs, index);
-        if (match->start < run->doc_start + run->doc_length &&
-            match->start + match->length > run->doc_start) {
-            float maximum_y = maxf(0, app->content_height - app->height);
-            float maximum_x = maxf(0, app->content_width - viewport);
-            app->scroll_y = run->y - app->height * 0.45f;
-            app->scroll_x = run->x + run->width * 0.5f - viewport * 0.5f;
-            app->scroll_y = minf(maximum_y, maxf(0, app->scroll_y));
-            app->scroll_x = minf(maximum_x, maxf(0, app->scroll_x));
-            return;
-        }
-    }
-}
-
-void tinta_viewer_update_search(TintaApp *app) {
-    size_t position = 0;
-    tinta_vec_clear(&app->viewer_search_matches);
-    app->viewer_search_index = -1;
-    if (!app->search_query.len) {
-        InvalidateRect(app->hwnd, NULL, FALSE);
-        return;
-    }
-    if ((app->layout_dirty || !app->layout_complete) &&
-        !tinta_layout_document(app)) return;
-    while (position + app->search_query.len <= app->doc_text.len) {
-        if (!_wcsnicmp(app->doc_text.data + position,
-                       app->search_query.data, app->search_query.len)) {
-            TintaSearchMatch match = {position, app->search_query.len};
-            if (!tinta_vec_push(&app->viewer_search_matches, &match)) break;
-            position += app->search_query.len;
-        } else {
-            position++;
-        }
-    }
-    if (app->viewer_search_matches.len) {
-        TintaSearchMatch match = TINTA_VEC_AT(
-            TintaSearchMatch, app->viewer_search_matches, 0);
-        app->viewer_search_index = 0;
-        scroll_to_viewer_match(app, &match);
-    }
-    InvalidateRect(app->hwnd, NULL, FALSE);
-}
-
-void tinta_search_next(TintaApp *app) {
-    if (!app->search_query.len) return;
-    if (!app->viewer_search_matches.len) tinta_viewer_update_search(app);
-    if (app->viewer_search_matches.len) {
-        TintaSearchMatch match;
-        app->viewer_search_index = (app->viewer_search_index + 1) %
-                                   (int)app->viewer_search_matches.len;
-        match = TINTA_VEC_AT(TintaSearchMatch, app->viewer_search_matches,
-                             (size_t)app->viewer_search_index);
-        scroll_to_viewer_match(app, &match);
-        InvalidateRect(app->hwnd, NULL, FALSE);
-    }
 }
 
 bool tinta_jump_to_internal_link(TintaApp *app, const char *url) {

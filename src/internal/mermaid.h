@@ -101,6 +101,8 @@ typedef struct TintaMermaidLayout {
 } TintaMermaidLayout;
 
 TintaMermaidParseResult tinta_mermaid_parse(const char *source, size_t length);
+TintaMermaidParseResult tinta_mermaid_parse_limited(
+    const char *source, size_t length, size_t max_nodes, size_t max_edges);
 void tinta_mermaid_parse_result_destroy(TintaMermaidParseResult *result);
 const TintaMermaidNode *tinta_mermaid_find_node(
     const TintaMermaidDiagram *diagram, const char *id);
@@ -120,4 +122,3 @@ void tinta_mermaid_layout_destroy(TintaMermaidLayout *layout);
 #endif
 
 #endif
-

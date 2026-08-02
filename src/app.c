@@ -1,4 +1,5 @@
 #include "app.h"
+#include "image_cache.h"
 #include "features.h"
 
 #include <commdlg.h>
@@ -14,10 +15,12 @@
 
 #if TINTA_ENABLE_REMOTE_IMAGES
 typedef struct RemoteWork {
-    TintaApp *app;
+    TintaImageAsync *async;
     size_t index;
     LONG generation;
     wchar_t *url;
+    uint64_t max_pixels;
+    uint64_t max_download_bytes;
 } RemoteWork;
 
 typedef struct RemoteResult {
@@ -30,6 +33,16 @@ typedef struct RemoteResult {
     UINT buffer_size;
     bool success;
 } RemoteResult;
+
+struct TintaImageAsync {
+    LONG references;
+    volatile LONG closing;
+    volatile LONG generation;
+    volatile LONG active_workers;
+    HWND hwnd;
+    SRWLOCK results_lock;
+    TintaVec results;
+};
 #endif
 
 static SRWLOCK g_graphics_lock = SRWLOCK_INIT;
@@ -38,59 +51,103 @@ static IDWriteFactory *g_dwrite_factory;
 static IDWriteFontFallback *g_font_fallback;
 
 #if TINTA_ENABLE_REMOTE_IMAGES
+static TintaImageAsync *image_async_create(void) {
+    TintaImageAsync *async = (TintaImageAsync *)calloc(1, sizeof(*async));
+    if (!async) return NULL;
+    async->references = 1;
+    InitializeSRWLock(&async->results_lock);
+    if (!tinta_vec_init(&async->results, sizeof(RemoteResult *))) {
+        free(async);
+        return NULL;
+    }
+    return async;
+}
+
+static void image_async_add_ref(TintaImageAsync *async) {
+    InterlockedIncrement(&async->references);
+}
+
 static void remote_result_destroy(RemoteResult *result) {
     if (!result) return;
     free(result->pixels);
     free(result);
 }
 
-static bool remote_result_enqueue(TintaApp *app, RemoteResult *result) {
+static bool remote_result_enqueue(TintaImageAsync *async,
+                                  RemoteResult *result) {
     bool queued = false;
-    AcquireSRWLockExclusive(&app->remote_results_lock);
-    if (!InterlockedCompareExchange(&app->closing, 0, 0))
-        queued = tinta_vec_push(&app->remote_results, &result) != NULL;
-    ReleaseSRWLockExclusive(&app->remote_results_lock);
+    AcquireSRWLockExclusive(&async->results_lock);
+    if (!InterlockedCompareExchange(&async->closing, 0, 0))
+        queued = tinta_vec_push(&async->results, &result) != NULL;
+    ReleaseSRWLockExclusive(&async->results_lock);
     return queued;
 }
 
-static RemoteResult *remote_result_dequeue(TintaApp *app) {
+static RemoteResult *remote_result_dequeue(TintaImageAsync *async) {
     RemoteResult *result = NULL;
-    AcquireSRWLockExclusive(&app->remote_results_lock);
-    if (app->remote_results.len) {
-        result = TINTA_VEC_AT(RemoteResult *, app->remote_results, 0);
-        app->remote_results.len--;
-        if (app->remote_results.len)
-            TINTA_VEC_AT(RemoteResult *, app->remote_results, 0) =
-                TINTA_VEC_AT(RemoteResult *, app->remote_results,
-                             app->remote_results.len);
+    AcquireSRWLockExclusive(&async->results_lock);
+    if (async->results.len) {
+        result = TINTA_VEC_AT(RemoteResult *, async->results, 0);
+        async->results.len--;
+        if (async->results.len)
+            TINTA_VEC_AT(RemoteResult *, async->results, 0) =
+                TINTA_VEC_AT(RemoteResult *, async->results,
+                             async->results.len);
     }
-    ReleaseSRWLockExclusive(&app->remote_results_lock);
+    ReleaseSRWLockExclusive(&async->results_lock);
     return result;
 }
 
-static bool remote_result_remove(TintaApp *app, RemoteResult *result) {
+static bool remote_result_remove(TintaImageAsync *async,
+                                 RemoteResult *result) {
     size_t index;
     bool removed = false;
-    AcquireSRWLockExclusive(&app->remote_results_lock);
-    for (index = 0; index < app->remote_results.len; index++) {
-        if (TINTA_VEC_AT(RemoteResult *, app->remote_results, index) == result) {
-            app->remote_results.len--;
-            if (index < app->remote_results.len)
-                TINTA_VEC_AT(RemoteResult *, app->remote_results, index) =
-                    TINTA_VEC_AT(RemoteResult *, app->remote_results,
-                                 app->remote_results.len);
+    AcquireSRWLockExclusive(&async->results_lock);
+    for (index = 0; index < async->results.len; index++) {
+        if (TINTA_VEC_AT(RemoteResult *, async->results, index) == result) {
+            async->results.len--;
+            if (index < async->results.len)
+                TINTA_VEC_AT(RemoteResult *, async->results, index) =
+                    TINTA_VEC_AT(RemoteResult *, async->results,
+                                 async->results.len);
             removed = true;
             break;
         }
     }
-    ReleaseSRWLockExclusive(&app->remote_results_lock);
+    ReleaseSRWLockExclusive(&async->results_lock);
     return removed;
 }
 
-static void remote_results_clear(TintaApp *app) {
+static void remote_results_clear(TintaImageAsync *async) {
     RemoteResult *result;
-    while ((result = remote_result_dequeue(app)) != NULL)
+    while ((result = remote_result_dequeue(async)) != NULL)
         remote_result_destroy(result);
+}
+
+static void image_async_release(TintaImageAsync *async) {
+    if (async && !InterlockedDecrement(&async->references)) {
+        remote_results_clear(async);
+        tinta_vec_destroy(&async->results);
+        free(async);
+    }
+}
+
+static void image_async_close(TintaImageAsync *async) {
+    if (!async) return;
+    AcquireSRWLockExclusive(&async->results_lock);
+    InterlockedExchange(&async->closing, 1);
+    async->hwnd = NULL;
+    ReleaseSRWLockExclusive(&async->results_lock);
+    remote_results_clear(async);
+}
+
+static HWND image_async_window(TintaImageAsync *async) {
+    HWND hwnd;
+    AcquireSRWLockShared(&async->results_lock);
+    hwnd = InterlockedCompareExchange(&async->closing, 0, 0) ?
+           NULL : async->hwnd;
+    ReleaseSRWLockShared(&async->results_lock);
+    return hwnd;
 }
 
 typedef struct TintaBindStatusCallback {
@@ -99,6 +156,7 @@ typedef struct TintaBindStatusCallback {
     volatile LONG *closing;
     volatile LONG *current_generation;
     LONG expected_generation;
+    uint64_t max_download_bytes;
 } TintaBindStatusCallback;
 
 static TintaBindStatusCallback *bind_callback_from_interface(
@@ -145,10 +203,12 @@ static HRESULT STDMETHODCALLTYPE bind_low_resource(IBindStatusCallback *self,
 static HRESULT STDMETHODCALLTYPE bind_progress(IBindStatusCallback *self,
     ULONG progress, ULONG maximum, ULONG status, LPCWSTR text) {
     TintaBindStatusCallback *callback = bind_callback_from_interface(self);
-    (void)progress; (void)maximum; (void)status; (void)text;
+    (void)maximum; (void)status; (void)text;
     return InterlockedCompareExchange(callback->closing, 0, 0) ||
            InterlockedCompareExchange(callback->current_generation, 0, 0) !=
-               callback->expected_generation ? E_ABORT : S_OK;
+               callback->expected_generation ||
+           (callback->max_download_bytes &&
+            progress > callback->max_download_bytes) ? E_ABORT : S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE bind_stop(IBindStatusCallback *self,
@@ -204,6 +264,50 @@ void tinta_app_clear_image_resources(TintaApp *app) {
     }
     tinta_vec_clear(&app->image_resources);
 }
+
+void tinta_app_invalidate_image_requests(TintaApp *app) {
+    if (!app) return;
+#if TINTA_ENABLE_REMOTE_IMAGES
+    if (app->image_async)
+        InterlockedIncrement(&app->image_async->generation);
+#endif
+}
+
+#if TINTA_ENABLE_MERMAID
+void tinta_app_clear_mermaid_cache(TintaApp *app) {
+    size_t i;
+    if (!app) return;
+    for (i = 0; i < app->mermaid_cache.len; i++) {
+        TintaMermaidCacheEntry *entry = TINTA_VEC_PTR(
+            TintaMermaidCacheEntry, app->mermaid_cache, i);
+        tinta_mermaid_parse_result_destroy(&entry->parsed);
+    }
+    tinta_vec_clear(&app->mermaid_cache);
+}
+
+const TintaMermaidParseResult *tinta_app_mermaid_parse(
+    TintaApp *app, const TintaElement *element,
+    const char *source, size_t length) {
+    size_t i;
+    TintaMermaidCacheEntry entry;
+    if (!app || !element || (!source && length)) return NULL;
+    for (i = 0; i < app->mermaid_cache.len; i++) {
+        TintaMermaidCacheEntry *cached = TINTA_VEC_PTR(
+            TintaMermaidCacheEntry, app->mermaid_cache, i);
+        if (cached->element == element) return &cached->parsed;
+    }
+    memset(&entry, 0, sizeof(entry));
+    entry.element = element;
+    entry.parsed = tinta_mermaid_parse_limited(source, length,
+        app->max_mermaid_nodes, app->max_mermaid_edges);
+    if (!tinta_vec_push(&app->mermaid_cache, &entry)) {
+        tinta_mermaid_parse_result_destroy(&entry.parsed);
+        return NULL;
+    }
+    return &TINTA_VEC_PTR(TintaMermaidCacheEntry, app->mermaid_cache,
+                          app->mermaid_cache.len - 1)->parsed;
+}
+#endif
 
 static IDWriteTextFormat *create_format(TintaApp *app, const wchar_t *family,
                                         float size, TintaDWriteFontWeight weight,
@@ -302,6 +406,9 @@ bool tinta_shared_graphics_initialize(void) {
 }
 
 void tinta_shared_graphics_uninitialize(void) {
+#if TINTA_ENABLE_REMOTE_IMAGES
+    tinta_image_cache_uninitialize();
+#endif
     AcquireSRWLockExclusive(&g_graphics_lock);
     if (g_font_fallback) {
         g_font_fallback->lpVtbl->Release(g_font_fallback);
@@ -386,7 +493,8 @@ bool tinta_app_update_formats(TintaApp *app) {
                        TINTA_DWRITE_FONT_STYLE_NORMAL);
     if (!body || !bold || !italic || !small_text || !code || !ui) goto failed;
     for (i = 0; i < 6; i++)
-        if (!(headings[i] = create_format(app, L"Segoe UI", heading_sizes[i],
+        if (!(headings[i] = create_format(app, app->theme->font_family,
+                                          heading_sizes[i],
                                           TINTA_DWRITE_FONT_WEIGHT_BOLD,
                                           TINTA_DWRITE_FONT_STYLE_NORMAL)))
             goto failed;
@@ -404,7 +512,6 @@ bool tinta_app_update_formats(TintaApp *app) {
     app->code_format = code;
     app->ui_format = ui;
     for (i = 0; i < 6; i++) app->heading_formats[i] = headings[i];
-    app->format_zoom = app->zoom;
     app->layout_dirty = true;
     return true;
 failed:
@@ -503,7 +610,6 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     app->layout_dirty = true;
     app->hovered_code_block = -1;
     tinta_str8_init(&app->source);
-    tinta_str16_init(&app->current_file);
     tinta_str16_init(&app->doc_text);
     tinta_str16_init(&app->search_query);
     tinta_vec_init(&app->text_runs, sizeof(TintaTextRun));
@@ -516,11 +622,18 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->hit_entries, sizeof(TintaHitEntry));
     app->hit_index_dirty = true;
     tinta_vec_init(&app->image_resources, sizeof(TintaImageResource));
-    tinta_vec_init(&app->worker_handles, sizeof(HANDLE));
-    InitializeSRWLock(&app->remote_results_lock);
-    tinta_vec_init(&app->remote_results, sizeof(void *));
+#if TINTA_ENABLE_MERMAID
+    tinta_vec_init(&app->mermaid_cache, sizeof(TintaMermaidCacheEntry));
+#endif
     tinta_vec_init(&app->viewer_search_matches, sizeof(TintaSearchMatch));
     app->viewer_search_index = -1;
+#if TINTA_ENABLE_REMOTE_IMAGES
+    app->image_async = image_async_create();
+    if (!app->image_async) {
+        tinta_app_destroy(app);
+        return false;
+    }
+#endif
 #if TINTA_ENABLE_IMAGES
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
@@ -544,23 +657,23 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
 void tinta_app_destroy(TintaApp *app) {
     size_t i;
     if (!app) return;
-    InterlockedExchange(&app->closing, 1);
-    for (i = 0; i < app->worker_handles.len; i++) {
-        HANDLE handle=TINTA_VEC_AT(HANDLE,app->worker_handles,i);
-        WaitForSingleObject(handle,INFINITE); CloseHandle(handle);
-    }
 #if TINTA_ENABLE_REMOTE_IMAGES
-    remote_results_clear(app);
+    image_async_close(app->image_async);
+    image_async_release(app->image_async);
+    app->image_async = NULL;
 #endif
     tinta_app_clear_image_resources(app);
+#if TINTA_ENABLE_MERMAID
+    tinta_app_clear_mermaid_cache(app);
+#endif
     tinta_layout_clear(app);
     tinta_parse_result_destroy(&app->document);
     tinta_vec_destroy(&app->image_resources);
-    tinta_vec_destroy(&app->worker_handles);
-    tinta_vec_destroy(&app->remote_results);
+#if TINTA_ENABLE_MERMAID
+    tinta_vec_destroy(&app->mermaid_cache);
+#endif
     tinta_vec_destroy(&app->viewer_search_matches);
     tinta_str8_destroy(&app->source);
-    tinta_str16_destroy(&app->current_file);
     tinta_str16_destroy(&app->doc_text);
     tinta_str16_destroy(&app->search_query);
     tinta_vec_destroy(&app->text_runs);
@@ -597,15 +710,17 @@ void tinta_app_destroy(TintaApp *app) {
 static unsigned __stdcall remote_worker(void *parameter) {
     RemoteWork *work=(RemoteWork *)parameter;
     RemoteResult *result=(RemoteResult *)calloc(1,sizeof(*result));
+    TintaImageAsync *async = work->async;
     wchar_t cache[MAX_PATH*2];
     HRESULT com_result = CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
     TintaBindStatusCallback callback;
     memset(&callback, 0, sizeof(callback));
     callback.iface.lpVtbl = &bind_status_vtable;
     callback.references = 1;
-    callback.closing = &work->app->closing;
-    callback.current_generation = &work->app->document_generation;
+    callback.closing = &async->closing;
+    callback.current_generation = &async->generation;
     callback.expected_generation = work->generation;
+    callback.max_download_bytes = work->max_download_bytes;
     if(result) {
         IWICImagingFactory *wic = NULL;
         IWICBitmapDecoder *decoder = NULL;
@@ -613,8 +728,19 @@ static unsigned __stdcall remote_worker(void *parameter) {
         IWICFormatConverter *converter = NULL;
         result->index=work->index;
         result->generation=work->generation;
-        if (SUCCEEDED(URLDownloadToCacheFileW(NULL,work->url,cache,
-                                             MAX_PATH*2,0,&callback.iface)) &&
+        WIN32_FILE_ATTRIBUTE_DATA file_info;
+        bool downloaded = SUCCEEDED(URLDownloadToCacheFileW(
+            NULL, work->url, cache, MAX_PATH * 2, 0, &callback.iface));
+        uint64_t file_size = 0;
+        if (downloaded && GetFileAttributesExW(
+                cache, GetFileExInfoStandard, &file_info))
+            file_size = ((uint64_t)file_info.nFileSizeHigh << 32) |
+                        file_info.nFileSizeLow;
+        else
+            downloaded = false;
+        if (downloaded &&
+            (!work->max_download_bytes ||
+             file_size <= work->max_download_bytes) &&
             SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory, NULL,
                                        CLSCTX_INPROC_SERVER,
                                        &IID_IWICImagingFactory,
@@ -625,7 +751,9 @@ static unsigned __stdcall remote_worker(void *parameter) {
             SUCCEEDED(IWICBitmapDecoder_GetFrame(decoder, 0, &frame)) &&
             SUCCEEDED(IWICBitmapFrameDecode_GetSize(
                 frame, &result->width, &result->height)) &&
-            result->width && result->height && result->width <= UINT_MAX / 4) {
+            result->width && result->height && result->width <= UINT_MAX / 4 &&
+            (!work->max_pixels ||
+             (uint64_t)result->width * result->height <= work->max_pixels)) {
             result->stride = result->width * 4;
             if (result->height <= UINT_MAX / result->stride) {
                 result->buffer_size = result->stride * result->height;
@@ -649,33 +777,20 @@ static unsigned __stdcall remote_worker(void *parameter) {
         if (decoder) IWICBitmapDecoder_Release(decoder);
         if (wic) IWICImagingFactory_Release(wic);
     }
-    /* The message is only a wake-up; the app-owned queue holds the result. */
-    if (!result || !remote_result_enqueue(work->app, result)) {
+    InterlockedDecrement(&async->active_workers);
+    /* The message is only a wake-up; the async queue owns the result. */
+    if (!result || !remote_result_enqueue(async, result)) {
         remote_result_destroy(result);
-    } else if (!PostMessageW(work->app->hwnd,TINTA_WM_IMAGE_READY,0,0) &&
-               remote_result_remove(work->app, result)) {
-        remote_result_destroy(result);
+    } else {
+        HWND hwnd = image_async_window(async);
+        if ((!hwnd || !PostMessageW(hwnd, TINTA_WM_IMAGE_READY, 0, 0)) &&
+            remote_result_remove(async, result))
+            remote_result_destroy(result);
     }
     free(work->url); free(work);
     if (SUCCEEDED(com_result)) CoUninitialize();
+    image_async_release(async);
     return 0;
-}
-
-static void reap_worker_handles(TintaApp *app) {
-    size_t index = 0;
-    while (index < app->worker_handles.len) {
-        HANDLE handle = TINTA_VEC_AT(HANDLE, app->worker_handles, index);
-        if (WaitForSingleObject(handle, 0) == WAIT_OBJECT_0) {
-            CloseHandle(handle);
-            app->worker_handles.len--;
-            if (index < app->worker_handles.len)
-                TINTA_VEC_AT(HANDLE, app->worker_handles, index) =
-                    TINTA_VEC_AT(HANDLE, app->worker_handles,
-                                 app->worker_handles.len);
-        } else {
-            index++;
-        }
-    }
 }
 #endif
 
@@ -708,6 +823,8 @@ static bool decode_local_image(TintaApp *app, TintaImageResource *image) {
         image->state = 2;
     } else {
         image->state = -1;
+        if (app->resource_error)
+            app->resource_error(app, false, image->resolved_uri, hr);
     }
     if (converter) IWICFormatConverter_Release(converter);
     if (frame) IWICBitmapFrameDecode_Release(frame);
@@ -718,50 +835,81 @@ static bool decode_local_image(TintaApp *app, TintaImageResource *image) {
 
 #if TINTA_ENABLE_REMOTE_IMAGES
 static bool start_remote_image(TintaApp *app, size_t image_index) {
+    TintaImageAsync *async = app->image_async;
     TintaImageResource *image;
     RemoteWork *work;
     uintptr_t thread;
     HANDLE handle;
-    reap_worker_handles(app);
-    if (image_index >= app->image_resources.len) return false;
+    if (!async || image_index >= app->image_resources.len) return false;
     image = TINTA_VEC_PTR(TintaImageResource, app->image_resources, image_index);
     if (image->state != 0) return image->state > 0;
-    if (app->max_concurrent_downloads &&
-        app->worker_handles.len >= app->max_concurrent_downloads)
-        return true;
-    if (!tinta_vec_reserve(&app->worker_handles,
-                           app->worker_handles.len + 1)) {
-        image->state = -1;
-        return false;
+    {
+        UINT width = 0, height = 0, stride = 0, buffer_size = 0;
+        BYTE *pixels = NULL;
+        IWICBitmap *bitmap = NULL;
+        if (tinta_image_cache_get(image->resolved_uri, &width, &height,
+                &stride, &buffer_size, &pixels)) {
+            if ((!app->max_image_pixels ||
+                 (uint64_t)width * height <= app->max_image_pixels) &&
+                SUCCEEDED(IWICImagingFactory_CreateBitmapFromMemory(
+                    app->wic_factory, width, height,
+                    &GUID_WICPixelFormat32bppPBGRA, stride, buffer_size,
+                    pixels, &bitmap))) {
+                image->source = (IWICBitmapSource *)bitmap;
+                image->width = width;
+                image->height = height;
+                image->state = 2;
+            }
+            free(pixels);
+            if (image->state == 2) return true;
+        }
     }
+    if (app->max_concurrent_downloads &&
+        (UINT)InterlockedCompareExchange(
+            &async->active_workers, 0, 0) >= app->max_concurrent_downloads)
+        return true;
     work = (RemoteWork *)calloc(1, sizeof(*work));
     if (!work) {
         image->state = -1;
+        if (app->resource_error)
+            app->resource_error(app, true, image->resolved_uri, E_OUTOFMEMORY);
         return false;
     }
-    work->app = app;
+    work->async = async;
     work->index = image_index;
     work->generation = InterlockedCompareExchange(
-        &app->document_generation, 0, 0);
+        &async->generation, 0, 0);
+    work->max_pixels = app->max_image_pixels;
+    work->max_download_bytes = app->max_remote_image_bytes;
     work->url = tinta_wcsdup_n(image->resolved_uri,
                                wcslen(image->resolved_uri));
     if (!work->url) {
         free(work);
         image->state = -1;
+        if (app->resource_error)
+            app->resource_error(app, true, image->resolved_uri, E_OUTOFMEMORY);
         return false;
     }
     image->state = 1;
+    AcquireSRWLockExclusive(&async->results_lock);
+    async->hwnd = app->hwnd;
+    ReleaseSRWLockExclusive(&async->results_lock);
+    InterlockedIncrement(&async->active_workers);
+    image_async_add_ref(async);
     thread = _beginthreadex(NULL, 0, remote_worker, work, 0, NULL);
     if (!thread) {
+        InterlockedDecrement(&async->active_workers);
+        image_async_release(async);
         image->state = -1;
+        if (app->resource_error)
+            app->resource_error(app, true, image->resolved_uri,
+                                HRESULT_FROM_WIN32(GetLastError()));
         free(work->url);
         free(work);
         return false;
     }
     handle = (HANDLE)thread;
-    if (!tinta_vec_push(&app->worker_handles, &handle)) {
-        CloseHandle(handle);
-    }
+    CloseHandle(handle);
     return true;
 }
 #endif
@@ -838,11 +986,13 @@ bool tinta_image_resource_get(TintaApp *app, const char *url,
 
 bool tinta_remote_image_complete(TintaApp *app) {
 #if TINTA_ENABLE_REMOTE_IMAGES
+    TintaImageAsync *async;
     RemoteResult *result;
     bool changed = false;
-    while ((result = remote_result_dequeue(app)) != NULL) {
+    if (!app || !(async = app->image_async)) return false;
+    while ((result = remote_result_dequeue(async)) != NULL) {
         if (result->generation == InterlockedCompareExchange(
-                &app->document_generation, 0, 0) &&
+                &async->generation, 0, 0) &&
             result->index < app->image_resources.len) {
             TintaImageResource *image = TINTA_VEC_PTR(
                 TintaImageResource, app->image_resources, result->index);
@@ -855,6 +1005,9 @@ bool tinta_remote_image_complete(TintaApp *app) {
                     app->wic_factory, result->width, result->height,
                     &GUID_WICPixelFormat32bppPBGRA, result->stride,
                     result->buffer_size, result->pixels, &bitmap))) {
+                tinta_image_cache_put(image->resolved_uri, result->width,
+                    result->height, result->stride, result->buffer_size,
+                    result->pixels);
                 if (image->source) IWICBitmapSource_Release(image->source);
                 image->source = (IWICBitmapSource *)bitmap;
                 image->width = result->width;
@@ -862,6 +1015,9 @@ bool tinta_remote_image_complete(TintaApp *app) {
                 image->state = 2;
             } else {
                 image->state = -1;
+                if (app->resource_error)
+                    app->resource_error(app, true, image->resolved_uri,
+                                        E_FAIL);
             }
             app->layout_dirty = true;
             InvalidateRect(app->hwnd, NULL, FALSE);
@@ -869,7 +1025,6 @@ bool tinta_remote_image_complete(TintaApp *app) {
         }
         remote_result_destroy(result);
     }
-    reap_worker_handles(app);
     return changed;
 #else
     (void)app;
@@ -878,24 +1033,31 @@ bool tinta_remote_image_complete(TintaApp *app) {
 }
 
 
-bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
-                             const wchar_t *path, bool new_document) {
+bool tinta_app_prepare_source(const char *source, size_t length,
+                              const wchar_t *path, size_t max_nodes,
+                              size_t max_depth, TintaPreparedSource *prepared) {
     TintaStr8 path8 = {0};
-    TintaStr8 new_source = {0};
-    TintaStr16 new_file = {0};
-    TintaParseResult parsed;
-    bool focus_mermaid = false;
+    TintaMarkdownOptions markdown_options = tinta_markdown_default_options();
+    if (!prepared || (!source && length)) return false;
+    memset(prepared, 0, sizeof(*prepared));
 #if TINTA_ENABLE_MERMAID
-    focus_mermaid = path && tinta_is_mermaid_document_path_utf16(path);
+    prepared->focus_mermaid =
+        path && tinta_is_mermaid_document_path_utf16(path);
 #endif
     if (path && !tinta_utf16_to_utf8(path, wcslen(path), &path8)) return false;
-    parsed = tinta_parse_document(source, length, path8.data ? path8.data : "", NULL);
+    markdown_options.max_nodes = max_nodes;
+    markdown_options.max_depth = max_depth;
+    prepared->document = tinta_parse_document(source, length,
+        path8.data ? path8.data : "", &markdown_options);
     tinta_str8_destroy(&path8);
-    if (!parsed.success) { tinta_parse_result_destroy(&parsed); return false; }
-    if (app->max_ast_nodes) {
+    if (!prepared->document.success) {
+        tinta_app_destroy_prepared_source(prepared);
+        return false;
+    }
+    {
         TintaVec pending = {0};
         size_t count = 0;
-        TintaElement *root = parsed.root;
+        TintaElement *root = prepared->document.root;
         bool within_limit = tinta_vec_init(&pending, sizeof(TintaElement *)) &&
                             tinta_vec_push(&pending, &root) != NULL;
         while (within_limit && pending.len) {
@@ -903,7 +1065,8 @@ bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
                 TintaElement *, pending, pending.len - 1);
             size_t child;
             pending.len--;
-            if (++count > app->max_ast_nodes) {
+            count++;
+            if (max_nodes && count > max_nodes) {
                 within_limit = false;
                 break;
             }
@@ -917,39 +1080,69 @@ bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
         }
         tinta_vec_destroy(&pending);
         if (!within_limit) {
-            tinta_parse_result_destroy(&parsed);
+            tinta_app_destroy_prepared_source(prepared);
             return false;
         }
+        prepared->ast_nodes = count;
     }
-    if (!tinta_str8_assign(&new_source, source, length) ||
-        (path && !tinta_str16_assign(&new_file, path, wcslen(path)))) {
-        tinta_str8_destroy(&new_source);
-        tinta_str16_destroy(&new_file);
-        tinta_parse_result_destroy(&parsed);
+    if (!tinta_str8_assign(&prepared->source, source ? source : "", length)) {
+        tinta_app_destroy_prepared_source(prepared);
         return false;
     }
+    return true;
+}
+
+void tinta_app_destroy_prepared_source(TintaPreparedSource *prepared) {
+    if (!prepared) return;
+    tinta_parse_result_destroy(&prepared->document);
+    tinta_str8_destroy(&prepared->source);
+    memset(prepared, 0, sizeof(*prepared));
+}
+
+void tinta_app_commit_prepared_source(TintaApp *app,
+                                      TintaPreparedSource *prepared,
+                                      bool new_document) {
+    if (!app || !prepared || !prepared->document.success) return;
+#if TINTA_ENABLE_MERMAID
+    tinta_app_clear_mermaid_cache(app);
+#endif
     tinta_parse_result_destroy(&app->document);
-    app->document = parsed;
-    app->parse_time_us = parsed.parse_time_us;
+    app->document = prepared->document;
+    memset(&prepared->document, 0, sizeof(prepared->document));
+    app->document_revision++;
+    if (!app->document_revision) app->document_revision = 1;
+    app->parse_time_us = app->document.parse_time_us;
+    app->ast_node_count = prepared->ast_nodes;
     tinta_str8_destroy(&app->source);
-    app->source = new_source;
-    tinta_str16_destroy(&app->current_file);
-    app->current_file = new_file;
+    app->source = prepared->source;
+    memset(&prepared->source, 0, sizeof(prepared->source));
+    tinta_vec_clear(&app->viewer_search_matches);
+    app->viewer_search_index = -1;
+    tinta_str16_clear(&app->search_query);
     if (new_document) {
-        InterlockedIncrement(&app->document_generation);
+        tinta_app_invalidate_image_requests(app);
         tinta_app_clear_image_resources(app);
     }
     app->layout_dirty = true;
-    app->focus_mermaid_on_next_layout = focus_mermaid;
+    app->focus_mermaid_on_next_layout = prepared->focus_mermaid;
     if (new_document) {
         app->scroll_y = 0;
         app->scroll_x = 0;
+        app->scroll_anchor_pending = false;
         app->selection_anchor = 0;
         app->selection_focus = 0;
-        app->viewer_search_index = -1;
-        tinta_vec_clear(&app->viewer_search_matches);
     }
     InvalidateRect(app->hwnd, NULL, FALSE);
+}
+
+bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
+                             const wchar_t *path, bool new_document) {
+    TintaPreparedSource prepared;
+    if (!app || !tinta_app_prepare_source(source, length, path,
+            app->max_ast_nodes, app->max_ast_depth, &prepared))
+        return false;
+    tinta_app_commit_prepared_source(app, &prepared, new_document);
+    tinta_app_destroy_prepared_source(&prepared);
     return true;
 }
 

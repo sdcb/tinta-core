@@ -66,6 +66,8 @@ typedef struct TintaMarkdownOptions {
     bool permissive_urls;
     bool tables;
     bool task_lists;
+    size_t max_nodes;
+    size_t max_depth;
 } TintaMarkdownOptions;
 
 typedef struct TintaParseResult {
