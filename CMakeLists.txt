@@ -12,31 +12,60 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 option(TINTA_BUILD_EXAMPLES "Build Tinta Core examples" ON)
+option(TINTA_ENABLE_UIA "Enable the UI Automation provider" ON)
+option(TINTA_ENABLE_MERMAID "Enable Mermaid parsing and rendering" ON)
+option(TINTA_ENABLE_SYNTAX "Enable code-block syntax highlighting" ON)
+option(TINTA_ENABLE_REMOTE_IMAGES "Enable remote image downloads" ON)
+option(TINTA_ENABLE_LOCAL_IMAGES "Enable local image decoding" ON)
 
-add_library(tinta_core
+set(TINTA_CORE_SOURCES
     vendor/md4c/src/md4c.c
     src/app.c
     src/control.c
     src/core.c
     src/document.c
     src/markdown.c
-    src/mermaid.c
     src/renderer.c
-    src/syntax.c
     src/themes.c
-    src/uia_provider.c
-    src/uia_semantics.c
-    src/uia_text.c
     src/win32_utils.c)
+
+if(TINTA_ENABLE_MERMAID)
+    list(APPEND TINTA_CORE_SOURCES src/mermaid.c)
+endif()
+if(TINTA_ENABLE_SYNTAX)
+    list(APPEND TINTA_CORE_SOURCES src/syntax.c)
+endif()
+if(TINTA_ENABLE_UIA)
+    list(APPEND TINTA_CORE_SOURCES
+        src/uia_provider.c src/uia_semantics.c src/uia_text.c)
+else()
+    list(APPEND TINTA_CORE_SOURCES src/uia_stub.c)
+endif()
+
+add_library(tinta_core ${TINTA_CORE_SOURCES})
 add_library(Tinta::Core ALIAS tinta_core)
 target_include_directories(tinta_core BEFORE PRIVATE src/internal vendor/md4c/src)
 target_include_directories(tinta_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(tinta_core PRIVATE d2d1 dwrite windowscodecs
-    advapi32 ole32 oleaut32 shell32 urlmon shlwapi uiautomationcore)
+target_link_libraries(tinta_core PRIVATE
+    d2d1 dwrite advapi32 shell32 shlwapi)
+if(TINTA_ENABLE_REMOTE_IMAGES OR TINTA_ENABLE_LOCAL_IMAGES)
+    target_link_libraries(tinta_core PRIVATE windowscodecs ole32)
+endif()
+if(TINTA_ENABLE_REMOTE_IMAGES)
+    target_link_libraries(tinta_core PRIVATE urlmon)
+endif()
+if(TINTA_ENABLE_UIA)
+    target_link_libraries(tinta_core PRIVATE oleaut32 uiautomationcore)
+endif()
 target_compile_definitions(tinta_core PRIVATE UNICODE _UNICODE TINTA_CORE_BUILD
-    _CRT_SECURE_NO_WARNINGS)
+    _CRT_SECURE_NO_WARNINGS
+    TINTA_ENABLE_UIA=$<BOOL:${TINTA_ENABLE_UIA}>
+    TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
+    TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
+    TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
+    TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
 if(BUILD_SHARED_LIBS)
     target_compile_definitions(tinta_core PUBLIC TINTA_CORE_SHARED)
 endif()
@@ -69,12 +98,21 @@ if(TINTA_BUILD_EXAMPLES)
 endif()
 
 if(BUILD_TESTING)
-    add_library(tinta_test_support STATIC
-        vendor/md4c/src/md4c.c
-        src/core.c src/document.c src/markdown.c src/mermaid.c src/syntax.c)
+    set(TINTA_TEST_SUPPORT_SOURCES
+        vendor/md4c/src/md4c.c src/core.c src/document.c src/markdown.c)
+    if(TINTA_ENABLE_MERMAID)
+        list(APPEND TINTA_TEST_SUPPORT_SOURCES src/mermaid.c)
+    endif()
+    if(TINTA_ENABLE_SYNTAX)
+        list(APPEND TINTA_TEST_SUPPORT_SOURCES src/syntax.c)
+    endif()
+    add_library(tinta_test_support STATIC ${TINTA_TEST_SUPPORT_SOURCES})
     target_include_directories(tinta_test_support PRIVATE
         src/internal vendor/md4c/src)
-    target_compile_definitions(tinta_test_support PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(tinta_test_support PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
+        TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>)
     if(MSVC)
         target_compile_options(tinta_test_support PRIVATE /utf-8 /W4)
         set_source_files_properties(vendor/md4c/src/md4c.c PROPERTIES
@@ -86,24 +124,36 @@ if(BUILD_TESTING)
     target_link_libraries(core_tests PRIVATE tinta_test_support)
     add_test(NAME core_containers COMMAND core_tests)
 
-    add_executable(mermaid_tests tests/mermaid_tests.cpp)
-    target_include_directories(mermaid_tests PRIVATE src/internal)
-    target_link_libraries(mermaid_tests PRIVATE tinta_test_support)
-    add_test(NAME mermaid_parser COMMAND mermaid_tests)
+    if(TINTA_ENABLE_MERMAID)
+        add_executable(mermaid_tests tests/mermaid_tests.cpp)
+        target_include_directories(mermaid_tests PRIVATE src/internal)
+        target_link_libraries(mermaid_tests PRIVATE tinta_test_support)
+        add_test(NAME mermaid_parser COMMAND mermaid_tests)
+    endif()
 
     add_executable(document_tests tests/document_tests.cpp)
     target_include_directories(document_tests PRIVATE src/internal)
     target_link_libraries(document_tests PRIVATE tinta_test_support)
+    target_compile_definitions(document_tests PRIVATE
+        TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>)
     add_test(NAME document_types COMMAND document_tests)
 
-    add_executable(syntax_tests tests/syntax_tests.cpp)
-    target_include_directories(syntax_tests PRIVATE src/internal)
-    target_link_libraries(syntax_tests PRIVATE tinta_test_support)
-    add_test(NAME syntax_highlighting COMMAND syntax_tests)
+    if(TINTA_ENABLE_SYNTAX)
+        add_executable(syntax_tests tests/syntax_tests.cpp)
+        target_include_directories(syntax_tests PRIVATE src/internal)
+        target_link_libraries(syntax_tests PRIVATE tinta_test_support)
+        add_test(NAME syntax_highlighting COMMAND syntax_tests)
+    endif()
 
     add_executable(control_tests tests/control_tests.cpp)
-    target_link_libraries(control_tests PRIVATE Tinta::Core ole32 oleaut32 uiautomationcore)
-    target_compile_definitions(control_tests PRIVATE UNICODE _UNICODE)
+    target_link_libraries(control_tests PRIVATE Tinta::Core)
+    if(TINTA_ENABLE_UIA)
+        target_link_libraries(control_tests PRIVATE ole32 oleaut32 uiautomationcore)
+    endif()
+    target_compile_definitions(control_tests PRIVATE UNICODE _UNICODE
+        TINTA_ENABLE_UIA=$<BOOL:${TINTA_ENABLE_UIA}>
+        TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
+        TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
     add_test(NAME markdown_control COMMAND control_tests)
 endif()
 

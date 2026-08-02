@@ -1,4 +1,5 @@
 #include "app.h"
+#include "features.h"
 
 #include <commdlg.h>
 #include <limits.h>
@@ -6,9 +7,12 @@
 #include <shlwapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if TINTA_ENABLE_REMOTE_IMAGES
 #include <process.h>
 #include <urlmon.h>
+#endif
 
+#if TINTA_ENABLE_REMOTE_IMAGES
 typedef struct RemoteWork {
     TintaApp *app;
     size_t index;
@@ -26,12 +30,14 @@ typedef struct RemoteResult {
     UINT buffer_size;
     bool success;
 } RemoteResult;
+#endif
 
 static SRWLOCK g_graphics_lock = SRWLOCK_INIT;
 static ID2D1Factory *g_d2d_factory;
 static IDWriteFactory *g_dwrite_factory;
 static IDWriteFontFallback *g_font_fallback;
 
+#if TINTA_ENABLE_REMOTE_IMAGES
 static void remote_result_destroy(RemoteResult *result) {
     if (!result) return;
     free(result->pixels);
@@ -174,10 +180,13 @@ static IBindStatusCallbackVtbl bind_status_vtable = {
     bind_priority, bind_low_resource, bind_progress, bind_stop,
     bind_info, bind_data, bind_object
 };
+#endif
 
+#if TINTA_ENABLE_IMAGES
 static void release_unknown(IUnknown **value) {
     if (*value) { IUnknown_Release(*value); *value = NULL; }
 }
+#endif
 
 static void release_text_format(IDWriteTextFormat **value) {
     if (*value) { (*value)->lpVtbl->Release(*value); *value = NULL; }
@@ -481,7 +490,9 @@ void tinta_draw_text_layout(TintaApp *app, D2D1_POINT_2F origin,
 
 
 bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *settings) {
+#if TINTA_ENABLE_IMAGES
     HRESULT hr;
+#endif
     memset(app, 0, sizeof(*app));
     app->instance = instance;
     app->width = settings->width;
@@ -507,22 +518,26 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->image_resources, sizeof(TintaImageResource));
     tinta_vec_init(&app->worker_handles, sizeof(HANDLE));
     InitializeSRWLock(&app->remote_results_lock);
-    tinta_vec_init(&app->remote_results, sizeof(RemoteResult *));
+    tinta_vec_init(&app->remote_results, sizeof(void *));
     tinta_vec_init(&app->viewer_search_matches, sizeof(TintaSearchMatch));
     app->viewer_search_index = -1;
+#if TINTA_ENABLE_IMAGES
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
     app->com_initialized = SUCCEEDED(hr);
+#endif
     if (!acquire_shared_graphics(app)) {
         tinta_app_destroy(app);
         return false;
     }
+#if TINTA_ENABLE_IMAGES
     hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
                           &IID_IWICImagingFactory, (void **)&app->wic_factory);
     if (FAILED(hr)) {
         tinta_app_destroy(app);
         return false;
     }
+#endif
     return true;
 }
 
@@ -534,7 +549,9 @@ void tinta_app_destroy(TintaApp *app) {
         HANDLE handle=TINTA_VEC_AT(HANDLE,app->worker_handles,i);
         WaitForSingleObject(handle,INFINITE); CloseHandle(handle);
     }
+#if TINTA_ENABLE_REMOTE_IMAGES
     remote_results_clear(app);
+#endif
     tinta_app_clear_image_resources(app);
     tinta_layout_clear(app);
     tinta_parse_result_destroy(&app->document);
@@ -562,16 +579,21 @@ void tinta_app_destroy(TintaApp *app) {
     release_text_format(&app->code_format);
     release_text_format(&app->ui_format);
     tinta_app_discard_device(app);
+#if TINTA_ENABLE_IMAGES
     release_unknown((IUnknown **)&app->wic_factory);
+#endif
     if (app->font_fallback) app->font_fallback->lpVtbl->Release(app->font_fallback);
     if (app->dwrite_factory) app->dwrite_factory->lpVtbl->Release(app->dwrite_factory);
     if (app->d2d_factory) app->d2d_factory->lpVtbl->Release(app->d2d_factory);
+#if TINTA_ENABLE_IMAGES
     if (app->com_initialized) {
         CoUninitialize();
         app->com_initialized = false;
     }
+#endif
 }
 
+#if TINTA_ENABLE_REMOTE_IMAGES
 static unsigned __stdcall remote_worker(void *parameter) {
     RemoteWork *work=(RemoteWork *)parameter;
     RemoteResult *result=(RemoteResult *)calloc(1,sizeof(*result));
@@ -655,7 +677,9 @@ static void reap_worker_handles(TintaApp *app) {
         }
     }
 }
+#endif
 
+#if TINTA_ENABLE_LOCAL_IMAGES
 static bool decode_local_image(TintaApp *app, TintaImageResource *image) {
     IWICBitmapDecoder *decoder = NULL;
     IWICBitmapFrameDecode *frame = NULL;
@@ -690,7 +714,9 @@ static bool decode_local_image(TintaApp *app, TintaImageResource *image) {
     if (decoder) IWICBitmapDecoder_Release(decoder);
     return image->state == 2;
 }
+#endif
 
+#if TINTA_ENABLE_REMOTE_IMAGES
 static bool start_remote_image(TintaApp *app, size_t image_index) {
     TintaImageResource *image;
     RemoteWork *work;
@@ -738,6 +764,7 @@ static bool start_remote_image(TintaApp *app, size_t image_index) {
     }
     return true;
 }
+#endif
 
 bool tinta_image_resource_get(TintaApp *app, const char *url,
                               size_t *resource_index, bool *ready) {
@@ -752,8 +779,10 @@ bool tinta_image_resource_get(TintaApp *app, const char *url,
         TintaImageResource *cached = TINTA_VEC_PTR(
             TintaImageResource, app->image_resources, i);
         if (!strcmp(cached->key, url)) {
+#if TINTA_ENABLE_REMOTE_IMAGES
             if (cached->remote && cached->state == 0)
                 start_remote_image(app, i);
+#endif
             *resource_index = i;
             *ready = cached->state == 2;
             return true;
@@ -774,6 +803,12 @@ bool tinta_image_resource_get(TintaApp *app, const char *url,
     image.resolved_uri = resolved.data ?
         tinta_wcsdup_n(resolved.data, resolved.len) : NULL;
     image.remote = remote;
+#if !TINTA_ENABLE_REMOTE_IMAGES
+    if (remote) blocked = true;
+#endif
+#if !TINTA_ENABLE_LOCAL_IMAGES
+    if (!remote) blocked = true;
+#endif
     image.state = blocked || !image.resolved_uri ? -1 : 0;
     tinta_str16_destroy(&resolved);
     if (!image.key || (!blocked && !image.resolved_uri) ||
@@ -787,14 +822,22 @@ bool tinta_image_resource_get(TintaApp *app, const char *url,
     if (image.state == 0) {
         TintaImageResource *stored = TINTA_VEC_PTR(
             TintaImageResource, app->image_resources, i);
-        if (stored->remote) start_remote_image(app, i);
-        else decode_local_image(app, stored);
+        if (stored->remote) {
+#if TINTA_ENABLE_REMOTE_IMAGES
+            start_remote_image(app, i);
+#endif
+        } else {
+#if TINTA_ENABLE_LOCAL_IMAGES
+            decode_local_image(app, stored);
+#endif
+        }
         *ready = stored->state == 2;
     }
     return true;
 }
 
 bool tinta_remote_image_complete(TintaApp *app) {
+#if TINTA_ENABLE_REMOTE_IMAGES
     RemoteResult *result;
     bool changed = false;
     while ((result = remote_result_dequeue(app)) != NULL) {
@@ -828,6 +871,10 @@ bool tinta_remote_image_complete(TintaApp *app) {
     }
     reap_worker_handles(app);
     return changed;
+#else
+    (void)app;
+    return false;
+#endif
 }
 
 
@@ -837,7 +884,10 @@ bool tinta_app_update_source(TintaApp *app, const char *source, size_t length,
     TintaStr8 new_source = {0};
     TintaStr16 new_file = {0};
     TintaParseResult parsed;
-    bool focus_mermaid = path && tinta_is_mermaid_document_path_utf16(path);
+    bool focus_mermaid = false;
+#if TINTA_ENABLE_MERMAID
+    focus_mermaid = path && tinta_is_mermaid_document_path_utf16(path);
+#endif
     if (path && !tinta_utf16_to_utf8(path, wcslen(path), &path8)) return false;
     parsed = tinta_parse_document(source, length, path8.data ? path8.data : "", NULL);
     tinta_str8_destroy(&path8);

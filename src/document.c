@@ -1,4 +1,5 @@
 #include "document.h"
+#include "features.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -61,6 +62,7 @@ TintaParseResult tinta_parse_document(const char *content, size_t length,
     memset(&result, 0, sizeof(result));
     result.root = tinta_element_create(TINTA_ELEMENT_DOCUMENT);
     if (result.root) {
+#if TINTA_ENABLE_MERMAID
         TintaElement *diagram = tinta_element_create(TINTA_ELEMENT_MERMAID_DIAGRAM);
         if (diagram) {
             diagram->text = tinta_str8_dup(content ? content : "", length);
@@ -71,10 +73,34 @@ TintaParseResult tinta_parse_document(const char *content, size_t length,
             }
             tinta_element_destroy(diagram);
         }
+#else
+        TintaElement *code = tinta_element_create(TINTA_ELEMENT_CODE_BLOCK);
+        TintaElement *text = tinta_element_create(TINTA_ELEMENT_TEXT);
+        if (code && text) {
+            char *source = tinta_str8_dup(content ? content : "", length);
+            char *language = tinta_str8_dup("mermaid", 7);
+            if (source && language) {
+                free(text->text);
+                text->text = source;
+                free(code->language);
+                code->language = language;
+                code->source_offset = 0;
+                if (tinta_element_add_child(code, text) &&
+                    tinta_element_add_child(result.root, code)) {
+                    result.success = true;
+                    return result;
+                }
+            } else {
+                free(source);
+                free(language);
+            }
+        }
+        if (text && !text->parent) tinta_element_destroy(text);
+        if (code && !code->parent) tinta_element_destroy(code);
+#endif
     }
     tinta_element_destroy(result.root);
     result.root = NULL;
     result.error = tinta_str8_dup("Out of memory", 13);
     return result;
 }
-

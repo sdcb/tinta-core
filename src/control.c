@@ -1,5 +1,6 @@
 #include "../include/tinta_core.h"
 #include "app.h"
+#include "features.h"
 #include "uia_provider.h"
 
 #include <math.h>
@@ -75,10 +76,28 @@ static float clamp_float(float value, float minimum, float maximum) {
 }
 
 static DWORD default_option_flags(void) {
-    return TINTA_OPTION_SELECTION | TINTA_OPTION_KEYBOARD_NAVIGATION |
-           TINTA_OPTION_MOUSE_ZOOM | TINTA_OPTION_CODE_COPY_BUTTON |
-           TINTA_OPTION_LOCAL_IMAGES | TINTA_OPTION_REMOTE_IMAGES |
-           TINTA_OPTION_OPEN_UNHANDLED_LINKS;
+    DWORD flags = TINTA_OPTION_SELECTION | TINTA_OPTION_KEYBOARD_NAVIGATION |
+                  TINTA_OPTION_MOUSE_ZOOM | TINTA_OPTION_CODE_COPY_BUTTON |
+                  TINTA_OPTION_OPEN_UNHANDLED_LINKS;
+#if TINTA_ENABLE_LOCAL_IMAGES
+    flags |= TINTA_OPTION_LOCAL_IMAGES;
+#endif
+#if TINTA_ENABLE_REMOTE_IMAGES
+    flags |= TINTA_OPTION_REMOTE_IMAGES;
+#endif
+    return flags;
+}
+
+static DWORD supported_option_flags(void) {
+    DWORD flags = ~(DWORD)(TINTA_OPTION_LOCAL_IMAGES |
+                           TINTA_OPTION_REMOTE_IMAGES);
+#if TINTA_ENABLE_LOCAL_IMAGES
+    flags |= TINTA_OPTION_LOCAL_IMAGES;
+#endif
+#if TINTA_ENABLE_REMOTE_IMAGES
+    flags |= TINTA_OPTION_REMOTE_IMAGES;
+#endif
+    return flags;
 }
 
 static TintaLimits default_limits(void) {
@@ -903,6 +922,7 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             const TintaOptions *options = (const TintaOptions *)lparam;
             if (!options || options->cb_size < sizeof(*options)) return FALSE;
             control->options = *options;
+            control->options.flags &= supported_option_flags();
             return TRUE;
         }
         case TMM_GETOPTIONS: {

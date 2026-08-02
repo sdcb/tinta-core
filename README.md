@@ -22,6 +22,27 @@ ctest --test-dir build --output-on-failure
 Set `BUILD_SHARED_LIBS=ON` to build `tinta_core.dll`; the default is a static
 library. md4c is vendored, so configuring the project requires no downloads.
 
+Optional viewer features can be removed at compile time. All five options are
+enabled by default:
+
+```bat
+cmake -S . -B build-mini -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DTINTA_ENABLE_UIA=OFF ^
+  -DTINTA_ENABLE_MERMAID=OFF ^
+  -DTINTA_ENABLE_SYNTAX=OFF ^
+  -DTINTA_ENABLE_REMOTE_IMAGES=OFF ^
+  -DTINTA_ENABLE_LOCAL_IMAGES=OFF
+cmake --build build-mini --target tinta_minimal
+```
+
+The trimmed control still supports Markdown parsing, Direct2D/DirectWrite
+layout and drawing, selection, scrolling, autosizing and streaming updates.
+Mermaid source falls back to a normal code block, code blocks use plain
+monospace text without syntax coloring, and unavailable images fall back to a
+clickable link. The link uses the alt text when present and the source URI
+otherwise. `TMM_GETOPTIONS` does not report image capabilities that were
+compiled out.
+
 The examples include `tinta_minimal`, the feature-oriented `tinta_demo`, and
 `tinta_chat_demo`. The chat demo hosts one Markdown control per message,
 provides a scrolling left/right conversation layout, and sends 128 simulated

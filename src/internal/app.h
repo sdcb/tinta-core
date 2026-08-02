@@ -8,7 +8,10 @@
 #include <wincodec.h>
 
 #include "document.h"
+#include "features.h"
+#if TINTA_ENABLE_MERMAID
 #include "mermaid.h"
+#endif
 #include "win_graphics_c.h"
 
 #ifdef __cplusplus

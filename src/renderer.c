@@ -1,5 +1,8 @@
 #include "app.h"
+#include "features.h"
+#if TINTA_ENABLE_SYNTAX
 #include "syntax.h"
+#endif
 
 #include <ctype.h>
 #include <commdlg.h>
@@ -29,10 +32,12 @@ typedef struct InlineStyle {
     int script;
 } InlineStyle;
 
+#if TINTA_ENABLE_MERMAID
 typedef struct ConnectorPath {
     D2D1_POINT_2F points[5];
     size_t count;
 } ConnectorPath;
+#endif
 
 static float maxf(float a, float b) { return a > b ? a : b; }
 static float minf(float a, float b) { return a < b ? a : b; }
@@ -382,6 +387,7 @@ static bool add_rect_alpha(TintaApp *app, float left, float top,
     return true;
 }
 
+#if TINTA_ENABLE_MERMAID
 static bool add_shape(TintaApp *app, float left, float top, float right, float bottom,
                       uint32_t color, float opacity, TintaDrawShape shape,
                       bool outline, float stroke) {
@@ -393,6 +399,7 @@ static bool add_shape(TintaApp *app, float left, float top, float right, float b
     app->content_width=maxf(app->content_width,right);
     return tinta_vec_push(&app->rects,&item)!=NULL;
 }
+#endif
 
 static bool add_line(TintaApp *app, float x1, float y1, float x2, float y2,
                      uint32_t color, float stroke) {
@@ -403,6 +410,7 @@ static bool add_line(TintaApp *app, float x1, float y1, float x2, float y2,
     return tinta_vec_push(&app->lines, &item) != NULL;
 }
 
+#if TINTA_ENABLE_MERMAID
 static bool add_connector_line(TintaApp *app, float x1, float y1, float x2, float y2,
                                uint32_t color, float stroke, bool dashed) {
     TintaDrawLine item;
@@ -413,6 +421,7 @@ static bool add_connector_line(TintaApp *app, float x1, float y1, float x2, floa
     app->content_width = maxf(app->content_width, maxf(x1, x2));
     return tinta_vec_push(&app->lines, &item) != NULL;
 }
+#endif
 
 
 static bool add_line_alpha(TintaApp *app, float x1, float y1, float x2, float y2,
@@ -791,8 +800,12 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
         size_t display_length = wide.len;
         float line_y=top+padding, max_line_width=0;
         float block_height;
+#if TINTA_ENABLE_SYNTAX
         int language=tinta_syntax_language(element->language);
-        bool block=false; TintaVec tokens; tinta_vec_init(&tokens,sizeof(TintaSyntaxToken));
+        bool block=false;
+        TintaVec tokens;
+        tinta_vec_init(&tokens,sizeof(TintaSyntaxToken));
+#endif
         size_t scan;
         if (display_length && wide.data[display_length - 1] == L'\n') {
             display_length--;
@@ -820,10 +833,11 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
         }
         while (ok && line_start <= display_length) {
             size_t line_end = line_start;
-            size_t token_index;
             float x = left + padding;
             while (line_end < display_length && wide.data[line_end] != L'\n')
                 line_end++;
+#if TINTA_ENABLE_SYNTAX
+            size_t token_index;
             if (!tinta_syntax_tokenize(wide.data + line_start,
                                        line_end - line_start, language,
                                        &block, &tokens)) {
@@ -854,6 +868,18 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
                 }
                 x += run->width;
             }
+#else
+            {
+                TintaTextRun *run = NULL;
+                if (!append_run(app, wide.data + line_start,
+                                line_end - line_start, app->code_format,
+                                app->theme->code, x, line_y, NULL, &run)) {
+                    ok = false;
+                    break;
+                }
+                x += run->width;
+            }
+#endif
             max_line_width = maxf(max_line_width, x - (left + padding));
             if (!ok) break;
             line_y += line_height;
@@ -864,7 +890,9 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
             }
             line_start = line_end + 1;
         }
+#if TINTA_ENABLE_SYNTAX
         tinta_vec_destroy(&tokens);
+#endif
         if (ok && max_line_width + padding * 2 > right - left) {
             float expanded_right = left + max_line_width + padding * 2;
             TintaDrawRect *background = TINTA_VEC_PTR(TintaDrawRect, app->rects, rect_index);
@@ -1084,6 +1112,7 @@ done:
     return ok;
 }
 
+#if TINTA_ENABLE_MERMAID
 static bool rects_overlap(D2D1_RECT_F a, D2D1_RECT_F b) {
     return a.left < b.right && a.right > b.left &&
            a.top < b.bottom && a.bottom > b.top;
@@ -1109,33 +1138,48 @@ static bool mermaid_label_collides(const TintaMermaidLayout *graph,
     }
     return false;
 }
+#endif
 
 static bool layout_image_placeholder(TintaApp *app, const TintaElement *element,
                                      float *y, float left) {
     TintaStr8 alt8 = {0};
-    TintaStr16 alt16 = {0};
-    TintaStr16 label = {0};
-    TintaTextRun *run = NULL;
-    bool ok = tinta_str16_init(&label) &&
-              tinta_str16_append(&label, L"[image", 6);
-    if (ok && flatten(element, &alt8) && alt8.len &&
-        tinta_utf8_to_utf16(alt8.data, alt8.len, &alt16)) {
-        ok = tinta_str16_append(&label, L": ", 2) &&
-             tinta_str16_append(&label, alt16.data, alt16.len);
-    }
-    if (ok) ok = tinta_str16_append(&label, L"]", 1);
+    TintaStr16 text = {0};
+    TintaTextRun *prefix_run = NULL;
+    TintaTextRun *link_run = NULL;
+    const wchar_t prefix[] = L"Image: ";
+    bool ok = flatten(element, &alt8);
+    if (ok && alt8.len)
+        ok = tinta_utf8_to_utf16(alt8.data, alt8.len, &text);
+    else if (ok && element->url && element->url[0])
+        ok = tinta_utf8_to_utf16(element->url, strlen(element->url), &text);
+    else if (ok)
+        ok = tinta_str16_assign(&text, L"image", 5);
     if (ok) {
-        ok = append_run(app, label.data, label.len, app->italic_format,
-                        app->theme->syntax_comment, left, *y, NULL, &run);
-        *y += run ? run->height + scale(app, 12) : scale(app, 28);
+        ok = append_run(app, prefix, 7, app->italic_format,
+                        app->theme->syntax_comment, left, *y, NULL,
+                        &prefix_run);
+    }
+    if (ok) {
+        float x = left + (prefix_run ? prefix_run->width : 0);
+        const char *url = element->url && element->url[0] ?
+                          element->url : NULL;
+        ok = append_run(app, text.data, text.len, app->italic_format,
+                        url ? app->theme->link : app->theme->syntax_comment,
+                        x, *y, url, &link_run);
+        if (link_run) link_run->underline = url != NULL;
+    }
+    if (ok) {
+        float height = prefix_run ? prefix_run->height : 0;
+        if (link_run) height = maxf(height, link_run->height);
+        *y += height + scale(app, 12);
     }
     tinta_str8_destroy(&alt8);
-    tinta_str16_destroy(&alt16);
-    tinta_str16_destroy(&label);
+    tinta_str16_destroy(&text);
     return ok;
 }
 
 static bool layout_image(TintaApp *app, const TintaElement *element, float *y, float left, float right) {
+#if TINTA_ENABLE_IMAGES
     size_t resource_index = 0;
     TintaImageResource *resource;
     TintaDrawBitmap item;
@@ -1159,8 +1203,13 @@ static bool layout_image(TintaApp *app, const TintaElement *element, float *y, f
     if (!tinta_vec_push(&app->bitmaps, &item)) return false;
     app->content_width = maxf(app->content_width, (float)item.rect.right);
     *y = (float)item.rect.bottom + scale(app, 16); return true;
+#else
+    (void)right;
+    return layout_image_placeholder(app, element, y, left);
+#endif
 }
 
+#if TINTA_ENABLE_MERMAID
 static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                            float *y, float left, float right) {
     TintaStr8 source={0};
@@ -1444,6 +1493,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
 failed:
     tinta_mermaid_layout_destroy(&graph); tinta_mermaid_parse_result_destroy(&parsed); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return false;
 }
+#endif
 
 static bool add_scroll_anchor(TintaApp *app, const TintaElement *element,
                               float rendered_y) {
@@ -1468,10 +1518,17 @@ static bool layout_element(TintaApp *app, const TintaElement *element,
         case TINTA_ELEMENT_PARAGRAPH: return layout_paragraph(app, element, y, left, right);
         case TINTA_ELEMENT_HEADING: return layout_heading(app, element, y, left, right);
         case TINTA_ELEMENT_CODE_BLOCK:
+#if TINTA_ENABLE_MERMAID
             if (element->language && !_stricmp(element->language, "mermaid"))
                 return layout_mermaid(app, element, y, left, right);
+#endif
             return layout_code(app, element, y, left, right);
-        case TINTA_ELEMENT_MERMAID_DIAGRAM: return layout_mermaid(app, element, y, left, right);
+        case TINTA_ELEMENT_MERMAID_DIAGRAM:
+#if TINTA_ENABLE_MERMAID
+            return layout_mermaid(app, element, y, left, right);
+#else
+            return layout_code(app, element, y, left, right);
+#endif
         case TINTA_ELEMENT_BLOCK_QUOTE: {
             float top = *y;
             uint32_t bar_color = app->theme->quote;
@@ -1915,6 +1972,7 @@ void tinta_render(TintaApp *app) {
                     item.stroke, NULL);
             }
         }
+#if TINTA_ENABLE_IMAGES
         for (i = 0; i < app->bitmaps.len; i++) {
             TintaDrawBitmap *item = TINTA_VEC_PTR(TintaDrawBitmap, app->bitmaps, i);
             TintaImageResource *resource;
@@ -1934,6 +1992,7 @@ void tinta_render(TintaApp *app) {
                     app->render_target, resource->bitmap, &destination, 1.0f,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
         }
+#endif
         if (app->search_query.len && app->viewer_search_matches.len) {
             size_t match_index;
             for (match_index = 0;

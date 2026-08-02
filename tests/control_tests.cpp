@@ -1,6 +1,8 @@
 #include "tinta_core.h"
 
+#if TINTA_ENABLE_UIA
 #include <UIAutomation.h>
+#endif
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -75,6 +77,47 @@ int main() {
         std::cerr << "control creation failed\n";
         return 1;
     }
+    TintaOptions compiled_options{};
+    compiled_options.cb_size = sizeof(compiled_options);
+    if (!SendMessageW(view, TMM_GETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&compiled_options))) {
+        std::cerr << "options query failed\n";
+        return 1;
+    }
+#if !TINTA_ENABLE_LOCAL_IMAGES
+    if (compiled_options.flags & TINTA_OPTION_LOCAL_IMAGES) {
+        std::cerr << "disabled local images were reported as supported\n";
+        return 1;
+    }
+#endif
+#if !TINTA_ENABLE_REMOTE_IMAGES
+    if (compiled_options.flags & TINTA_OPTION_REMOTE_IMAGES) {
+        std::cerr << "disabled remote images were reported as supported\n";
+        return 1;
+    }
+#endif
+    TintaOptions requested_options = compiled_options;
+    requested_options.flags |= TINTA_OPTION_LOCAL_IMAGES |
+                               TINTA_OPTION_REMOTE_IMAGES;
+    if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&requested_options)) ||
+        !SendMessageW(view, TMM_GETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&compiled_options))) {
+        std::cerr << "options update failed\n";
+        return 1;
+    }
+#if !TINTA_ENABLE_LOCAL_IMAGES
+    if (compiled_options.flags & TINTA_OPTION_LOCAL_IMAGES) {
+        std::cerr << "disabled local images could be enabled at runtime\n";
+        return 1;
+    }
+#endif
+#if !TINTA_ENABLE_REMOTE_IMAGES
+    if (compiled_options.flags & TINTA_OPTION_REMOTE_IMAGES) {
+        std::cerr << "disabled remote images could be enabled at runtime\n";
+        return 1;
+    }
+#endif
     TintaLimits limits{};
     limits.cb_size = sizeof(limits);
     if (!SendMessageW(view, TMM_GETLIMITS, 0,
@@ -238,7 +281,7 @@ int main() {
         return 1;
     }
     if (stream_update_notifications >= 1000 ||
-        resource_notifications != 1) {
+        resource_notifications != (TINTA_ENABLE_LOCAL_IMAGES ? 1 : 0)) {
         std::cerr << "stream coalescing or image cache failed\n";
         return 1;
     }
@@ -258,7 +301,7 @@ int main() {
         return 1;
     }
     TintaDocument image_document{};
-    const char image_markdown[] = "# Image\n\n![alt](missing.png)\n";
+    const char image_markdown[] = "# Image\n\n![](missing.png)\n";
     image_document.cb_size = sizeof(image_document);
     image_document.utf8 = image_markdown;
     image_document.utf8_length = std::strlen(image_markdown);
@@ -270,10 +313,25 @@ int main() {
         return 1;
     }
     SendMessageW(view, TMM_GETHEADINGCOUNT, 0, 0);
-    if (resource_notifications != 2) {
+    if (resource_notifications != (TINTA_ENABLE_LOCAL_IMAGES ? 2 : 0)) {
         std::cerr << "resource notification failed\n";
         return 1;
     }
+    TintaFindRequest image_find{};
+    image_find.cb_size = sizeof(image_find);
+    image_find.text = L"Image: missing.png";
+    image_find.text_length = std::wcslen(image_find.text);
+    TintaFindState image_find_state{};
+    image_find_state.cb_size = sizeof(image_find_state);
+    if (!SendMessageW(view, TMM_FIND, 0,
+                      reinterpret_cast<LPARAM>(&image_find)) ||
+        !SendMessageW(view, TMM_GETFINDSTATE, 0,
+                      reinterpret_cast<LPARAM>(&image_find_state)) ||
+        image_find_state.match_count != 1) {
+        std::cerr << "image link fallback text failed\n";
+        return 1;
+    }
+#if TINTA_ENABLE_UIA
     std::wstring accessible_document =
         L"# Accessible heading\n\n[Accessible link](https://example.com)\n\n";
     for (int index = 0; index < 80; index++)
@@ -369,6 +427,7 @@ int main() {
         std::cerr << "UI Automation text provider failed\n";
         return 1;
     }
+#endif
     constexpr UINT image_ready_message = WM_APP + 2;
     HWND first_probe = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW, L"first",
         WS_CHILD, 0, 0, 1, 1, parent, reinterpret_cast<HMENU>(101),

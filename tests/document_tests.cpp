@@ -1,5 +1,7 @@
 #include "document.h"
+#if TINTA_ENABLE_MERMAID
 #include "mermaid.h"
+#endif
 
 #include <cstring>
 #include <iostream>
@@ -27,7 +29,15 @@ int main() {
 
     auto mermaid = parse_doc("flowchart LR\nA --> B\n", "diagram.mmd");
     check(mermaid.success && mermaid.root && mermaid.root->child_count == 1, "Mermaid wrapper");
-    if (mermaid.success) check(mermaid.root->children[0]->type == TINTA_ELEMENT_MERMAID_DIAGRAM, "Mermaid element");
+    if (mermaid.success) {
+#if TINTA_ENABLE_MERMAID
+        check(mermaid.root->children[0]->type == TINTA_ELEMENT_MERMAID_DIAGRAM,
+              "Mermaid element");
+#else
+        check(mermaid.root->children[0]->type == TINTA_ELEMENT_CODE_BLOCK,
+              "disabled Mermaid falls back to source code");
+#endif
+    }
     tinta_parse_result_destroy(&mermaid);
 
     auto ext = parse_doc("before ==mark 中文== mid x^2^ and H~2~O ~~gone~~ `==not this==`\n", "notes.md");
@@ -119,9 +129,14 @@ int main() {
               "fenced Mermaid language is preserved");
         auto *code = fenced.root->children[0];
         const char *diagram_source = code->child_count ? code->children[0]->text : code->text;
+#if TINTA_ENABLE_MERMAID
         auto diagram = tinta_mermaid_parse(diagram_source, std::strlen(diagram_source));
         check(diagram.success, "fenced Mermaid content parses as a diagram");
         tinta_mermaid_parse_result_destroy(&diagram);
+#else
+        check(std::strstr(diagram_source, "flowchart TB") != nullptr,
+              "disabled Mermaid preserves fenced source");
+#endif
     }
     tinta_parse_result_destroy(&fenced);
 
