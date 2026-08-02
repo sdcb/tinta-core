@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 #define TINTA_CORE_VERSION_MAJOR 0
-#define TINTA_CORE_VERSION_MINOR 2
+#define TINTA_CORE_VERSION_MINOR 3
 #define TINTA_CORE_VERSION_PATCH 0
 
 /* Register this class with TintaCoreInitialize before calling CreateWindowExW. */
@@ -86,6 +86,23 @@ typedef struct TintaOptions {
     UINT cb_size;
     DWORD flags;
 } TintaOptions;
+
+/* TintaAutoSize::flags. Heights are specified in 96-DPI device-independent pixels. */
+enum {
+    TINTA_AUTOSIZE_HEIGHT = 0x0001,
+    TINTA_AUTOSIZE_MAX_HEIGHT = 0x0002
+};
+
+/*
+ * Optional height management. The host continues to own the control width and
+ * position. When the maximum is reached, the control uses its internal scroll bar.
+ */
+typedef struct TintaAutoSize {
+    UINT cb_size;
+    DWORD flags;
+    float min_height;             /* 0 = no explicit minimum. */
+    float max_height;             /* Used with TINTA_AUTOSIZE_MAX_HEIGHT. */
+} TintaAutoSize;
 
 typedef struct TintaLimits {
     UINT cb_size;
@@ -238,6 +255,14 @@ typedef struct TintaContentUpdateNotify {
     TintaContentSize content_size;
 } TintaContentUpdateNotify;
 
+typedef struct TintaAutoSizeNotify {
+    NMHDR hdr;
+    int old_client_height;
+    int new_client_height;
+    int new_window_height;
+    TintaContentSize content_size;
+} TintaAutoSizeNotify;
+
 /*
  * Control messages. Unless described otherwise, wParam is zero and a mutating
  * message returns nonzero on success.
@@ -245,6 +270,7 @@ typedef struct TintaContentUpdateNotify {
  * TMM_SETDOCUMENT       lParam = const TintaDocument *; replaces active stream.
  * TMM_SETBASEURI        lParam = const wchar_t *; rejected during a stream.
  * TMM_SET/GETOPTIONS    lParam = TintaOptions *.
+ * TMM_SET/GETAUTOSIZE   lParam = TintaAutoSize *.
  * TMM_SET/GETLIMITS     lParam = TintaLimits *.
  * TMM_SETBUILTINTHEME   wParam = TintaBuiltinTheme.
  * TMM_SETCUSTOMTHEME    lParam = const TintaThemeSpec *.
@@ -300,6 +326,8 @@ typedef struct TintaContentUpdateNotify {
 #define TMM_STREAM_APPEND         (TMM_FIRST + 26)
 #define TMM_STREAM_END            (TMM_FIRST + 27)
 #define TMM_STREAM_CANCEL         (TMM_FIRST + 28)
+#define TMM_SETAUTOSIZE           (TMM_FIRST + 29)
+#define TMM_GETAUTOSIZE           (TMM_FIRST + 30)
 
 /*
  * WM_NOTIFY codes sent synchronously to the parent window.
@@ -312,6 +340,8 @@ typedef struct TintaContentUpdateNotify {
  * TMN_STREAMUPDATED   lParam = const TintaStreamUpdateNotify *.
  * TMN_CONTENTUPDATED  lParam = const TintaContentUpdateNotify *; for example,
  *                     an image completion that changes content size.
+ * TMN_AUTOSIZED        lParam = const TintaAutoSizeNotify *; the parent should
+ *                     reflow sibling controls and update outer scroll ranges.
  */
 #define TMN_FIRST                 ((UINT)-1800)
 #define TMN_DOCUMENTREADY         (TMN_FIRST - 1)
@@ -327,6 +357,7 @@ typedef struct TintaContentUpdateNotify {
 #define TMN_COPYCOMPLETED         (TMN_FIRST - 11)
 #define TMN_STREAMUPDATED         (TMN_FIRST - 12)
 #define TMN_CONTENTUPDATED        (TMN_FIRST - 13)
+#define TMN_AUTOSIZED             (TMN_FIRST - 14)
 
 /*
  * Initialization is process-wide and reference counted. Pair every successful

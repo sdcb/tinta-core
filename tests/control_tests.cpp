@@ -3,6 +3,7 @@
 #include <UIAutomation.h>
 #include <cstring>
 #include <iostream>
+#include <string>
 #include <windows.h>
 
 static int notifications;
@@ -10,6 +11,7 @@ static int resource_notifications;
 static int link_notifications;
 static int document_ready_notifications;
 static int stream_update_notifications;
+static int autosize_notifications;
 static bool post_quit_on_destroy;
 static int destroy_quit_code;
 
@@ -24,6 +26,8 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
             document_ready_notifications++;
         if (header && header->code == TMN_STREAMUPDATED)
             stream_update_notifications++;
+        if (header && header->code == TMN_AUTOSIZED)
+            autosize_notifications++;
         if (header && header->code == TMN_LINKACTIVATE) {
             link_notifications++;
             return TRUE;
@@ -127,6 +131,54 @@ int main() {
         std::cerr << "selection API failed\n";
         return 1;
     }
+    TintaAutoSize auto_size{};
+    auto_size.cb_size = sizeof(auto_size);
+    auto_size.flags = TINTA_AUTOSIZE_HEIGHT |
+                      TINTA_AUTOSIZE_MAX_HEIGHT;
+    auto_size.min_height = 80.0f;
+    auto_size.max_height = 120.0f;
+    int autosize_target = autosize_notifications + 1;
+    if (!SendMessageW(view, TMM_SETAUTOSIZE, 0,
+                      reinterpret_cast<LPARAM>(&auto_size)) ||
+        autosize_notifications < autosize_target) {
+        std::cerr << "autosize configuration failed\n";
+        return 1;
+    }
+    std::wstring tall_document = L"# Auto size\n\n";
+    for (int index = 0; index < 100; index++)
+        tall_document += L"A line that makes the document taller.\n\n";
+    int autosize_ready_target = document_ready_notifications + 1;
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(tall_document.c_str()));
+    if (!pump_until(view, &document_ready_notifications,
+                    autosize_ready_target, 3000)) {
+        std::cerr << "autosize document layout failed\n";
+        return 1;
+    }
+    RECT autosized_client{};
+    GetClientRect(view, &autosized_client);
+    int expected_maximum = MulDiv(120, static_cast<int>(GetDpiForWindow(view)), 96);
+    if (autosized_client.bottom - autosized_client.top > expected_maximum + 1) {
+        std::cerr << "autosize maximum height failed\n";
+        return 1;
+    }
+    TintaAutoSize queried_auto_size{};
+    queried_auto_size.cb_size = sizeof(queried_auto_size);
+    if (!SendMessageW(view, TMM_GETAUTOSIZE, 0,
+                      reinterpret_cast<LPARAM>(&queried_auto_size)) ||
+        queried_auto_size.flags != auto_size.flags ||
+        queried_auto_size.max_height != auto_size.max_height) {
+        std::cerr << "autosize query failed\n";
+        return 1;
+    }
+    auto_size.flags = 0;
+    if (!SendMessageW(view, TMM_SETAUTOSIZE, 0,
+                      reinterpret_cast<LPARAM>(&auto_size))) {
+        std::cerr << "autosize disable failed\n";
+        return 1;
+    }
+    SetWindowPos(view, nullptr, 0, 0, 640, 480,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     TintaStreamBegin stream_begin{};
     stream_begin.cb_size = sizeof(stream_begin);
     stream_begin.base_uri = L"C:\\temp\\stream.md";
@@ -197,6 +249,12 @@ int main() {
     delete[] stream_text;
     if (!stream_text_ok) {
         std::cerr << "stream final text mismatch\n";
+        return 1;
+    }
+    RECT fixed_client{};
+    GetClientRect(view, &fixed_client);
+    if (fixed_client.bottom - fixed_client.top != 480) {
+        std::cerr << "disabled autosize changed the fixed height\n";
         return 1;
     }
     TintaDocument image_document{};

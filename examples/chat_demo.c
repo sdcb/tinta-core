@@ -363,34 +363,6 @@ static ChatMessage *find_message(HWND view) {
     return NULL;
 }
 
-static void size_message_to_content(ChatMessage *message) {
-    TintaContentSize size;
-    int height;
-    if (!message || !message->view) return;
-    memset(&size, 0, sizeof(size));
-    size.cb_size = sizeof(size);
-    if (!SendMessageW(message->view, TMM_GETCONTENTSIZE, 0, (LPARAM)&size))
-        return;
-    height = maximum_int(scale_value(message->view, 68),
-                         (int)(size.height + 1.999f));
-    if (height == message->height) return;
-    message->height = height;
-    update_round_region(message);
-    layout_history(false);
-}
-
-static void size_message_from_content(ChatMessage *message,
-                                      const TintaContentSize *size) {
-    int height;
-    if (!message || !size) return;
-    height = maximum_int(scale_value(message->view, 68),
-                         (int)(size->height + 1.999f));
-    if (height == message->height) return;
-    message->height = height;
-    update_round_region(message);
-    layout_history(false);
-}
-
 static void apply_message_theme(HWND view, ChatRole role) {
     TintaThemeSpec theme;
     memset(&theme, 0, sizeof(theme));
@@ -444,10 +416,44 @@ static void configure_message_options(HWND view) {
     SendMessageW(view, TMM_SETOPTIONS, 0, (LPARAM)&options);
 }
 
+static void configure_message_auto_size(HWND view) {
+    TintaAutoSize auto_size;
+    memset(&auto_size, 0, sizeof(auto_size));
+    auto_size.cb_size = sizeof(auto_size);
+    auto_size.flags = TINTA_AUTOSIZE_HEIGHT |
+                      TINTA_AUTOSIZE_MAX_HEIGHT;
+    auto_size.min_height = 68.0f;
+    auto_size.max_height = 440.0f;
+    SendMessageW(view, TMM_SETAUTOSIZE, 0, (LPARAM)&auto_size);
+}
+
+static bool message_can_scroll_wheel(HWND hwnd, int delta) {
+    TintaContentSize content;
+    TintaScrollPosition position;
+    RECT client;
+    float maximum;
+    memset(&content, 0, sizeof(content));
+    memset(&position, 0, sizeof(position));
+    content.cb_size = sizeof(content);
+    position.cb_size = sizeof(position);
+    if (!GetClientRect(hwnd, &client) ||
+        !SendMessageW(hwnd, TMM_GETCONTENTSIZE, 0, (LPARAM)&content) ||
+        !SendMessageW(hwnd, TMM_GETSCROLLPOS, 0, (LPARAM)&position))
+        return false;
+    maximum = content.height - (client.bottom - client.top);
+    if (maximum <= 0) return false;
+    if (delta > 0) return position.y > 0.5f;
+    if (delta < 0) return position.y < maximum - 0.5f;
+    return true;
+}
+
 static LRESULT CALLBACK markdown_subclass(HWND hwnd, UINT message,
     WPARAM wparam, LPARAM lparam, UINT_PTR subclass_id, DWORD_PTR reference) {
     HWND history = (HWND)reference;
     (void)subclass_id;
+    if (message == WM_MOUSEWHEEL &&
+        message_can_scroll_wheel(hwnd, GET_WHEEL_DELTA_WPARAM(wparam)))
+        return DefSubclassProc(hwnd, message, wparam, lparam);
     if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
         return SendMessageW(history, message, wparam, lparam);
     if (message == WM_KEYDOWN && !((GetKeyState(VK_CONTROL) & 0x8000) != 0)) {
@@ -488,6 +494,7 @@ static ChatMessage *create_message(ChatRole role, const wchar_t *markdown) {
     SetWindowSubclass(view, markdown_subclass, 1, (DWORD_PTR)g_app.history);
     configure_message_options(view);
     apply_message_theme(view, role);
+    configure_message_auto_size(view);
     update_round_region(message);
     if (role == CHAT_ROLE_USER) SetWindowTextW(view, message->markdown);
     layout_history(true);
@@ -500,26 +507,12 @@ static void reflow_all_messages(void) {
     bool keep_bottom = g_app.follow_bottom;
     for (index = 0; index < g_app.message_count; index++) {
         ChatMessage *message = &g_app.messages[index];
-        TintaContentSize content;
-        int height;
         if (message->width == width) continue;
-        SendMessageW(message->view, WM_SETREDRAW, FALSE, 0);
         message->width = width;
         SetWindowPos(message->view, NULL, 0, 0, message->width,
             message->height, SWP_NOMOVE | SWP_NOACTIVATE |
-            SWP_NOZORDER | SWP_NOREDRAW);
-        SendMessageW(message->view, TMM_GETHEADINGCOUNT, 0, 0);
-        memset(&content, 0, sizeof(content));
-        content.cb_size = sizeof(content);
-        if (SendMessageW(message->view, TMM_GETCONTENTSIZE, 0,
-                         (LPARAM)&content)) {
-            height = maximum_int(scale_value(message->view, 68),
-                                 (int)(content.height + 1.999f));
-            message->height = height;
-        }
+            SWP_NOZORDER);
         update_round_region(message);
-        SendMessageW(message->view, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(message->view, NULL, FALSE);
     }
     layout_history(keep_bottom);
 }
@@ -706,24 +699,20 @@ static LRESULT CALLBACK input_subclass(HWND hwnd, UINT message,
 static LRESULT handle_history_notify(LPARAM lparam) {
     NMHDR *header = (NMHDR *)lparam;
     if (!header) return 0;
-    if (header->code == TMN_DOCUMENTREADY) {
-        size_message_to_content(find_message(header->hwndFrom));
+    if (header->code == TMN_AUTOSIZED) {
+        const TintaAutoSizeNotify *notice =
+            (const TintaAutoSizeNotify *)header;
+        ChatMessage *message = find_message(header->hwndFrom);
+        if (message) {
+            message->height = notice->new_window_height;
+            update_round_region(message);
+            layout_history(false);
+        }
         return TRUE;
     }
-    if (header->code == TMN_STREAMUPDATED) {
-        const TintaStreamUpdateNotify *update =
-            (const TintaStreamUpdateNotify *)header;
-        size_message_from_content(find_message(header->hwndFrom),
-                                  &update->content_size);
-        return TRUE;
-    }
-    if (header->code == TMN_CONTENTUPDATED) {
-        const TintaContentUpdateNotify *update =
-            (const TintaContentUpdateNotify *)header;
-        size_message_from_content(find_message(header->hwndFrom),
-                                  &update->content_size);
-        return TRUE;
-    }
+    if (header->code == TMN_DOCUMENTREADY ||
+        header->code == TMN_STREAMUPDATED ||
+        header->code == TMN_CONTENTUPDATED) return TRUE;
     if (header->code == TMN_LINKACTIVATE) {
         const TintaLinkNotify *link = (const TintaLinkNotify *)header;
         wchar_t text[1200];
@@ -876,7 +865,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT message,
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
                 ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
                 0, 0, 1, 1, hwnd, (HMENU)ID_INPUT, g_app.instance, NULL);
-            g_app.send = CreateWindowW(L"BUTTON", L"Send\n(Ctrl+Enter)",
+            g_app.send = CreateWindowW(L"BUTTON", L"&Send\n(Ctrl+Enter)",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_MULTILINE,
                 0, 0, 1, 1, hwnd, (HMENU)ID_SEND, g_app.instance, NULL);
             if (!g_app.history || !g_app.input || !g_app.send) return -1;

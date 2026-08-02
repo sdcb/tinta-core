@@ -43,6 +43,7 @@ typedef struct TintaControl {
     bool stream_layout_in_flight;
     bool stream_ending;
     bool content_update_pending;
+    TintaAutoSize auto_size;
 } TintaControl;
 
 static SRWLOCK g_class_lock = SRWLOCK_INIT;
@@ -321,6 +322,54 @@ static void notify_content_updated(TintaControl *control) {
     notify_parent(control, &notice.hdr);
 }
 
+static bool control_apply_auto_size(TintaControl *control) {
+    RECT window_rect;
+    RECT client_rect;
+    TintaAutoSizeNotify notice;
+    float target;
+    float minimum;
+    float maximum;
+    int old_client_height;
+    int old_window_height;
+    int target_client_height;
+    int target_window_height;
+    int window_width;
+    if (!control ||
+        !(control->auto_size.flags & TINTA_AUTOSIZE_HEIGHT) ||
+        !control->view.layout_complete || !control->view.hwnd)
+        return false;
+    target = ceilf(control->view.content_height);
+    minimum = control->auto_size.min_height * control->view.dpi_scale;
+    if (target < minimum) target = minimum;
+    if (control->auto_size.flags & TINTA_AUTOSIZE_MAX_HEIGHT) {
+        maximum = control->auto_size.max_height * control->view.dpi_scale;
+        if (target > maximum) target = maximum;
+    }
+    target_client_height = max(1, (int)ceilf(target));
+    old_client_height = control->view.height;
+    if (target_client_height == old_client_height) return false;
+    if (!GetWindowRect(control->view.hwnd, &window_rect)) return false;
+    old_window_height = window_rect.bottom - window_rect.top;
+    window_width = window_rect.right - window_rect.left;
+    target_window_height = target_client_height +
+        max(0, old_window_height - old_client_height);
+    if (!SetWindowPos(control->view.hwnd, NULL, 0, 0,
+            window_width, target_window_height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+        return false;
+    GetClientRect(control->view.hwnd, &client_rect);
+    memset(&notice, 0, sizeof(notice));
+    notice.hdr.code = TMN_AUTOSIZED;
+    notice.old_client_height = old_client_height;
+    notice.new_client_height = client_rect.bottom - client_rect.top;
+    notice.new_window_height = target_window_height;
+    notice.content_size.cb_size = sizeof(notice.content_size);
+    notice.content_size.width = control->view.content_width;
+    notice.content_size.height = control->view.content_height;
+    notify_parent(control, &notice.hdr);
+    return true;
+}
+
 static bool control_stream_flush(TintaControl *control, bool force) {
     TintaStr16 synthetic = {0};
     const wchar_t *path;
@@ -353,6 +402,7 @@ static void control_layout_completed(TintaControl *control) {
     ULONGLONG now;
     ULONGLONG elapsed;
     if (!control || !control->view.layout_complete) return;
+    control_apply_auto_size(control);
     if (control->stream_active && control->stream_layout_in_flight) {
         now = GetTickCount64();
         elapsed = now - control->stream_layout_started;
@@ -998,6 +1048,32 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             return control_stream_end(control);
         case TMM_STREAM_CANCEL:
             return control_stream_cancel(control);
+        case TMM_SETAUTOSIZE: {
+            const TintaAutoSize *auto_size =
+                (const TintaAutoSize *)lparam;
+            DWORD known_flags = TINTA_AUTOSIZE_HEIGHT |
+                                TINTA_AUTOSIZE_MAX_HEIGHT;
+            if (!auto_size || auto_size->cb_size < sizeof(*auto_size) ||
+                (auto_size->flags & ~known_flags) ||
+                ((auto_size->flags & TINTA_AUTOSIZE_MAX_HEIGHT) &&
+                 (!(auto_size->flags & TINTA_AUTOSIZE_HEIGHT) ||
+                  auto_size->max_height <= 0)) ||
+                auto_size->min_height < 0 ||
+                ((auto_size->flags & TINTA_AUTOSIZE_MAX_HEIGHT) &&
+                 auto_size->max_height < auto_size->min_height))
+                return FALSE;
+            control->auto_size = *auto_size;
+            control->auto_size.cb_size = sizeof(control->auto_size);
+            control_apply_auto_size(control);
+            return TRUE;
+        }
+        case TMM_GETAUTOSIZE: {
+            TintaAutoSize *auto_size = (TintaAutoSize *)lparam;
+            if (!auto_size || auto_size->cb_size < sizeof(*auto_size))
+                return FALSE;
+            *auto_size = control->auto_size;
+            return TRUE;
+        }
     }
     return 0;
 }
@@ -1030,6 +1106,7 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
     control->view.resource_context = control;
     control->use_system_theme = true;
     control->redraw_enabled = true;
+    control->auto_size.cb_size = sizeof(control->auto_size);
     tinta_str16_init(&control->base_uri);
     tinta_str8_init(&control->stream_buffer);
     return tinta_app_update_formats(&control->view);
@@ -1046,7 +1123,7 @@ static void control_destroy_state(TintaControl *control) {
 static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
                                            WPARAM wparam, LPARAM lparam) {
     TintaControl *control = control_from_window(hwnd);
-    if (message >= TMM_FIRST && message <= TMM_STREAM_CANCEL && control)
+    if (message >= TMM_FIRST && message <= TMM_GETAUTOSIZE && control)
         return control_custom_message(control, message, wparam, lparam);
     switch (message) {
         case WM_NCCREATE: {
@@ -1077,10 +1154,12 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
             return control ? (LRESULT)control_get_text(control, NULL, 0) : 0;
         case WM_SIZE:
             if (control) {
+                int old_width = control->view.width;
                 control->view.width = LOWORD(lparam);
                 control->view.height = HIWORD(lparam);
                 tinta_app_create_device(&control->view);
-                control->view.layout_dirty = true;
+                if (control->view.width != old_width)
+                    control->view.layout_dirty = true;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0
+
+- Added opt-in height autosizing with optional minimum and maximum heights.
+- Added `TMN_AUTOSIZED` so container windows can reflow sibling controls.
+
 ## 0.2.0
 
 - Added coalesced UTF-8 streaming messages and revision/content notifications.

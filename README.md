@@ -50,6 +50,9 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   `TMM_STREAM_CANCEL` accept arbitrary UTF-8 delta boundaries. The control
   copies each delta, coalesces full parse/layout revisions at 20 Hz by default,
   and reports displayed revisions with `TMN_STREAMUPDATED`.
+- `TMM_SETAUTOSIZE` can fit the control height to its content and optionally
+  cap it at a maximum height. Overflow continues to use the control's internal
+  scroll bar, while `TMN_AUTOSIZED` lets an outer container reflow its layout.
 - Input pointers are copied before `SendMessage` returns. Output messages use
   caller-owned buffers, so no allocator crosses a static-library or DLL ABI.
 - The control owns parsing, Direct2D drawing, scrolling, selection, zoom,
