@@ -4,6 +4,9 @@ Tinta Core is a C11 Win32 Markdown and Mermaid viewing control. It exposes the
 window class `Tinta.MarkdownView`, supports normal `CreateWindowExW` hosting,
 and uses window messages and `WM_NOTIFY` for integration.
 
+Tinta Core is sdcb's reusable-control rewrite of Tinta C. Tinta C is itself
+sdcb's pure C rewrite of the original Tinta project.
+
 The original `tintac.exe` application is not part of this repository. This
 repository contains the reusable read-only control, a minimal host, and a
 larger demonstration host.
