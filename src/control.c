@@ -1,0 +1,1069 @@
+#include "../include/tinta_core.h"
+#include "app.h"
+#include "uia_provider.h"
+
+#include <math.h>
+#include <shellapi.h>
+#include <shlwapi.h>
+#include <urlmon.h>
+#include <stdlib.h>
+#include <string.h>
+#include <windowsx.h>
+#include <wctype.h>
+
+extern IMAGE_DOS_HEADER __ImageBase;
+
+typedef struct TintaControl {
+    TintaApp view;
+    TintaOptions options;
+    TintaLimits limits;
+    TintaStr16 base_uri;
+    TintaTheme custom_theme;
+    wchar_t custom_font[LF_FACESIZE];
+    wchar_t custom_code_font[LF_FACESIZE];
+    DWORD find_flags;
+    bool use_system_theme;
+    bool redraw_enabled;
+    bool ready_notified;
+} TintaControl;
+
+static SRWLOCK g_class_lock = SRWLOCK_INIT;
+static LONG g_initialize_count;
+static LONG g_live_controls;
+static HINSTANCE g_module;
+
+static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
+                                           WPARAM wparam, LPARAM lparam);
+static void control_activate_link(TintaControl *control, const char *url);
+
+static void control_invoke_link(TintaApp *app, const char *url) {
+    char *copy;
+    if (!app || !url) return;
+    copy = tinta_str8_dup(url, strlen(url));
+    if (!copy) return;
+    if (!PostMessageW(app->hwnd, TINTA_WM_UIA_INVOKE, 0, (LPARAM)copy))
+        free(copy);
+}
+
+static TintaControl *control_from_window(HWND hwnd) {
+    return (TintaControl *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+}
+
+static float clamp_float(float value, float minimum, float maximum) {
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+static DWORD default_option_flags(void) {
+    return TINTA_OPTION_SELECTION | TINTA_OPTION_KEYBOARD_NAVIGATION |
+           TINTA_OPTION_MOUSE_ZOOM | TINTA_OPTION_CODE_COPY_BUTTON |
+           TINTA_OPTION_LOCAL_IMAGES | TINTA_OPTION_REMOTE_IMAGES |
+           TINTA_OPTION_OPEN_UNHANDLED_LINKS;
+}
+
+static TintaLimits default_limits(void) {
+    TintaLimits limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.cb_size = sizeof(limits);
+    limits.max_document_bytes = 64u * 1024u * 1024u;
+    limits.max_ast_nodes = 1000000u;
+    limits.max_image_pixels = 64ull * 1024ull * 1024ull;
+    limits.max_image_resources = 512;
+    limits.max_concurrent_downloads = 4;
+    return limits;
+}
+
+static bool system_uses_dark_mode(void) {
+    DWORD value = 1;
+    DWORD size = sizeof(value);
+    LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &value, &size);
+    return status == ERROR_SUCCESS && value == 0;
+}
+
+static LRESULT notify_parent(TintaControl *control, NMHDR *header) {
+    HWND parent;
+    if (!control || !header) return 0;
+    parent = GetParent(control->view.hwnd);
+    if (!parent) return 0;
+    header->hwndFrom = control->view.hwnd;
+    header->idFrom = (UINT_PTR)GetDlgCtrlID(control->view.hwnd);
+    return SendMessageW(parent, WM_NOTIFY, header->idFrom, (LPARAM)header);
+}
+
+static void notify_code(TintaControl *control, UINT code) {
+    NMHDR header;
+    memset(&header, 0, sizeof(header));
+    header.code = code;
+    notify_parent(control, &header);
+}
+
+static void notify_error(TintaControl *control, HRESULT error,
+                         const wchar_t *operation, const wchar_t *message) {
+    TintaErrorNotify notice;
+    memset(&notice, 0, sizeof(notice));
+    notice.hdr.code = TMN_ERROR;
+    notice.error = error;
+    notice.operation = operation;
+    notice.message = message;
+    notify_parent(control, &notice.hdr);
+}
+
+static bool control_apply_theme(TintaControl *control, int index) {
+    int old_index;
+    const TintaTheme *old_theme;
+    if (!control || index < 0 || index >= (int)TINTA_THEME_COUNT) return false;
+    old_index = control->view.theme_index;
+    old_theme = control->view.theme;
+    control->view.theme_index = index;
+    control->view.theme = &TINTA_THEMES[index];
+    if (!tinta_app_update_formats(&control->view)) {
+        control->view.theme_index = old_index;
+        control->view.theme = old_theme;
+        return false;
+    }
+    tinta_app_discard_device(&control->view);
+    control->view.layout_dirty = true;
+    InvalidateRect(control->view.hwnd, NULL, FALSE);
+    return true;
+}
+
+static bool control_refresh_system_theme(TintaControl *control) {
+    if (!control || !control->use_system_theme) return false;
+    return control_apply_theme(control,
+        system_uses_dark_mode() ? TINTA_THEME_MIDNIGHT : TINTA_THEME_PAPER);
+}
+
+static bool control_set_custom_theme(TintaControl *control,
+                                     const TintaThemeSpec *theme) {
+    int old_index;
+    const TintaTheme *old_theme;
+    if (!control || !theme || theme->cb_size < sizeof(*theme) ||
+        !theme->font_family || !theme->code_font_family)
+        return false;
+    wcsncpy_s(control->custom_font, LF_FACESIZE, theme->font_family, _TRUNCATE);
+    wcsncpy_s(control->custom_code_font, LF_FACESIZE,
+              theme->code_font_family, _TRUNCATE);
+    control->custom_theme.name = L"Custom";
+    control->custom_theme.font_family = control->custom_font;
+    control->custom_theme.code_font_family = control->custom_code_font;
+    control->custom_theme.dark = theme->dark != FALSE;
+    control->custom_theme.background = theme->background;
+    control->custom_theme.text = theme->text;
+    control->custom_theme.heading = theme->heading;
+    control->custom_theme.link = theme->link;
+    control->custom_theme.code = theme->code;
+    control->custom_theme.code_background = theme->code_background;
+    control->custom_theme.quote = theme->quote;
+    control->custom_theme.accent = theme->accent;
+    control->custom_theme.syntax_keyword = theme->syntax_keyword;
+    control->custom_theme.syntax_string = theme->syntax_string;
+    control->custom_theme.syntax_comment = theme->syntax_comment;
+    control->custom_theme.syntax_number = theme->syntax_number;
+    control->custom_theme.syntax_function = theme->syntax_function;
+    control->custom_theme.syntax_type = theme->syntax_type;
+    control->custom_theme.syntax_control = theme->syntax_control;
+    old_index = control->view.theme_index;
+    old_theme = control->view.theme;
+    control->view.theme_index = -1;
+    control->view.theme = &control->custom_theme;
+    if (!tinta_app_update_formats(&control->view)) {
+        control->view.theme_index = old_index;
+        control->view.theme = old_theme;
+        return false;
+    }
+    control->use_system_theme = false;
+    tinta_app_discard_device(&control->view);
+    control->view.layout_dirty = true;
+    InvalidateRect(control->view.hwnd, NULL, FALSE);
+    return true;
+}
+
+static void control_store_base_uri(TintaControl *control,
+                                   const wchar_t *base_uri) {
+    if (!control) return;
+    if (base_uri)
+        tinta_str16_assign(&control->base_uri, base_uri, wcslen(base_uri));
+    else
+        tinta_str16_clear(&control->base_uri);
+}
+
+static bool path_has_extension(const wchar_t *path, const wchar_t *extension) {
+    size_t path_length;
+    size_t extension_length;
+    if (!path || !extension) return false;
+    path_length = wcslen(path);
+    extension_length = wcslen(extension);
+    return path_length >= extension_length &&
+           !_wcsicmp(path + path_length - extension_length, extension);
+}
+
+static bool control_set_document(TintaControl *control,
+                                 const char *utf8, size_t length,
+                                 const wchar_t *base_uri,
+                                 TintaDocumentFormat format) {
+    TintaStr16 synthetic = {0};
+    const wchar_t *path = NULL;
+    bool result;
+    if (!control || (!utf8 && length)) return false;
+    if (length > control->limits.max_document_bytes) {
+        notify_error(control, HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE),
+                     L"set-document", L"The Markdown document exceeds the configured limit.");
+        return false;
+    }
+    if (base_uri) control_store_base_uri(control, base_uri);
+    if (control->base_uri.len) path = control->base_uri.data;
+    if (format == TINTA_FORMAT_MERMAID &&
+        (!path || !path_has_extension(path, L".mmd"))) {
+        tinta_str16_assign(&synthetic, L"document.mmd", 12);
+        path = synthetic.data;
+    } else if (format == TINTA_FORMAT_MARKDOWN &&
+               path && path_has_extension(path, L".mmd")) {
+        tinta_str16_assign(&synthetic, L"document.md", 11);
+        path = synthetic.data;
+    }
+    result = tinta_app_load_source(&control->view, utf8 ? utf8 : "", length, path);
+    tinta_str16_destroy(&synthetic);
+    if (!result) {
+        notify_error(control, E_FAIL, L"parse", L"The Markdown document could not be parsed.");
+        return false;
+    }
+    control->ready_notified = false;
+    return true;
+}
+
+static bool control_set_text(TintaControl *control, const wchar_t *text) {
+    TintaStr8 utf8 = {0};
+    bool result;
+    if (!text) text = L"";
+    if (!tinta_utf16_to_utf8(text, wcslen(text), &utf8)) return false;
+    result = control_set_document(control, utf8.data, utf8.len, NULL,
+                                  TINTA_FORMAT_MARKDOWN);
+    tinta_str8_destroy(&utf8);
+    return result;
+}
+
+static size_t control_get_text(TintaControl *control, wchar_t *buffer,
+                               size_t capacity) {
+    TintaStr16 wide = {0};
+    size_t length = 0;
+    if (!control) return 0;
+    if (!tinta_utf8_to_utf16(control->view.source.data,
+                             control->view.source.len, &wide))
+        return 0;
+    length = wide.len;
+    if (buffer && capacity) {
+        size_t copy = length < capacity - 1 ? length : capacity - 1;
+        if (copy) memcpy(buffer, wide.data, copy * sizeof(*buffer));
+        buffer[copy] = 0;
+    }
+    tinta_str16_destroy(&wide);
+    return length;
+}
+
+static bool find_word_character(wchar_t value) {
+    return value == L'_' || iswalnum(value) != 0;
+}
+
+static int selection_character_class(wchar_t value) {
+    if ((value >= L'a' && value <= L'z') ||
+        (value >= L'A' && value <= L'Z') ||
+        (value >= L'0' && value <= L'9') || value == L'_') return 1;
+    if ((unsigned int)value > 127 && !iswspace(value)) return 2;
+    return 0;
+}
+
+static bool find_matches_at(const TintaControl *control, size_t position,
+                            const wchar_t *query, size_t query_length) {
+    const wchar_t *document = control->view.doc_text.data;
+    size_t document_length = control->view.doc_text.len;
+    bool matches;
+    if (control->find_flags & TINTA_FIND_MATCH_CASE)
+        matches = wcsncmp(document + position, query, query_length) == 0;
+    else
+        matches = _wcsnicmp(document + position, query, query_length) == 0;
+    if (!matches || !(control->find_flags & TINTA_FIND_WHOLE_WORD))
+        return matches;
+    if (position && find_word_character(document[position - 1])) return false;
+    if (position + query_length < document_length &&
+        find_word_character(document[position + query_length])) return false;
+    return true;
+}
+
+static void control_activate_find(TintaControl *control, size_t index) {
+    TintaSearchMatch match;
+    size_t run_index;
+    if (!control || index >= control->view.viewer_search_matches.len) return;
+    control->view.viewer_search_index = (int)index;
+    match = TINTA_VEC_AT(TintaSearchMatch, control->view.viewer_search_matches, index);
+    for (run_index = 0; run_index < control->view.text_runs.len; run_index++) {
+        TintaTextRun *run = TINTA_VEC_PTR(TintaTextRun, control->view.text_runs,
+                                          run_index);
+        if (match.start < run->doc_start + run->doc_length &&
+            match.start + match.length > run->doc_start) {
+            float maximum_y = fmaxf(0, control->view.content_height - control->view.height);
+            float maximum_x = fmaxf(0, control->view.content_width - control->view.width);
+            control->view.scroll_y = clamp_float(
+                run->y - control->view.height * 0.45f, 0, maximum_y);
+            control->view.scroll_x = clamp_float(
+                run->x + run->width * 0.5f - control->view.width * 0.5f,
+                0, maximum_x);
+            break;
+        }
+    }
+    InvalidateRect(control->view.hwnd, NULL, FALSE);
+}
+
+static bool control_find(TintaControl *control, const TintaFindRequest *request) {
+    size_t position = 0;
+    if (!control || !request || request->cb_size < sizeof(*request) ||
+        (!request->text && request->text_length)) return false;
+    if ((control->view.layout_dirty || !control->view.layout_complete) &&
+        !tinta_layout_document(&control->view)) return false;
+    tinta_str16_assign(&control->view.search_query,
+                       request->text ? request->text : L"",
+                       request->text_length);
+    control->find_flags = request->flags;
+    tinta_vec_clear(&control->view.viewer_search_matches);
+    control->view.viewer_search_index = -1;
+    if (!request->text_length) {
+        InvalidateRect(control->view.hwnd, NULL, FALSE);
+        return true;
+    }
+    while (position + request->text_length <= control->view.doc_text.len) {
+        if (find_matches_at(control, position, request->text,
+                            request->text_length)) {
+            TintaSearchMatch match = {position, request->text_length};
+            if (!tinta_vec_push(&control->view.viewer_search_matches, &match))
+                return false;
+            position += request->text_length;
+        } else {
+            position++;
+        }
+    }
+    if (control->view.viewer_search_matches.len)
+        control_activate_find(control, 0);
+    else
+        InvalidateRect(control->view.hwnd, NULL, FALSE);
+    return true;
+}
+
+static void control_find_step(TintaControl *control, int direction) {
+    int current;
+    int count;
+    if (!control || !control->view.viewer_search_matches.len) return;
+    count = (int)control->view.viewer_search_matches.len;
+    current = control->view.viewer_search_index;
+    current += direction;
+    if (control->find_flags & TINTA_FIND_WRAP) {
+        if (current < 0) current = count - 1;
+        if (current >= count) current = 0;
+    } else {
+        if (current < 0) current = 0;
+        if (current >= count) current = count - 1;
+    }
+    control_activate_find(control, (size_t)current);
+}
+
+static void control_clear_find(TintaControl *control) {
+    if (!control) return;
+    tinta_str16_clear(&control->view.search_query);
+    tinta_vec_clear(&control->view.viewer_search_matches);
+    control->view.viewer_search_index = -1;
+    InvalidateRect(control->view.hwnd, NULL, FALSE);
+}
+
+static bool control_pressed(void) {
+    return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+}
+
+static void control_copy_selection(TintaControl *control) {
+    if (!control ||
+        control->view.selection_anchor == control->view.selection_focus)
+        return;
+    tinta_copy_selection(&control->view);
+    KillTimer(control->view.hwnd, TINTA_TIMER_NOTIFICATION);
+    control->view.notice_kind = TINTA_NOTICE_NONE;
+    notify_code(control, TMN_COPYCOMPLETED);
+}
+
+static void control_handle_key(TintaControl *control, WPARAM key) {
+    TintaApp *view;
+    if (!control || !(control->options.flags & TINTA_OPTION_KEYBOARD_NAVIGATION))
+        return;
+    view = &control->view;
+    if (control_pressed()) {
+        if (key == 'A') {
+            view->selection_anchor = 0;
+            view->selection_focus = view->doc_text.len;
+            InvalidateRect(view->hwnd, NULL, FALSE);
+            notify_code(control, TMN_SELECTIONCHANGED);
+            tinta_uia_raise_selection_changed(view);
+            return;
+        }
+        if (key == 'C') {
+            control_copy_selection(control);
+            return;
+        }
+        if (key == 'F') {
+            notify_code(control, TMN_REQUESTFIND);
+            return;
+        }
+    }
+    switch (key) {
+        case VK_DOWN: tinta_scroll(view, 42.0f * view->dpi_scale); break;
+        case VK_UP: tinta_scroll(view, -42.0f * view->dpi_scale); break;
+        case VK_NEXT: case VK_SPACE: tinta_scroll(view, view->height * 0.82f); break;
+        case VK_PRIOR: tinta_scroll(view, -view->height * 0.82f); break;
+        case VK_HOME: view->scroll_y = 0; InvalidateRect(view->hwnd, NULL, FALSE); break;
+        case VK_END: tinta_scroll(view, view->content_height); break;
+        default: return;
+    }
+    notify_code(control, TMN_SCROLLCHANGED);
+}
+
+static wchar_t *control_resolve_link(TintaControl *control, const char *url) {
+    TintaStr16 wide = {0};
+    wchar_t combined[4096];
+    wchar_t directory[MAX_PATH * 4];
+    wchar_t *result = NULL;
+    if (!url || !tinta_utf8_to_utf16(url, strlen(url), &wide)) return NULL;
+    if (!control->base_uri.len || PathIsURLW(wide.data) ||
+        PathIsRelativeW(wide.data) == FALSE) {
+        result = tinta_wcsdup_n(wide.data, wide.len);
+    } else if (PathIsURLW(control->base_uri.data)) {
+        DWORD length = _countof(combined);
+        if (SUCCEEDED(UrlCombineW(control->base_uri.data, wide.data, combined,
+                                  &length, 0)))
+            result = tinta_wcsdup_n(combined, wcslen(combined));
+    } else if (wcslen(control->base_uri.data) < _countof(directory)) {
+        size_t directory_length;
+        wcscpy_s(directory, _countof(directory), control->base_uri.data);
+        directory_length = wcslen(directory);
+        if (directory_length &&
+            directory[directory_length - 1] != L'\\' &&
+            directory[directory_length - 1] != L'/' &&
+            !PathIsDirectoryW(directory))
+            PathRemoveFileSpecW(directory);
+        if (PathAppendW(directory, wide.data))
+            result = tinta_wcsdup_n(directory, wcslen(directory));
+    }
+    tinta_str16_destroy(&wide);
+    return result;
+}
+
+static bool control_resolve_image(TintaApp *app, const char *source,
+                                  TintaStr16 *resolved, bool *remote,
+                                  bool *blocked) {
+    TintaControl *control;
+    TintaStr16 original = {0};
+    wchar_t *initial;
+    TintaResourceNotify notice;
+    TintaResourceAction action;
+    const wchar_t *chosen;
+    bool is_remote;
+    if (!app || !source || !resolved || !remote || !blocked) return false;
+    control = (TintaControl *)app->resource_context;
+    if (!control || !tinta_utf8_to_utf16(source, strlen(source), &original))
+        return false;
+    initial = control_resolve_link(control, source);
+    if (!initial) {
+        tinta_str16_destroy(&original);
+        return false;
+    }
+    is_remote = !_wcsnicmp(initial, L"http://", 7) ||
+                !_wcsnicmp(initial, L"https://", 8);
+    if ((is_remote && !(control->options.flags & TINTA_OPTION_REMOTE_IMAGES)) ||
+        (!is_remote && !(control->options.flags & TINTA_OPTION_LOCAL_IMAGES))) {
+        *blocked = true;
+        free(initial);
+        tinta_str16_destroy(&original);
+        return true;
+    }
+    memset(&notice, 0, sizeof(notice));
+    notice.hdr.code = TMN_RESOURCEOPENING;
+    notice.kind = is_remote ? TINTA_RESOURCE_REMOTE_IMAGE :
+                              TINTA_RESOURCE_LOCAL_IMAGE;
+    notice.original_uri = original.data;
+    notice.resolved_uri = initial;
+    action = (TintaResourceAction)notify_parent(control, &notice.hdr);
+    if (action == TINTA_RESOURCE_BLOCK) {
+        *blocked = true;
+        free(initial);
+        tinta_str16_destroy(&original);
+        return true;
+    }
+    chosen = action == TINTA_RESOURCE_REPLACE && notice.replacement_uri ?
+             notice.replacement_uri : initial;
+    if (!tinta_str16_assign(resolved, chosen, wcslen(chosen))) {
+        free(initial);
+        tinta_str16_destroy(&original);
+        return false;
+    }
+    *remote = !_wcsnicmp(resolved->data, L"http://", 7) ||
+              !_wcsnicmp(resolved->data, L"https://", 8);
+    *blocked = false;
+    free(initial);
+    tinta_str16_destroy(&original);
+    return true;
+}
+
+static void control_activate_link(TintaControl *control, const char *url) {
+    wchar_t *resolved;
+    TintaLinkNotify notice;
+    if (!control || !url || !url[0]) return;
+    if (url[0] == '#' && tinta_jump_to_internal_link(&control->view, url)) return;
+    resolved = control_resolve_link(control, url);
+    if (!resolved) return;
+    memset(&notice, 0, sizeof(notice));
+    notice.hdr.code = TMN_LINKACTIVATE;
+    notice.uri = resolved;
+    if (!notify_parent(control, &notice.hdr) &&
+        (control->options.flags & TINTA_OPTION_OPEN_UNHANDLED_LINKS))
+        ShellExecuteW(control->view.hwnd, L"open", resolved, NULL, NULL,
+                      SW_SHOWNORMAL);
+    free(resolved);
+}
+
+static bool copy_heading_string(wchar_t *destination, size_t capacity,
+                                const wchar_t *source) {
+    size_t length = source ? wcslen(source) : 0;
+    if (!destination || !capacity) return length == 0;
+    if (length >= capacity) {
+        destination[0] = 0;
+        return false;
+    }
+    if (length) memcpy(destination, source, length * sizeof(*destination));
+    destination[length] = 0;
+    return true;
+}
+
+static LRESULT control_custom_message(TintaControl *control, UINT message,
+                                      WPARAM wparam, LPARAM lparam) {
+    TintaApp *view = &control->view;
+    switch (message) {
+        case TMM_SETDOCUMENT: {
+            const TintaDocument *document = (const TintaDocument *)lparam;
+            if (!document || document->cb_size < sizeof(*document)) return FALSE;
+            return control_set_document(control, document->utf8,
+                document->utf8_length, document->base_uri, document->format);
+        }
+        case TMM_SETBASEURI:
+            control_store_base_uri(control, (const wchar_t *)lparam);
+            return TRUE;
+        case TMM_SETOPTIONS: {
+            const TintaOptions *options = (const TintaOptions *)lparam;
+            if (!options || options->cb_size < sizeof(*options)) return FALSE;
+            control->options = *options;
+            return TRUE;
+        }
+        case TMM_GETOPTIONS: {
+            TintaOptions *options = (TintaOptions *)lparam;
+            if (!options || options->cb_size < sizeof(*options)) return FALSE;
+            *options = control->options;
+            return TRUE;
+        }
+        case TMM_SETLIMITS: {
+            const TintaLimits *limits = (const TintaLimits *)lparam;
+            if (!limits || limits->cb_size < sizeof(*limits) ||
+                !limits->max_document_bytes || !limits->max_ast_nodes ||
+                !limits->max_image_pixels || !limits->max_image_resources ||
+                !limits->max_concurrent_downloads) return FALSE;
+            control->limits = *limits;
+            view->max_ast_nodes = limits->max_ast_nodes;
+            view->max_image_pixels = limits->max_image_pixels;
+            view->max_image_resources = limits->max_image_resources;
+            view->max_concurrent_downloads = limits->max_concurrent_downloads;
+            return TRUE;
+        }
+        case TMM_GETLIMITS: {
+            TintaLimits *limits = (TintaLimits *)lparam;
+            if (!limits || limits->cb_size < sizeof(*limits)) return FALSE;
+            *limits = control->limits;
+            return TRUE;
+        }
+        case TMM_SETBUILTINTHEME:
+            if ((int)wparam == TINTA_THEME_SYSTEM) {
+                control->use_system_theme = true;
+                return control_refresh_system_theme(control);
+            }
+            control->use_system_theme = false;
+            return control_apply_theme(control, (int)wparam);
+        case TMM_SETCUSTOMTHEME:
+            return control_set_custom_theme(control, (const TintaThemeSpec *)lparam);
+        case TMM_SETZOOM: {
+            float zoom;
+            if (!lparam) return FALSE;
+            zoom = *(const float *)lparam;
+            view->zoom = clamp_float(zoom, 0.5f, 3.0f);
+            if (!tinta_app_update_formats(view)) return FALSE;
+            view->layout_dirty = true;
+            InvalidateRect(view->hwnd, NULL, FALSE);
+            notify_code(control, TMN_ZOOMCHANGED);
+            return TRUE;
+        }
+        case TMM_GETZOOM:
+            if (!lparam) return FALSE;
+            *(float *)lparam = view->zoom;
+            return TRUE;
+        case TMM_SETSCROLLPOS: {
+            const TintaScrollPosition *position = (const TintaScrollPosition *)lparam;
+            if (!position || position->cb_size < sizeof(*position)) return FALSE;
+            view->scroll_x = fmaxf(0, position->x);
+            view->scroll_y = fmaxf(0, position->y);
+            InvalidateRect(view->hwnd, NULL, FALSE);
+            notify_code(control, TMN_SCROLLCHANGED);
+            return TRUE;
+        }
+        case TMM_GETSCROLLPOS: {
+            TintaScrollPosition *position = (TintaScrollPosition *)lparam;
+            if (!position || position->cb_size < sizeof(*position)) return FALSE;
+            position->x = view->scroll_x;
+            position->y = view->scroll_y;
+            return TRUE;
+        }
+        case TMM_GETCONTENTSIZE: {
+            TintaContentSize *size = (TintaContentSize *)lparam;
+            if (!size || size->cb_size < sizeof(*size)) return FALSE;
+            size->width = view->content_width;
+            size->height = view->content_height;
+            return TRUE;
+        }
+        case TMM_FIND:
+            return control_find(control, (const TintaFindRequest *)lparam);
+        case TMM_FINDNEXT: control_find_step(control, 1); return TRUE;
+        case TMM_FINDPREVIOUS: control_find_step(control, -1); return TRUE;
+        case TMM_CLEARFIND: control_clear_find(control); return TRUE;
+        case TMM_GETFINDSTATE: {
+            TintaFindState *state = (TintaFindState *)lparam;
+            if (!state || state->cb_size < sizeof(*state)) return FALSE;
+            state->match_count = view->viewer_search_matches.len;
+            state->current_index = view->viewer_search_index >= 0 ?
+                (size_t)view->viewer_search_index : SIZE_MAX;
+            return TRUE;
+        }
+        case TMM_GETHEADINGCOUNT:
+            if ((view->layout_dirty || !view->layout_complete) &&
+                !tinta_layout_document(view)) return 0;
+            return (LRESULT)view->headings.len;
+        case TMM_GETHEADING: {
+            TintaHeadingInfo *info = (TintaHeadingInfo *)lparam;
+            TintaHeading *heading;
+            if (!info || info->cb_size < sizeof(*info) ||
+                info->index >= view->headings.len) return FALSE;
+            heading = TINTA_VEC_PTR(TintaHeading, view->headings, info->index);
+            info->level = heading->level;
+            return copy_heading_string(info->text, info->text_capacity,
+                                       heading->text) &&
+                   copy_heading_string(info->anchor, info->anchor_capacity,
+                                       heading->slug);
+        }
+        case TMM_SCROLLTOHEADING: {
+            size_t index = (size_t)wparam;
+            if (index >= view->headings.len) return FALSE;
+            view->scroll_y = fmaxf(0,
+                TINTA_VEC_AT(TintaHeading, view->headings, index).y -
+                20.0f * view->dpi_scale);
+            InvalidateRect(view->hwnd, NULL, FALSE);
+            notify_code(control, TMN_SCROLLCHANGED);
+            return TRUE;
+        }
+        case TMM_SELECTALL:
+            view->selection_anchor = 0;
+            view->selection_focus = view->doc_text.len;
+            InvalidateRect(view->hwnd, NULL, FALSE);
+            notify_code(control, TMN_SELECTIONCHANGED);
+            tinta_uia_raise_selection_changed(view);
+            return TRUE;
+        case TMM_CLEARSELECTION:
+            view->selection_anchor = view->selection_focus = 0;
+            InvalidateRect(view->hwnd, NULL, FALSE);
+            notify_code(control, TMN_SELECTIONCHANGED);
+            tinta_uia_raise_selection_changed(view);
+            return TRUE;
+        case TMM_GETSELECTION: {
+            TintaSelection *selection = (TintaSelection *)lparam;
+            if (!selection || selection->cb_size < sizeof(*selection)) return FALSE;
+            selection->start = min(view->selection_anchor, view->selection_focus);
+            selection->end = max(view->selection_anchor, view->selection_focus);
+            return TRUE;
+        }
+        case TMM_REFRESHAPPEARANCE:
+            return control_refresh_system_theme(control);
+    }
+    return 0;
+}
+
+static bool control_initialize_state(TintaControl *control, HWND hwnd) {
+    TintaSettings settings;
+    RECT client;
+    memset(&settings, 0, sizeof(settings));
+    settings.width = 1;
+    settings.height = 1;
+    settings.theme_index = system_uses_dark_mode() ?
+        TINTA_THEME_MIDNIGHT : TINTA_THEME_PAPER;
+    settings.zoom = 1.0f;
+    if (!tinta_app_init(&control->view, g_module, &settings)) return false;
+    control->view.hwnd = hwnd;
+    GetClientRect(hwnd, &client);
+    control->view.width = client.right - client.left;
+    control->view.height = client.bottom - client.top;
+    control->view.dpi_scale = GetDpiForWindow(hwnd) / 96.0f;
+    control->options.cb_size = sizeof(control->options);
+    control->options.flags = default_option_flags();
+    control->limits = default_limits();
+    control->view.max_ast_nodes = control->limits.max_ast_nodes;
+    control->view.max_image_pixels = control->limits.max_image_pixels;
+    control->view.max_image_resources = control->limits.max_image_resources;
+    control->view.max_concurrent_downloads =
+        control->limits.max_concurrent_downloads;
+    control->view.resolve_image = control_resolve_image;
+    control->view.invoke_link = control_invoke_link;
+    control->view.resource_context = control;
+    control->use_system_theme = true;
+    control->redraw_enabled = true;
+    tinta_str16_init(&control->base_uri);
+    return tinta_app_update_formats(&control->view);
+}
+
+static void control_destroy_state(TintaControl *control) {
+    if (!control) return;
+    tinta_str16_destroy(&control->base_uri);
+    tinta_app_destroy(&control->view);
+}
+
+static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
+                                           WPARAM wparam, LPARAM lparam) {
+    TintaControl *control = control_from_window(hwnd);
+    if (message >= TMM_FIRST && message <= TMM_REFRESHAPPEARANCE && control)
+        return control_custom_message(control, message, wparam, lparam);
+    switch (message) {
+        case WM_NCCREATE: {
+            TintaControl *created = (TintaControl *)calloc(1, sizeof(*created));
+            if (!created) return FALSE;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)created);
+            if (!control_initialize_state(created, hwnd)) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                control_destroy_state(created);
+                free(created);
+                return FALSE;
+            }
+            InterlockedIncrement(&g_live_controls);
+            return TRUE;
+        }
+        case WM_CREATE: {
+            CREATESTRUCTW *create = (CREATESTRUCTW *)lparam;
+            if (control && create->lpszName && create->lpszName[0])
+                control_set_text(control, create->lpszName);
+            return 0;
+        }
+        case WM_SETTEXT:
+            return control && control_set_text(control, (const wchar_t *)lparam);
+        case WM_GETTEXT:
+            return control ? (LRESULT)min((size_t)wparam - ((size_t)wparam ? 1 : 0),
+                control_get_text(control, (wchar_t *)lparam, (size_t)wparam)) : 0;
+        case WM_GETTEXTLENGTH:
+            return control ? (LRESULT)control_get_text(control, NULL, 0) : 0;
+        case WM_SIZE:
+            if (control) {
+                control->view.width = LOWORD(lparam);
+                control->view.height = HIWORD(lparam);
+                tinta_app_create_device(&control->view);
+                control->view.layout_dirty = true;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_DPICHANGED:
+        case WM_DPICHANGED_AFTERPARENT:
+            if (control) {
+                control->view.dpi_scale = GetDpiForWindow(hwnd) / 96.0f;
+                tinta_app_update_formats(&control->view);
+                tinta_app_discard_device(&control->view);
+                control->view.layout_dirty = true;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_THEMECHANGED:
+        case WM_SETTINGCHANGE:
+            if (control) control_refresh_system_theme(control);
+            break;
+        case WM_PAINT: {
+            PAINTSTRUCT paint;
+            BeginPaint(hwnd, &paint);
+            if (control && control->redraw_enabled) {
+                tinta_render(&control->view);
+                if (control->view.layout_complete && !control->ready_notified) {
+                    control->ready_notified = true;
+                    notify_code(control, TMN_DOCUMENTREADY);
+                    tinta_uia_raise_text_changed(&control->view);
+                }
+            }
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_SETREDRAW:
+            if (control) control->redraw_enabled = wparam != 0;
+            return 0;
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS;
+        case WM_GETOBJECT:
+            return control ? tinta_uia_get_object(&control->view, wparam, lparam) : 0;
+        case WM_MOUSEWHEEL:
+            if (control) {
+                int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+                if (control_pressed() &&
+                    (control->options.flags & TINTA_OPTION_MOUSE_ZOOM)) {
+                    control->view.zoom = clamp_float(control->view.zoom +
+                        (delta > 0 ? 0.1f : -0.1f), 0.5f, 3.0f);
+                    if (tinta_app_update_formats(&control->view)) {
+                        control->view.layout_dirty = true;
+                        InvalidateRect(hwnd, NULL, FALSE);
+                        notify_code(control, TMN_ZOOMCHANGED);
+                    }
+                } else {
+                    tinta_scroll(&control->view, -delta / 3.0f);
+                    notify_code(control, TMN_SCROLLCHANGED);
+                }
+            }
+            return 0;
+        case WM_MOUSEHWHEEL:
+            if (control) {
+                control->view.scroll_x = fmaxf(0, control->view.scroll_x +
+                    GET_WHEEL_DELTA_WPARAM(wparam) / 3.0f);
+                InvalidateRect(hwnd, NULL, FALSE);
+                notify_code(control, TMN_SCROLLCHANGED);
+            }
+            return 0;
+        case WM_LBUTTONDOWN:
+            if (control) {
+                int x = GET_X_LPARAM(lparam);
+                int y = GET_Y_LPARAM(lparam);
+                control->view.mouse_x = x;
+                control->view.mouse_y = y;
+                SetFocus(hwnd);
+                if (tinta_scrollbar_begin_drag(&control->view, x, y)) {
+                    SetCapture(hwnd);
+                } else if ((control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) &&
+                           tinta_copy_code_at(&control->view, x, y)) {
+                    KillTimer(hwnd, TINTA_TIMER_NOTIFICATION);
+                    control->view.notice_kind = TINTA_NOTICE_NONE;
+                    notify_code(control, TMN_COPYCOMPLETED);
+                } else if (control->options.flags & TINTA_OPTION_SELECTION) {
+                    const char *url = NULL;
+                    tinta_hit_test(&control->view, (float)x, (float)y,
+                                   &control->view.selection_anchor, &url);
+                    control->view.selection_focus = control->view.selection_anchor;
+                    control->view.selecting = true;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            if (control) {
+                int x = GET_X_LPARAM(lparam);
+                int y = GET_Y_LPARAM(lparam);
+                control->view.mouse_x = x;
+                control->view.mouse_y = y;
+                if (!control->view.tracking_mouse) {
+                    TRACKMOUSEEVENT tracking = {
+                        sizeof(tracking), TME_LEAVE, hwnd, 0
+                    };
+                    TrackMouseEvent(&tracking);
+                    control->view.tracking_mouse = true;
+                }
+                if (tinta_scrollbar_drag(&control->view, x, y)) {
+                    notify_code(control, TMN_SCROLLCHANGED);
+                } else if (control->view.selecting) {
+                    tinta_hit_test(&control->view, (float)x, (float)y,
+                                   &control->view.selection_focus, NULL);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                } else {
+                    const char *url = NULL;
+                    bool text = tinta_text_at(&control->view, (float)x, (float)y,
+                                              &url);
+                    tinta_scrollbar_update_hover(&control->view, x, y);
+                    control->view.hovered_code_block =
+                        tinta_code_block_at(&control->view, x, y);
+                    SetCursor(LoadCursorW(NULL, url && url[0] ? IDC_HAND :
+                        text ? IDC_IBEAM : IDC_ARROW));
+                }
+            }
+            return 0;
+        case WM_LBUTTONDBLCLK:
+            if (control && (control->options.flags & TINTA_OPTION_SELECTION)) {
+                size_t position = 0;
+                size_t start;
+                size_t end;
+                int character_class = 0;
+                tinta_hit_test(&control->view, (float)GET_X_LPARAM(lparam),
+                    (float)GET_Y_LPARAM(lparam), &position, NULL);
+                start = end = position;
+                if (position < control->view.doc_text.len)
+                    character_class = selection_character_class(
+                        control->view.doc_text.data[position]);
+                if (!character_class && position &&
+                    selection_character_class(
+                        control->view.doc_text.data[position - 1])) {
+                    start = position - 1;
+                    character_class = selection_character_class(
+                        control->view.doc_text.data[start]);
+                }
+                while (start && selection_character_class(
+                        control->view.doc_text.data[start - 1]) == character_class)
+                    start--;
+                while (end < control->view.doc_text.len &&
+                       selection_character_class(
+                        control->view.doc_text.data[end]) == character_class)
+                    end++;
+                control->view.selection_anchor = start;
+                control->view.selection_focus = end;
+                control->view.selecting = false;
+                InvalidateRect(hwnd, NULL, FALSE);
+                notify_code(control, TMN_SELECTIONCHANGED);
+                tinta_uia_raise_selection_changed(&control->view);
+            }
+            return 0;
+        case WM_MOUSELEAVE:
+            if (control) {
+                control->view.tracking_mouse = false;
+                control->view.hovered_code_block = -1;
+                tinta_scrollbar_update_hover(&control->view, -1, -1);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (control && tinta_scrollbar_end_drag(&control->view,
+                    GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam))) {
+                ReleaseCapture();
+                notify_code(control, TMN_SCROLLCHANGED);
+                return 0;
+            }
+            if (control && control->view.selecting) {
+                const char *url = NULL;
+                size_t position;
+                tinta_hit_test(&control->view, (float)GET_X_LPARAM(lparam),
+                    (float)GET_Y_LPARAM(lparam), &position, &url);
+                control->view.selection_focus = position;
+                control->view.selecting = false;
+                ReleaseCapture();
+                if (url && control->view.selection_anchor == position)
+                    control_activate_link(control, url);
+                notify_code(control, TMN_SELECTIONCHANGED);
+                tinta_uia_raise_selection_changed(&control->view);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_KEYDOWN:
+            if (control) control_handle_key(control, wparam);
+            return 0;
+        case WM_COPY:
+            if (control) control_copy_selection(control);
+            return 0;
+        case WM_CONTEXTMENU:
+            if (control) {
+                TintaContextMenuNotify notice;
+                memset(&notice, 0, sizeof(notice));
+                notice.hdr.code = TMN_CONTEXTMENU;
+                notice.screen.x = GET_X_LPARAM(lparam);
+                notice.screen.y = GET_Y_LPARAM(lparam);
+                notice.has_selection = control->view.selection_anchor !=
+                                       control->view.selection_focus;
+                notice.over_code_block = tinta_code_block_at(&control->view,
+                    control->view.mouse_x, control->view.mouse_y) >= 0;
+                notify_parent(control, &notice.hdr);
+            }
+            return 0;
+        case TINTA_WM_LAYOUT_CHUNK:
+            if (control) {
+                control->view.layout_chunk_posted = false;
+                if (tinta_layout_continue(&control->view)) {
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    if (!control->view.layout_complete &&
+                        !control->view.layout_dirty) {
+                        control->view.layout_chunk_posted =
+                            PostMessageW(hwnd, TINTA_WM_LAYOUT_CHUNK, 0, 0) != FALSE;
+                    } else if (control->view.layout_complete &&
+                               !control->ready_notified) {
+                        control->ready_notified = true;
+                        notify_code(control, TMN_DOCUMENTREADY);
+                        tinta_uia_raise_text_changed(&control->view);
+                    }
+                }
+            }
+            return 0;
+        case TINTA_WM_IMAGE_READY:
+            if (control) tinta_remote_image_complete(&control->view, (void *)lparam);
+            return 0;
+        case TINTA_WM_UIA_INVOKE:
+            if (control && lparam) control_activate_link(control, (const char *)lparam);
+            free((void *)lparam);
+            return 0;
+        case WM_TIMER:
+            if (control && wparam == TINTA_TIMER_NOTIFICATION) {
+                KillTimer(hwnd, TINTA_TIMER_NOTIFICATION);
+                control->view.notice_kind = TINTA_NOTICE_NONE;
+                return 0;
+            }
+            break;
+        case WM_NCDESTROY:
+            if (control) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                tinta_uia_disconnect(&control->view);
+                control_destroy_state(control);
+                free(control);
+                if (!InterlockedDecrement(&g_live_controls)) {
+                    AcquireSRWLockExclusive(&g_class_lock);
+                    if (!g_initialize_count && g_module) {
+                        UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
+                        g_module = NULL;
+                    }
+                    ReleaseSRWLockExclusive(&g_class_lock);
+                }
+            }
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+HRESULT TintaCoreInitialize(void) {
+    WNDCLASSEXW window_class;
+    HRESULT result = S_OK;
+    AcquireSRWLockExclusive(&g_class_lock);
+    if (g_initialize_count > 0) {
+        g_initialize_count++;
+        ReleaseSRWLockExclusive(&g_class_lock);
+        return S_FALSE;
+    }
+    g_module = (HINSTANCE)&__ImageBase;
+    memset(&window_class, 0, sizeof(window_class));
+    window_class.cbSize = sizeof(window_class);
+    window_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS | CS_GLOBALCLASS;
+    window_class.lpfnWndProc = tinta_control_proc;
+    window_class.hInstance = g_module;
+    window_class.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    window_class.lpszClassName = TINTA_MARKDOWN_VIEW_CLASSW;
+    if (!RegisterClassExW(&window_class)) {
+        DWORD error = GetLastError();
+        result = error == ERROR_CLASS_ALREADY_EXISTS ? S_FALSE :
+                 HRESULT_FROM_WIN32(error);
+    }
+    if (SUCCEEDED(result)) g_initialize_count = 1;
+    ReleaseSRWLockExclusive(&g_class_lock);
+    return result;
+}
+
+void TintaCoreUninitialize(void) {
+    AcquireSRWLockExclusive(&g_class_lock);
+    if (g_initialize_count > 0) g_initialize_count--;
+    if (!g_initialize_count && !g_live_controls && g_module) {
+        UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
+        g_module = NULL;
+    }
+    ReleaseSRWLockExclusive(&g_class_lock);
+}

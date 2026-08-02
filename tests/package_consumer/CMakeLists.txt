@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(TintaCorePackageConsumer LANGUAGES C)
+find_package(TintaCore CONFIG REQUIRED)
+add_executable(package_consumer WIN32 main.c)
+target_link_libraries(package_consumer PRIVATE Tinta::Core)
+target_compile_definitions(package_consumer PRIVATE UNICODE _UNICODE)

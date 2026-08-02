@@ -1,0 +1,7 @@
+flowchart LR
+classDef start fill:#fff7ed,stroke:#f97316,color:#7c2d12,stroke-width:2px;
+Start(["Begin"]):::start -->|Validate| Choice{"Ready?"}
+Choice -->|Yes| Done(("Complete"))
+Choice -->|No| Retry{{"Retry"}}
+Retry --> Start
+
