@@ -27,6 +27,61 @@ typedef struct RemoteResult {
     bool success;
 } RemoteResult;
 
+static void remote_result_destroy(RemoteResult *result) {
+    if (!result) return;
+    free(result->pixels);
+    free(result);
+}
+
+static bool remote_result_enqueue(TintaApp *app, RemoteResult *result) {
+    bool queued = false;
+    AcquireSRWLockExclusive(&app->remote_results_lock);
+    if (!InterlockedCompareExchange(&app->closing, 0, 0))
+        queued = tinta_vec_push(&app->remote_results, &result) != NULL;
+    ReleaseSRWLockExclusive(&app->remote_results_lock);
+    return queued;
+}
+
+static RemoteResult *remote_result_dequeue(TintaApp *app) {
+    RemoteResult *result = NULL;
+    AcquireSRWLockExclusive(&app->remote_results_lock);
+    if (app->remote_results.len) {
+        result = TINTA_VEC_AT(RemoteResult *, app->remote_results, 0);
+        app->remote_results.len--;
+        if (app->remote_results.len)
+            TINTA_VEC_AT(RemoteResult *, app->remote_results, 0) =
+                TINTA_VEC_AT(RemoteResult *, app->remote_results,
+                             app->remote_results.len);
+    }
+    ReleaseSRWLockExclusive(&app->remote_results_lock);
+    return result;
+}
+
+static bool remote_result_remove(TintaApp *app, RemoteResult *result) {
+    size_t index;
+    bool removed = false;
+    AcquireSRWLockExclusive(&app->remote_results_lock);
+    for (index = 0; index < app->remote_results.len; index++) {
+        if (TINTA_VEC_AT(RemoteResult *, app->remote_results, index) == result) {
+            app->remote_results.len--;
+            if (index < app->remote_results.len)
+                TINTA_VEC_AT(RemoteResult *, app->remote_results, index) =
+                    TINTA_VEC_AT(RemoteResult *, app->remote_results,
+                                 app->remote_results.len);
+            removed = true;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&app->remote_results_lock);
+    return removed;
+}
+
+static void remote_results_clear(TintaApp *app) {
+    RemoteResult *result;
+    while ((result = remote_result_dequeue(app)) != NULL)
+        remote_result_destroy(result);
+}
+
 typedef struct TintaBindStatusCallback {
     IBindStatusCallback iface;
     LONG references;
@@ -374,6 +429,8 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     app->hit_index_dirty = true;
     tinta_vec_init(&app->remote_images, sizeof(TintaRemoteImage));
     tinta_vec_init(&app->worker_handles, sizeof(HANDLE));
+    InitializeSRWLock(&app->remote_results_lock);
+    tinta_vec_init(&app->remote_results, sizeof(RemoteResult *));
     tinta_vec_init(&app->viewer_search_matches, sizeof(TintaSearchMatch));
     app->viewer_search_index = -1;
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -410,16 +467,13 @@ void tinta_app_destroy(TintaApp *app) {
         HANDLE handle=TINTA_VEC_AT(HANDLE,app->worker_handles,i);
         WaitForSingleObject(handle,INFINITE); CloseHandle(handle);
     }
-    {
-        MSG message;
-        while(PeekMessageW(&message,app->hwnd,TINTA_WM_IMAGE_READY,TINTA_WM_IMAGE_READY,PM_REMOVE))
-            tinta_remote_image_complete(app,(void *)message.lParam);
-    }
+    remote_results_clear(app);
     remote_images_clear(app);
     tinta_layout_clear(app);
     tinta_parse_result_destroy(&app->document);
     tinta_vec_destroy(&app->remote_images);
     tinta_vec_destroy(&app->worker_handles);
+    tinta_vec_destroy(&app->remote_results);
     tinta_vec_destroy(&app->viewer_search_matches);
     tinta_str8_destroy(&app->source);
     tinta_str16_destroy(&app->current_file);
@@ -506,9 +560,12 @@ static unsigned __stdcall remote_worker(void *parameter) {
         if (decoder) IWICBitmapDecoder_Release(decoder);
         if (wic) IWICImagingFactory_Release(wic);
     }
-    if(!result || InterlockedCompareExchange(&work->app->closing,0,0) ||
-       !PostMessageW(work->app->hwnd,TINTA_WM_IMAGE_READY,0,(LPARAM)result)) {
-        if(result){free(result->pixels);free(result);}
+    /* The message is only a wake-up; the app-owned queue holds the result. */
+    if (!result || !remote_result_enqueue(work->app, result)) {
+        remote_result_destroy(result);
+    } else if (!PostMessageW(work->app->hwnd,TINTA_WM_IMAGE_READY,0,0) &&
+               remote_result_remove(work->app, result)) {
+        remote_result_destroy(result);
     }
     free(work->url); free(work);
     if (SUCCEEDED(com_result)) CoUninitialize();
@@ -603,31 +660,31 @@ IWICBitmapSource *tinta_remote_image_request(TintaApp *app, const char *url,
     return NULL;
 }
 
-void tinta_remote_image_complete(TintaApp *app, void *opaque) {
-    RemoteResult *result = (RemoteResult *)opaque;
-    if (!result) return;
-    if (result->generation == InterlockedCompareExchange(
-            &app->document_generation, 0, 0) &&
-        result->index < app->remote_images.len) {
-        TintaRemoteImage *image = TINTA_VEC_PTR(
-            TintaRemoteImage, app->remote_images, result->index);
-        IWICBitmap *bitmap = NULL;
-        if (result->success && result->pixels &&
-            SUCCEEDED(IWICImagingFactory_CreateBitmapFromMemory(
-                app->wic_factory, result->width, result->height,
-                &GUID_WICPixelFormat32bppPBGRA, result->stride,
-                result->buffer_size, result->pixels, &bitmap))) {
-            if (image->source) IWICBitmapSource_Release(image->source);
-            image->source = (IWICBitmapSource *)bitmap;
-            image->state = 1;
-        } else {
-            image->state = -1;
+void tinta_remote_image_complete(TintaApp *app) {
+    RemoteResult *result;
+    while ((result = remote_result_dequeue(app)) != NULL) {
+        if (result->generation == InterlockedCompareExchange(
+                &app->document_generation, 0, 0) &&
+            result->index < app->remote_images.len) {
+            TintaRemoteImage *image = TINTA_VEC_PTR(
+                TintaRemoteImage, app->remote_images, result->index);
+            IWICBitmap *bitmap = NULL;
+            if (result->success && result->pixels &&
+                SUCCEEDED(IWICImagingFactory_CreateBitmapFromMemory(
+                    app->wic_factory, result->width, result->height,
+                    &GUID_WICPixelFormat32bppPBGRA, result->stride,
+                    result->buffer_size, result->pixels, &bitmap))) {
+                if (image->source) IWICBitmapSource_Release(image->source);
+                image->source = (IWICBitmapSource *)bitmap;
+                image->state = 1;
+            } else {
+                image->state = -1;
+            }
+            app->layout_dirty = true;
+            InvalidateRect(app->hwnd, NULL, FALSE);
         }
-        app->layout_dirty = true;
-        InvalidateRect(app->hwnd, NULL, FALSE);
+        remote_result_destroy(result);
     }
-    free(result->pixels);
-    free(result);
     reap_worker_handles(app);
 }
 

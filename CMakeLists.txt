@@ -57,6 +57,13 @@ if(TINTA_BUILD_EXAMPLES)
     add_executable(tinta_demo WIN32 examples/demo.c)
     target_link_libraries(tinta_demo PRIVATE Tinta::Core comdlg32)
     target_compile_definitions(tinta_demo PRIVATE UNICODE _UNICODE)
+
+    add_executable(tinta_chat_demo WIN32 examples/chat_demo.c)
+    target_link_libraries(tinta_chat_demo PRIVATE Tinta::Core comctl32)
+    target_compile_definitions(tinta_chat_demo PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+        target_compile_options(tinta_chat_demo PRIVATE /utf-8 /W4 /WX)
+    endif()
 endif()
 
 if(BUILD_TESTING)

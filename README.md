@@ -22,6 +22,11 @@ ctest --test-dir build --output-on-failure
 Set `BUILD_SHARED_LIBS=ON` to build `tinta_core.dll`; the default is a static
 library. md4c is vendored, so configuring the project requires no downloads.
 
+The examples include `tinta_minimal`, the feature-oriented `tinta_demo`, and
+`tinta_chat_demo`. The chat demo hosts one Markdown control per message,
+provides a scrolling left/right conversation layout, and simulates a streaming
+assistant response without network access.
+
 ## Minimal use
 
 ```c

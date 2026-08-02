@@ -998,7 +998,7 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
             }
             return 0;
         case TINTA_WM_IMAGE_READY:
-            if (control) tinta_remote_image_complete(&control->view, (void *)lparam);
+            if (control) tinta_remote_image_complete(&control->view);
             return 0;
         case TINTA_WM_UIA_INVOKE:
             if (control && lparam) control_activate_link(control, (const char *)lparam);

@@ -8,6 +8,8 @@
 static int notifications;
 static int resource_notifications;
 static int link_notifications;
+static bool post_quit_on_destroy;
+static int destroy_quit_code;
 
 static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
                                     WPARAM wparam, LPARAM lparam) {
@@ -24,6 +26,11 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
             resource_notifications++;
             return TINTA_RESOURCE_BLOCK;
         }
+    }
+    if (message == WM_DESTROY && post_quit_on_destroy) {
+        PostQuitMessage(destroy_quit_code);
+        post_quit_on_destroy = false;
+        return 0;
     }
     return DefWindowProcW(hwnd, message, wparam, lparam);
 }
@@ -190,7 +197,34 @@ int main() {
         return 1;
     }
     DestroyWindow(second_probe);
-    DestroyWindow(parent);
+    post_quit_on_destroy = true;
+    destroy_quit_code = 37;
+    UINT_PTR shutdown_timer = SetTimer(nullptr, 0, 2000, nullptr);
+    bool received_quit = false;
+    if (!shutdown_timer || !PostMessageW(parent, WM_CLOSE, 0, 0)) {
+        std::cerr << "failed to start control shutdown test\n";
+        return 1;
+    }
+    for (;;) {
+        MSG shutdown_message{};
+        BOOL result = GetMessageW(&shutdown_message, nullptr, 0, 0);
+        if (result == 0) {
+            received_quit = shutdown_message.wParam == 37;
+            break;
+        }
+        if (result < 0 ||
+            (shutdown_message.message == WM_TIMER &&
+             shutdown_message.hwnd == nullptr &&
+             shutdown_message.wParam == shutdown_timer))
+            break;
+        TranslateMessage(&shutdown_message);
+        DispatchMessageW(&shutdown_message);
+    }
+    KillTimer(nullptr, shutdown_timer);
+    if (!received_quit) {
+        std::cerr << "destroying a control consumed the host's quit message\n";
+        return 1;
+    }
     TintaCoreUninitialize();
     std::cout << "Control tests passed\n";
     return 0;

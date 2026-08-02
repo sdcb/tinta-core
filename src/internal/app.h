@@ -218,6 +218,8 @@ struct TintaApp {
     TintaStr16 search_query;
     TintaVec remote_images;
     TintaVec worker_handles;
+    SRWLOCK remote_results_lock;
+    TintaVec remote_results;
     volatile LONG closing;
     volatile LONG document_generation;
     TintaResolveImageFn resolve_image;
@@ -297,7 +299,7 @@ bool tinta_jump_to_internal_link(TintaApp *app, const char *url);
 
 IWICBitmapSource *tinta_remote_image_request(TintaApp *app, const char *url,
                                              bool *failed);
-void tinta_remote_image_complete(TintaApp *app, void *result);
+void tinta_remote_image_complete(TintaApp *app);
 
 #ifdef __cplusplus
 }
