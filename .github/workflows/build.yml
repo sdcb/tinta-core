@@ -11,6 +11,16 @@ jobs:
       matrix:
         configuration: [full, trimmed]
         shared: [OFF, ON]
+        architecture:
+          - name: x64
+            platform: x64
+            run_tests: true
+          - name: x86
+            platform: Win32
+            run_tests: true
+          - name: arm64
+            platform: ARM64
+            run_tests: false
     steps:
       - uses: actions/checkout@v7
       - name: Configure
@@ -24,13 +34,22 @@ jobs:
             $flags += '-DTINTA_ENABLE_REMOTE_IMAGES=OFF'
             $flags += '-DTINTA_ENABLE_LOCAL_IMAGES=OFF'
           }
-          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
+          cmake -S . -B build -G "Visual Studio 18 2026" -A ${{ matrix.architecture.platform }} `
             -DBUILD_SHARED_LIBS=${{ matrix.shared }} `
             -DBUILD_TESTING=ON -DTINTA_BUILD_EXAMPLES=ON @flags
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Test
+        if: matrix.architecture.run_tests
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        run: cmake --install build --config Release --prefix package
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: tinta-core-${{ matrix.configuration }}-${{ matrix.shared == 'ON' && 'shared' || 'static' }}-windows-${{ matrix.architecture.name }}
+          path: package
+          if-no-files-found: error
 
   parser-tools:
     runs-on: windows-latest
