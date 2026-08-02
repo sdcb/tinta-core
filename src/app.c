@@ -412,7 +412,7 @@ void tinta_app_destroy(TintaApp *app) {
     }
     {
         MSG message;
-        while(PeekMessageW(&message,NULL,TINTA_WM_IMAGE_READY,TINTA_WM_IMAGE_READY,PM_REMOVE))
+        while(PeekMessageW(&message,app->hwnd,TINTA_WM_IMAGE_READY,TINTA_WM_IMAGE_READY,PM_REMOVE))
             tinta_remote_image_complete(app,(void *)message.lParam);
     }
     remote_images_clear(app);

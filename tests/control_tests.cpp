@@ -170,6 +170,26 @@ int main() {
         std::cerr << "UI Automation text provider failed\n";
         return 1;
     }
+    constexpr UINT image_ready_message = WM_APP + 2;
+    HWND first_probe = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW, L"first",
+        WS_CHILD, 0, 0, 1, 1, parent, reinterpret_cast<HMENU>(101),
+        instance, nullptr);
+    HWND second_probe = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW, L"second",
+        WS_CHILD, 0, 0, 1, 1, parent, reinterpret_cast<HMENU>(102),
+        instance, nullptr);
+    if (!first_probe || !second_probe ||
+        !PostMessageW(second_probe, image_ready_message, 0, 0)) {
+        std::cerr << "multi-control setup failed\n";
+        return 1;
+    }
+    DestroyWindow(first_probe);
+    MSG image_message{};
+    if (!PeekMessageW(&image_message, second_probe, image_ready_message,
+                      image_ready_message, PM_REMOVE)) {
+        std::cerr << "destroying one control consumed another control's image message\n";
+        return 1;
+    }
+    DestroyWindow(second_probe);
     DestroyWindow(parent);
     TintaCoreUninitialize();
     std::cout << "Control tests passed\n";
