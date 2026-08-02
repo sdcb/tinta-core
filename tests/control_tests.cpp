@@ -274,16 +274,25 @@ int main() {
         std::cerr << "resource notification failed\n";
         return 1;
     }
+    std::wstring accessible_document =
+        L"# Accessible heading\n\n[Accessible link](https://example.com)\n\n";
+    for (int index = 0; index < 80; index++)
+        accessible_document += L"Accessible scrolling content.\n\n";
     SendMessageW(view, WM_SETTEXT, 0,
-        reinterpret_cast<LPARAM>(L"# Accessible heading\n\n[Accessible link](https://example.com)"));
+        reinterpret_cast<LPARAM>(accessible_document.c_str()));
     SendMessageW(view, TMM_GETHEADINGCOUNT, 0, 0);
+    SendMessageW(view, TMM_SELECTALL, 0, 0);
     HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     IUIAutomation *automation = nullptr;
     IUIAutomationElement *element = nullptr;
     IUIAutomationTextPattern *text_pattern = nullptr;
     IUIAutomationTextRange *range = nullptr;
+    IUIAutomationTextRangeArray *selection_ranges = nullptr;
+    IUIAutomationScrollPattern *scroll_pattern = nullptr;
     IUIAutomationCondition *link_condition = nullptr;
+    IUIAutomationCondition *header_condition = nullptr;
     IUIAutomationElement *link_element = nullptr;
+    IUIAutomationElement *header_element = nullptr;
     IUIAutomationInvokePattern *invoke = nullptr;
     BSTR text = nullptr;
     CONTROLTYPEID type = 0;
@@ -297,6 +306,26 @@ int main() {
     if (SUCCEEDED(uia)) uia = range->GetText(-1, &text);
     bool uia_ok = SUCCEEDED(uia) && type == UIA_DocumentControlTypeId &&
                   text && std::wcsstr(text, L"Accessible heading");
+    int selection_length = 0;
+    if (uia_ok) uia = text_pattern->GetSelection(&selection_ranges);
+    if (SUCCEEDED(uia) && selection_ranges)
+        uia = selection_ranges->get_Length(&selection_length);
+    uia_ok = uia_ok && SUCCEEDED(uia) && selection_length == 1;
+    BOOL vertically_scrollable = FALSE;
+    if (uia_ok) uia = element->GetCurrentPatternAs(
+        UIA_ScrollPatternId, IID_PPV_ARGS(&scroll_pattern));
+    if (SUCCEEDED(uia) && scroll_pattern)
+        uia = scroll_pattern->get_CurrentVerticallyScrollable(
+            &vertically_scrollable);
+    if (SUCCEEDED(uia) && vertically_scrollable)
+        uia = scroll_pattern->Scroll(
+            ScrollAmount_NoAmount, ScrollAmount_SmallIncrement);
+    TintaScrollPosition uia_scroll{};
+    uia_scroll.cb_size = sizeof(uia_scroll);
+    SendMessageW(view, TMM_GETSCROLLPOS, 0,
+                 reinterpret_cast<LPARAM>(&uia_scroll));
+    uia_ok = uia_ok && SUCCEEDED(uia) && vertically_scrollable &&
+             uia_scroll.y > 0;
     VARIANT link_type;
     VariantInit(&link_type);
     V_VT(&link_type) = VT_I4;
@@ -305,6 +334,14 @@ int main() {
         UIA_ControlTypePropertyId, link_type, &link_condition);
     if (SUCCEEDED(uia)) uia = element->FindFirst(
         TreeScope_Descendants, link_condition, &link_element);
+    VARIANT header_type;
+    VariantInit(&header_type);
+    V_VT(&header_type) = VT_I4;
+    V_I4(&header_type) = UIA_HeaderControlTypeId;
+    if (SUCCEEDED(uia)) uia = automation->CreatePropertyCondition(
+        UIA_ControlTypePropertyId, header_type, &header_condition);
+    if (SUCCEEDED(uia)) uia = element->FindFirst(
+        TreeScope_Descendants, header_condition, &header_element);
     if (SUCCEEDED(uia) && link_element) uia = link_element->GetCurrentPatternAs(
         UIA_InvokePatternId, IID_PPV_ARGS(&invoke));
     if (SUCCEEDED(uia) && invoke) uia = invoke->Invoke();
@@ -313,11 +350,16 @@ int main() {
         TranslateMessage(&pending);
         DispatchMessageW(&pending);
     }
-    uia_ok = uia_ok && SUCCEEDED(uia) && link_element && link_notifications == 1;
+    uia_ok = uia_ok && SUCCEEDED(uia) && link_element && header_element &&
+             link_notifications == 1;
     SysFreeString(text);
     if (invoke) invoke->Release();
+    if (header_element) header_element->Release();
     if (link_element) link_element->Release();
+    if (header_condition) header_condition->Release();
     if (link_condition) link_condition->Release();
+    if (scroll_pattern) scroll_pattern->Release();
+    if (selection_ranges) selection_ranges->Release();
     if (range) range->Release();
     if (text_pattern) text_pattern->Release();
     if (element) element->Release();

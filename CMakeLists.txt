@@ -25,6 +25,8 @@ add_library(tinta_core
     src/syntax.c
     src/themes.c
     src/uia_provider.c
+    src/uia_semantics.c
+    src/uia_text.c
     src/win32_utils.c)
 add_library(Tinta::Core ALIAS tinta_core)
 target_include_directories(tinta_core BEFORE PRIVATE src/internal vendor/md4c/src)
