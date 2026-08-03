@@ -2,7 +2,25 @@ name: build
 
 on:
   push:
+    paths:
+      - .github/workflows/build.yml
+      - CMakeLists.txt
+      - cmake/**
+      - examples/**
+      - include/**
+      - src/**
+      - tests/**
+      - vendor/md4c/src/**
   pull_request:
+    paths:
+      - .github/workflows/build.yml
+      - CMakeLists.txt
+      - cmake/**
+      - examples/**
+      - include/**
+      - src/**
+      - tests/**
+      - vendor/md4c/src/**
 
 jobs:
   windows:
