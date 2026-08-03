@@ -309,20 +309,27 @@ const TintaMermaidParseResult *tinta_app_mermaid_parse(
 }
 #endif
 
-static IDWriteTextFormat *create_format(TintaApp *app, const wchar_t *family,
-                                        float size, TintaDWriteFontWeight weight,
-                                        TintaDWriteFontStyle style) {
+static IDWriteTextFormat *create_scaled_format(
+        TintaApp *app, const wchar_t *family, float size,
+        TintaDWriteFontWeight weight, TintaDWriteFontStyle style,
+        float zoom) {
     IDWriteTextFormat *format = NULL;
     HRESULT hr = app->dwrite_factory->lpVtbl->CreateTextFormat(
         app->dwrite_factory, family, NULL, weight, style,
         TINTA_DWRITE_FONT_STRETCH_NORMAL,
-        size * app->dpi_scale * app->zoom, L"en-us", &format);
+        size * app->dpi_scale * zoom, L"en-us", &format);
     if (SUCCEEDED(hr) && format)
         format->lpVtbl->SetParagraphAlignment(
             format, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
     if (SUCCEEDED(hr) && format)
         format->lpVtbl->SetWordWrapping(format, TINTA_DWRITE_WORD_WRAPPING_NO_WRAP);
     return SUCCEEDED(hr) ? format : NULL;
+}
+
+static IDWriteTextFormat *create_format(TintaApp *app, const wchar_t *family,
+                                        float size, TintaDWriteFontWeight weight,
+                                        TintaDWriteFontStyle style) {
+    return create_scaled_format(app, family, size, weight, style, app->zoom);
 }
 
 static void create_font_fallback(IDWriteFactory *dwrite_factory,
@@ -472,6 +479,7 @@ bool tinta_app_update_formats(TintaApp *app) {
     IDWriteTextFormat *small_text = NULL;
     IDWriteTextFormat *code = NULL;
     IDWriteTextFormat *ui = NULL;
+    IDWriteTextFormat *chrome = NULL;
     IDWriteTextFormat *headings[6] = {0};
     body = create_format(app, app->theme->font_family, 16,
                          TINTA_DWRITE_FONT_WEIGHT_NORMAL,
@@ -491,7 +499,11 @@ bool tinta_app_update_formats(TintaApp *app) {
     ui = create_format(app, app->theme->font_family, 14,
                        TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                        TINTA_DWRITE_FONT_STYLE_NORMAL);
-    if (!body || !bold || !italic || !small_text || !code || !ui) goto failed;
+    chrome = create_scaled_format(app, app->theme->font_family, 12,
+                                  TINTA_DWRITE_FONT_WEIGHT_NORMAL,
+                                  TINTA_DWRITE_FONT_STYLE_NORMAL, 1.0f);
+    if (!body || !bold || !italic || !small_text || !code || !ui || !chrome)
+        goto failed;
     for (i = 0; i < 6; i++)
         if (!(headings[i] = create_format(app, app->theme->font_family,
                                           heading_sizes[i],
@@ -504,6 +516,7 @@ bool tinta_app_update_formats(TintaApp *app) {
     release_text_format(&app->small_format);
     release_text_format(&app->code_format);
     release_text_format(&app->ui_format);
+    release_text_format(&app->chrome_format);
     for (i = 0; i < 6; i++) release_text_format(&app->heading_formats[i]);
     app->body_format = body;
     app->bold_format = bold;
@@ -511,6 +524,7 @@ bool tinta_app_update_formats(TintaApp *app) {
     app->small_format = small_text;
     app->code_format = code;
     app->ui_format = ui;
+    app->chrome_format = chrome;
     for (i = 0; i < 6; i++) app->heading_formats[i] = headings[i];
     app->layout_dirty = true;
     return true;
@@ -521,6 +535,7 @@ failed:
     release_text_format(&small_text);
     release_text_format(&code);
     release_text_format(&ui);
+    release_text_format(&chrome);
     for (i = 0; i < 6; i++) release_text_format(&headings[i]);
     return false;
 }
@@ -609,6 +624,7 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     app->zoom = settings->zoom;
     app->layout_dirty = true;
     app->hovered_code_block = -1;
+    app->notice_code_block = -1;
     tinta_str8_init(&app->source);
     tinta_str16_init(&app->doc_text);
     tinta_str16_init(&app->search_query);
@@ -691,6 +707,7 @@ void tinta_app_destroy(TintaApp *app) {
     release_text_format(&app->small_format);
     release_text_format(&app->code_format);
     release_text_format(&app->ui_format);
+    release_text_format(&app->chrome_format);
     tinta_app_discard_device(app);
 #if TINTA_ENABLE_IMAGES
     release_unknown((IUnknown **)&app->wic_factory);

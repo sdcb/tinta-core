@@ -87,6 +87,9 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - With keyboard navigation enabled, `Ctrl+0` resets zoom to 100% and
   `Ctrl++`/`Ctrl+-` adjust it by 10%. `Ctrl+mouse wheel` uses the same steps
   when mouse zoom is enabled.
+- Code blocks show their Markdown language info verbatim in a non-selectable
+  header. Blocks without a language are labeled `Plain text`; the Copy button
+  shares the header and briefly changes to `Copied` after a successful copy.
 - External links send `TMN_LINKACTIVATE`; returning zero permits the default
   `ShellExecuteW` behavior. Images send `TMN_RESOURCEOPENING`; the host can
   return default, block, or replace the resource URI.

@@ -147,6 +147,12 @@ int main() {
     }
     tinta_parse_result_destroy(&fenced);
 
+    auto raw_language = parse_doc("```cpp\nreturn 0;\n```\n", "notes.md");
+    check(raw_language.success && raw_language.root->child_count == 1 &&
+          std::strcmp(raw_language.root->children[0]->language, "cpp") == 0,
+          "code fence language is preserved without display normalization");
+    tinta_parse_result_destroy(&raw_language);
+
     TintaMarkdownOptions limited = tinta_markdown_default_options();
     limited.max_nodes = 1000;
     limited.max_depth = 3;

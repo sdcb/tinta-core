@@ -13,6 +13,7 @@ static int document_ready_notifications;
 static int stream_update_notifications;
 static int autosize_notifications;
 static int resource_error_notifications;
+static int copy_notifications;
 static bool block_resources = true;
 static bool post_quit_on_destroy;
 static int destroy_quit_code;
@@ -37,6 +38,8 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
             stream_update_notifications++;
         if (header && header->code == TMN_AUTOSIZED)
             autosize_notifications++;
+        if (header && header->code == TMN_COPYCOMPLETED)
+            copy_notifications++;
         if (header && header->code == TMN_LINKACTIVATE) {
             link_notifications++;
             return TRUE;
@@ -86,18 +89,10 @@ static bool send_control_key(HWND view, WPARAM key) {
     return true;
 }
 
-static bool copy_document_text(HWND view, const wchar_t *markdown,
-                               std::wstring *copied) {
+static bool read_clipboard_text(HWND owner, std::wstring *copied) {
     HANDLE data;
     const wchar_t *text;
-    if (!view || !markdown || !copied ||
-        !SendMessageW(view, WM_SETTEXT, 0,
-                      reinterpret_cast<LPARAM>(markdown)))
-        return false;
-    SendMessageW(view, WM_PAINT, 0, 0);
-    SendMessageW(view, TMM_SELECTALL, 0, 0);
-    SendMessageW(view, WM_COPY, 0, 0);
-    if (!OpenClipboard(view)) return false;
+    if (!copied || !OpenClipboard(owner)) return false;
     data = GetClipboardData(CF_UNICODETEXT);
     text = data ? static_cast<const wchar_t *>(GlobalLock(data)) : nullptr;
     if (text) {
@@ -106,6 +101,18 @@ static bool copy_document_text(HWND view, const wchar_t *markdown,
     }
     CloseClipboard();
     return text != nullptr;
+}
+
+static bool copy_document_text(HWND view, const wchar_t *markdown,
+                               std::wstring *copied) {
+    if (!view || !markdown || !copied ||
+        !SendMessageW(view, WM_SETTEXT, 0,
+                      reinterpret_cast<LPARAM>(markdown)))
+        return false;
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, TMM_SELECTALL, 0, 0);
+    SendMessageW(view, WM_COPY, 0, 0);
+    return read_clipboard_text(view, copied);
 }
 
 int main() {
@@ -180,8 +187,52 @@ int main() {
         std::cerr << "list clipboard spacing failed\n";
         return 1;
     }
+    ShowWindow(parent, SW_SHOWNOACTIVATE);
+    UpdateWindow(parent);
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(L"```text\ncopy me\n```"));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, TMM_SELECTALL, 0, 0);
+    SendMessageW(view, WM_COPY, 0, 0);
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != L"copy me\n\n") {
+        std::cerr << "code language header leaked into document text\n";
+        return 1;
+    }
+    SendMessageW(view, TMM_CLEARSELECTION, 0, 0);
+    ValidateRect(view, nullptr);
+    float dpi_scale = GetDpiForWindow(view) / 96.0f;
+    RECT code_client{};
+    GetClientRect(view, &code_client);
+    int copy_x = code_client.right - static_cast<int>(74.0f * dpi_scale);
+    int copy_y = static_cast<int>(41.0f * dpi_scale);
+    int code_hover_x = static_cast<int>(60.0f * dpi_scale);
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(code_hover_x, copy_y));
+    if (!GetUpdateRect(view, nullptr, FALSE)) {
+        std::cerr << "code block hover did not invalidate\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    ValidateRect(view, nullptr);
+    SendMessageW(view, WM_MOUSEMOVE, 0, MAKELPARAM(copy_x, copy_y));
+    if (!GetUpdateRect(view, nullptr, FALSE)) {
+        std::cerr << "code copy button hover transition did not invalidate\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    int copy_target = copy_notifications + 1;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(copy_x, copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != L"copy me\n" ||
+        copy_notifications != copy_target) {
+        std::cerr << "code copy button did not copy on first hover\n";
+        return 1;
+    }
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));
+    ShowWindow(parent, SW_HIDE);
 #if !TINTA_ENABLE_LOCAL_IMAGES
     if (compiled_options.flags & TINTA_OPTION_LOCAL_IMAGES) {
         std::cerr << "disabled local images were reported as supported\n";

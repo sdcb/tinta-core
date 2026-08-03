@@ -43,6 +43,7 @@ static float maxf(float a, float b) { return a > b ? a : b; }
 static float minf(float a, float b) { return a < b ? a : b; }
 static float scale(const TintaApp *app, float value) { return value * app->dpi_scale * app->zoom; }
 static float ui_scale(const TintaApp *app, float value) { return value * app->dpi_scale; }
+static float code_header_height(const TintaApp *app) { return scale(app, 32); }
 static float viewport_x(const TintaApp *app) { (void)app; return 0; }
 static float viewport_width(const TintaApp *app) {
     return (float)app->width;
@@ -222,7 +223,11 @@ void tinta_layout_clear(TintaApp *app) {
         free(heading->text);
         free(heading->slug);
     }
-    for (i = 0; i < app->code_blocks.len; i++) free(TINTA_VEC_AT(TintaCodeBlock, app->code_blocks, i).text);
+    for (i = 0; i < app->code_blocks.len; i++) {
+        TintaCodeBlock *block = TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, i);
+        free(block->text);
+        free(block->language);
+    }
     tinta_vec_clear(&app->text_runs); tinta_vec_clear(&app->rects);
     tinta_vec_clear(&app->lines); tinta_vec_clear(&app->headings);
     tinta_vec_clear(&app->scroll_anchors);
@@ -230,6 +235,9 @@ void tinta_layout_clear(TintaApp *app) {
     app->hit_index_dirty = true;
     tinta_vec_clear(&app->bitmaps); tinta_vec_clear(&app->code_blocks); tinta_str16_clear(&app->doc_text);
     app->hovered_code_block = -1;
+    app->notice_kind = TINTA_NOTICE_NONE;
+    app->notice_code_block = -1;
+    if (app->hwnd) KillTimer(app->hwnd, TINTA_TIMER_NOTIFICATION);
 }
 
 static void capture_scroll_anchor(TintaApp *app) {
@@ -858,12 +866,19 @@ static bool layout_heading(TintaApp *app, const TintaElement *element,
 static bool layout_code(TintaApp *app, const TintaElement *element,
                         float *y, float left, float right) {
     TintaStr8 utf8 = {0}; TintaStr16 wide = {0};
+    TintaStr16 language_label = {0};
+    const char *language_utf8 = element->language && element->language[0] ?
+        element->language : "Plain text";
     float top = *y, line_height = scale(app, 20), padding = scale(app, 12);
-    bool ok = flatten(element, &utf8) && tinta_utf8_to_utf16(utf8.data, utf8.len, &wide);
+    float header_height = code_header_height(app);
+    bool ok = flatten(element, &utf8) &&
+              tinta_utf8_to_utf16(utf8.data, utf8.len, &wide) &&
+              tinta_utf8_to_utf16(language_utf8, strlen(language_utf8),
+                                  &language_label);
     if (ok) {
         size_t line_start=0, line_count=1, rect_index, block_index;
         size_t display_length = wide.len;
-        float line_y=top+padding, max_line_width=0;
+        float line_y=top+header_height+padding, max_line_width=0;
         float block_height;
 #if TINTA_ENABLE_SYNTAX
         int language=tinta_syntax_language(element->language);
@@ -879,7 +894,7 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
         }
         for (scan = 0; scan < display_length; scan++)
             if (wide.data[scan] == L'\n') line_count++;
-        block_height = line_count * line_height + padding * 2;
+        block_height = header_height + line_count * line_height + padding * 2;
         rect_index = app->rects.len;
         if (!add_rect(app, left, top, right, top + block_height,
                       app->theme->code_background, 0, false, 0)) ok = false;
@@ -890,9 +905,13 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
             command.rect.right = (LONG)right;
             command.rect.bottom = (LONG)(top + block_height);
             command.text = tinta_wcsdup_n(wide.data, wide.len);
+            command.language = tinta_wcsdup_n(
+                language_label.data, language_label.len);
             block_index = app->code_blocks.len;
-            if (!command.text || !tinta_vec_push(&app->code_blocks, &command)) {
+            if (!command.text || !command.language ||
+                !tinta_vec_push(&app->code_blocks, &command)) {
                 free(command.text);
+                free(command.language);
                 ok = false;
             }
         }
@@ -969,7 +988,8 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
         if (ok) ok = tinta_str16_append(&app->doc_text, L"\n\n", 2);
         *y = top + block_height + scale(app, 14);
     }
-    tinta_str8_destroy(&utf8); tinta_str16_destroy(&wide); return ok;
+    tinta_str8_destroy(&utf8); tinta_str16_destroy(&wide);
+    tinta_str16_destroy(&language_label); return ok;
 }
 
 static bool layout_list(TintaApp *app, const TintaElement *element,
@@ -1731,13 +1751,15 @@ bool tinta_layout_continue(TintaApp *app) {
 }
 
 static RECT code_button_rect(const TintaApp *app, const TintaCodeBlock *block) {
-    LONG width = (LONG)ui_scale(app, 52);
-    LONG height = (LONG)ui_scale(app, 26);
+    LONG width = (LONG)ui_scale(app, 78);
+    LONG height = (LONG)ui_scale(app, 28);
     LONG padding = (LONG)scale(app, 8);
+    LONG visible_right = (LONG)(app->scroll_x + viewport_width(app));
+    LONG header_height = (LONG)code_header_height(app);
     RECT result;
-    result.right = block->rect.right - padding;
+    result.right = min(block->rect.right, visible_right) - padding;
     result.left = result.right - width;
-    result.top = block->rect.top + padding;
+    result.top = block->rect.top + max(0L, (header_height - height) / 2);
     result.bottom = result.top + height;
     return result;
 }
@@ -2013,6 +2035,53 @@ static void draw_rect_item(TintaApp *app, const TintaDrawRect *item,
     }
 }
 
+static void draw_code_header(TintaApp *app, const TintaCodeBlock *block,
+                             float vx, float scroll) {
+    float document_left;
+    float document_right;
+    float padding = scale(app, 12);
+    float top = block->rect.top - scroll;
+    float bottom = top + code_header_height(app);
+    RECT button;
+    D2D1_RECT_F background;
+    IDWriteTextLayout *label = NULL;
+    if (!block->language || bottom < 0 || top > app->height) return;
+    document_left = maxf((float)block->rect.left, app->scroll_x);
+    document_right = minf((float)block->rect.right,
+                          app->scroll_x + viewport_width(app));
+    if (document_right <= document_left) return;
+    background = (D2D1_RECT_F){document_left + vx, top,
+                               document_right + vx, bottom};
+    set_brush_alpha(app, app->theme->quote, app->theme->dark ? 0.16f : 0.10f);
+    app->render_target->lpVtbl->FillRectangle(
+        app->render_target, &background, (ID2D1Brush *)app->brush);
+    set_brush_alpha(app, app->theme->quote, 0.45f);
+    app->render_target->lpVtbl->DrawLine(
+        app->render_target,
+        (D2D1_POINT_2F){background.left, background.bottom},
+        (D2D1_POINT_2F){background.right, background.bottom},
+        (ID2D1Brush *)app->brush, maxf(1.0f, scale(app, 1)), NULL);
+    button = code_button_rect(app, block);
+    if (button.left > document_left + padding &&
+        SUCCEEDED(app->dwrite_factory->lpVtbl->CreateTextLayout(
+            app->dwrite_factory, block->language,
+            (UINT32)wcslen(block->language), app->code_format,
+            button.left - document_left - padding * 2,
+            code_header_height(app), &label))) {
+        D2D1_POINT_2F origin = {document_left + padding + vx, top};
+        apply_font_fallback(app, label);
+        label->lpVtbl->SetWordWrapping(
+            label, TINTA_DWRITE_WORD_WRAPPING_NO_WRAP);
+        label->lpVtbl->SetParagraphAlignment(
+            label, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        set_brush_alpha(app, app->theme->syntax_comment, 0.95f);
+        tinta_draw_text_layout(app, origin, label,
+            (ID2D1Brush *)app->brush,
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        label->lpVtbl->Release(label);
+    }
+}
+
 
 void tinta_render(TintaApp *app) {
     size_t i;
@@ -2097,6 +2166,9 @@ void tinta_render(TintaApp *app) {
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
         }
 #endif
+        for (i = 0; i < app->code_blocks.len; i++)
+            draw_code_header(app,
+                TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, i), vx, scroll);
         if (app->search_query.len && app->viewer_search_matches.len) {
             size_t match_index = 0;
             size_t run_index = 0;
@@ -2134,6 +2206,12 @@ void tinta_render(TintaApp *app) {
             (size_t)app->hovered_code_block < app->code_blocks.len) {
             TintaCodeBlock *block = TINTA_VEC_PTR(
                 TintaCodeBlock, app->code_blocks, (size_t)app->hovered_code_block);
+            bool copied = app->notice_kind == TINTA_NOTICE_COPIED &&
+                          app->notice_code_block == app->hovered_code_block;
+            const wchar_t *button_text = copied ? L"Copied" : L"Copy";
+            size_t button_text_length = copied ? 6 : 4;
+            bool over_button = tinta_code_button_at(
+                app, app->mouse_x, app->mouse_y);
             RECT document_button = code_button_rect(app, block);
             D2D1_ROUNDED_RECT button;
             IDWriteTextLayout *label = NULL;
@@ -2143,20 +2221,60 @@ void tinta_render(TintaApp *app) {
             button.rect.bottom = document_button.bottom - scroll;
             button.radiusX = ui_scale(app, 4); button.radiusY = ui_scale(app, 4);
             if (button.rect.bottom > 0 && button.rect.top < app->height) {
-                set_brush_gray(app, app->theme->dark ? 0.3f : 0.85f, 0.9f);
-                app->render_target->lpVtbl->FillRoundedRectangle(
-                    app->render_target, &button, (ID2D1Brush *)app->brush);
+                float icon_size = ui_scale(app, 12);
+                float icon_left = button.rect.left + ui_scale(app, 7);
+                float icon_top = button.rect.top +
+                    (button.rect.bottom - button.rect.top - icon_size) * 0.5f;
+                float text_left = icon_left + icon_size + ui_scale(app, 7);
+                uint32_t foreground = copied ? app->theme->accent :
+                                              app->theme->syntax_comment;
+                if (over_button || copied) {
+                    set_brush_alpha(app, copied ? app->theme->accent :
+                                                  app->theme->quote,
+                                    copied ? 0.12f : 0.16f);
+                    app->render_target->lpVtbl->FillRoundedRectangle(
+                        app->render_target, &button,
+                        (ID2D1Brush *)app->brush);
+                }
+                set_brush_alpha(app, foreground,
+                                over_button || copied ? 1.0f : 0.82f);
+                if (copied) {
+                    D2D1_POINT_2F a = {icon_left,
+                                       icon_top + icon_size * 0.55f};
+                    D2D1_POINT_2F b = {icon_left + icon_size * 0.36f,
+                                       icon_top + icon_size * 0.88f};
+                    D2D1_POINT_2F c = {icon_left + icon_size,
+                                       icon_top + icon_size * 0.12f};
+                    app->render_target->lpVtbl->DrawLine(
+                        app->render_target, a, b,
+                        (ID2D1Brush *)app->brush, ui_scale(app, 1.5f), NULL);
+                    app->render_target->lpVtbl->DrawLine(
+                        app->render_target, b, c,
+                        (ID2D1Brush *)app->brush, ui_scale(app, 1.5f), NULL);
+                } else {
+                    D2D1_RECT_F back = {icon_left + ui_scale(app, 3), icon_top,
+                        icon_left + icon_size, icon_top + icon_size - ui_scale(app, 3)};
+                    D2D1_RECT_F front = {icon_left, icon_top + ui_scale(app, 3),
+                        icon_left + icon_size - ui_scale(app, 3),
+                        icon_top + icon_size};
+                    app->render_target->lpVtbl->DrawRectangle(
+                        app->render_target, &back,
+                        (ID2D1Brush *)app->brush, ui_scale(app, 1.1f), NULL);
+                    app->render_target->lpVtbl->DrawRectangle(
+                        app->render_target, &front,
+                        (ID2D1Brush *)app->brush, ui_scale(app, 1.1f), NULL);
+                }
                 if (SUCCEEDED(app->dwrite_factory->lpVtbl->CreateTextLayout(
-                        app->dwrite_factory, L"Copy", 4, app->code_format,
-                        button.rect.right - button.rect.left,
+                        app->dwrite_factory, button_text,
+                        (UINT32)button_text_length, app->chrome_format,
+                        button.rect.right - text_left - ui_scale(app, 4),
                         button.rect.bottom - button.rect.top, &label))) {
-                    D2D1_POINT_2F origin = {button.rect.left, button.rect.top};
+                    D2D1_POINT_2F origin = {text_left, button.rect.top};
                     apply_font_fallback(app, label);
-                    label->lpVtbl->SetTextAlignment(
-                        label, TINTA_DWRITE_TEXT_ALIGNMENT_CENTER);
                     label->lpVtbl->SetParagraphAlignment(
                         label, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                    set_brush_gray(app, app->theme->dark ? 0.9f : 0.15f, 1.0f);
+                    set_brush_alpha(app, foreground,
+                                    over_button || copied ? 1.0f : 0.82f);
                     tinta_draw_text_layout(app, origin, label,
                         (ID2D1Brush *)app->brush,
                         D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
@@ -2433,17 +2551,20 @@ bool tinta_text_at(TintaApp *app, float x, float y, const char **url) {
     return hit_test_linear(app, x, y, NULL, url, &candidate);
 }
 
-static void show_copied_notice(TintaApp *app) {
+static void show_copied_notice(TintaApp *app, int code_block) {
     app->notice_kind = TINTA_NOTICE_COPIED;
-    app->notice_tick = GetTickCount64();
-    SetTimer(app->hwnd, TINTA_TIMER_NOTIFICATION, 33, NULL);
+    app->notice_code_block = code_block;
+    if (!SetTimer(app->hwnd, TINTA_TIMER_NOTIFICATION, 1000, NULL)) {
+        app->notice_kind = TINTA_NOTICE_NONE;
+        app->notice_code_block = -1;
+    }
     InvalidateRect(app->hwnd, NULL, FALSE);
 }
 
-void tinta_copy_selection(TintaApp *app) {
+bool tinta_copy_selection(TintaApp *app) {
     size_t start;
     size_t end;
-    if (!app) return;
+    if (!app) return false;
     start = min(app->selection_anchor, app->selection_focus);
     end = max(app->selection_anchor, app->selection_focus);
     if (start > app->doc_text.len) start = app->doc_text.len;
@@ -2452,18 +2573,22 @@ void tinta_copy_selection(TintaApp *app) {
         start = 0;
         end = app->doc_text.len;
     }
-    if (end <= start) return;
-    if (tinta_set_clipboard_text(app->hwnd, app->doc_text.data + start, end - start))
-        show_copied_notice(app);
+    if (end <= start) return false;
+    return tinta_set_clipboard_text(
+        app->hwnd, app->doc_text.data + start, end - start);
 }
 
-bool tinta_copy_code_at(TintaApp *app, int x, int y) {
+bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied) {
     int index = tinta_code_block_at(app, x, y);
     TintaCodeBlock *block;
+    bool success;
+    if (copied) *copied = false;
     if (index < 0 || !tinta_code_button_at(app, x, y)) return false;
     block = TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, (size_t)index);
-    if (tinta_set_clipboard_text(app->hwnd, block->text, wcslen(block->text)))
-        show_copied_notice(app);
+    success = tinta_set_clipboard_text(
+        app->hwnd, block->text, wcslen(block->text));
+    if (success) show_copied_notice(app, index);
+    if (copied) *copied = success;
     return true;
 }
 
