@@ -291,6 +291,25 @@ static bool control_set_custom_theme(TintaControl *control,
     return true;
 }
 
+static bool control_set_zoom(TintaControl *control, float zoom) {
+    TintaApp *view;
+    float old_zoom;
+    if (!control) return false;
+    view = &control->view;
+    old_zoom = view->zoom;
+    zoom = clamp_float(zoom, 0.5f, 3.0f);
+    if (zoom == old_zoom) return true;
+    view->zoom = zoom;
+    if (!tinta_app_update_formats(view)) {
+        view->zoom = old_zoom;
+        return false;
+    }
+    view->layout_dirty = true;
+    InvalidateRect(view->hwnd, NULL, FALSE);
+    notify_code(control, TMN_ZOOMCHANGED);
+    return true;
+}
+
 static bool control_store_base_uri(TintaControl *control,
                                    const wchar_t *base_uri) {
     if (!control) return false;
@@ -775,6 +794,18 @@ static void control_handle_key(TintaControl *control, WPARAM key) {
             notify_code(control, TMN_REQUESTFIND);
             return;
         }
+        if (key == '0' || key == VK_NUMPAD0) {
+            control_set_zoom(control, 1.0f);
+            return;
+        }
+        if (key == VK_OEM_PLUS || key == VK_ADD) {
+            control_set_zoom(control, view->zoom + 0.1f);
+            return;
+        }
+        if (key == VK_OEM_MINUS || key == VK_SUBTRACT) {
+            control_set_zoom(control, view->zoom - 0.1f);
+            return;
+        }
     }
     switch (key) {
         case VK_DOWN: tinta_scroll(view, 42.0f * view->dpi_scale); break;
@@ -1136,17 +1167,8 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             return control_apply_theme(control, (int)wparam);
         case TMM_SETCUSTOMTHEME:
             return control_set_custom_theme(control, (const TintaThemeSpec *)lparam);
-        case TMM_SETZOOM: {
-            float zoom;
-            if (!lparam) return FALSE;
-            zoom = *(const float *)lparam;
-            view->zoom = clamp_float(zoom, 0.5f, 3.0f);
-            if (!tinta_app_update_formats(view)) return FALSE;
-            view->layout_dirty = true;
-            InvalidateRect(view->hwnd, NULL, FALSE);
-            notify_code(control, TMN_ZOOMCHANGED);
-            return TRUE;
-        }
+        case TMM_SETZOOM:
+            return lparam && control_set_zoom(control, *(const float *)lparam);
         case TMM_GETZOOM:
             if (!lparam) return FALSE;
             *(float *)lparam = view->zoom;
@@ -1459,13 +1481,8 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 int delta = GET_WHEEL_DELTA_WPARAM(wparam);
                 if (control_pressed() &&
                     (control->options.flags & TINTA_OPTION_MOUSE_ZOOM)) {
-                    control->view.zoom = clamp_float(control->view.zoom +
-                        (delta > 0 ? 0.1f : -0.1f), 0.5f, 3.0f);
-                    if (tinta_app_update_formats(&control->view)) {
-                        control->view.layout_dirty = true;
-                        InvalidateRect(hwnd, NULL, FALSE);
-                        notify_code(control, TMN_ZOOMCHANGED);
-                    }
+                    control_set_zoom(control, control->view.zoom +
+                        (delta > 0 ? 0.1f : -0.1f));
                 } else {
                     tinta_scroll(&control->view, -delta / 3.0f);
                     notify_code(control, TMN_SCROLLCHANGED);

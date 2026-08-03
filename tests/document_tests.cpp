@@ -83,6 +83,7 @@ int main() {
         if (blocks.root->child_count >= 2) {
             auto *list = blocks.root->children[1];
             check(list->type == TINTA_ELEMENT_LIST && list->child_count == 2, "list has two items");
+            check(list->tight, "compact Markdown list is marked tight");
             check(list->child_count && list->children[0]->child_count, "list item keeps paragraph content");
             if (list->child_count && list->children[0]->child_count) {
                 auto *content = list->children[0]->children[0];
@@ -96,6 +97,12 @@ int main() {
         }
     }
     tinta_parse_result_destroy(&blocks);
+
+    auto loose_list = parse_doc("- first paragraph\n\n- second paragraph\n", "notes.md");
+    check(loose_list.success && loose_list.root->child_count == 1 &&
+          !loose_list.root->children[0]->tight,
+          "blank lines produce a loose Markdown list");
+    tinta_parse_result_destroy(&loose_list);
 
     auto tasks = parse_doc("- [ ] pending\n- [x] complete\n", "notes.md");
     check(tasks.success && tasks.root->child_count == 1,

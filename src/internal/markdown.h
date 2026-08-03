@@ -47,6 +47,7 @@ struct TintaElement {
     char *language;
     int level;
     bool ordered;
+    bool tight;
     bool task;
     bool task_checked;
     int start;

@@ -1,5 +1,6 @@
 #include "tinta_core.h"
 
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -73,6 +74,40 @@ static bool pump_until(HWND view, int *value, int target, DWORD timeout_ms) {
     return *value >= target;
 }
 
+static bool send_control_key(HWND view, WPARAM key) {
+    BYTE original[256];
+    BYTE keyboard[256];
+    if (!GetKeyboardState(original)) return false;
+    std::memcpy(keyboard, original, sizeof(keyboard));
+    keyboard[VK_CONTROL] |= 0x80;
+    if (!SetKeyboardState(keyboard)) return false;
+    SendMessageW(view, WM_KEYDOWN, key, 0);
+    SetKeyboardState(original);
+    return true;
+}
+
+static bool copy_document_text(HWND view, const wchar_t *markdown,
+                               std::wstring *copied) {
+    HANDLE data;
+    const wchar_t *text;
+    if (!view || !markdown || !copied ||
+        !SendMessageW(view, WM_SETTEXT, 0,
+                      reinterpret_cast<LPARAM>(markdown)))
+        return false;
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, TMM_SELECTALL, 0, 0);
+    SendMessageW(view, WM_COPY, 0, 0);
+    if (!OpenClipboard(view)) return false;
+    data = GetClipboardData(CF_UNICODETEXT);
+    text = data ? static_cast<const wchar_t *>(GlobalLock(data)) : nullptr;
+    if (text) {
+        *copied = text;
+        GlobalUnlock(data);
+    }
+    CloseClipboard();
+    return text != nullptr;
+}
+
 int main() {
     HINSTANCE instance = GetModuleHandleW(nullptr);
     WNDCLASSW parent_class{};
@@ -109,6 +144,44 @@ int main() {
         std::cerr << "version/capability query failed\n";
         return 1;
     }
+    float zoom = 0.0f;
+    float requested_zoom = 1.4f;
+    if (!SendMessageW(view, TMM_GETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&zoom)) ||
+        std::fabs(zoom - 1.0f) > 0.001f ||
+        !SendMessageW(view, TMM_SETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&requested_zoom)) ||
+        !SendMessageW(view, TMM_GETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&zoom)) ||
+        std::fabs(zoom - 1.4f) > 0.001f ||
+        !send_control_key(view, '0') ||
+        !SendMessageW(view, TMM_GETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&zoom)) ||
+        std::fabs(zoom - 1.0f) > 0.001f ||
+        !send_control_key(view, VK_OEM_PLUS) ||
+        !SendMessageW(view, TMM_GETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&zoom)) ||
+        std::fabs(zoom - 1.1f) > 0.001f ||
+        !send_control_key(view, VK_OEM_MINUS) ||
+        !SendMessageW(view, TMM_GETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&zoom)) ||
+        std::fabs(zoom - 1.0f) > 0.001f) {
+        std::cerr << "zoom API or keyboard shortcuts failed\n";
+        return 1;
+    }
+    std::wstring copied_text;
+    if (!copy_document_text(view, L"- first\n- second",
+                            &copied_text) ||
+        copied_text != L"\x2022 first\n\x2022 second\n" ||
+        !copy_document_text(view,
+                            L"- first paragraph\n\n- second paragraph",
+                            &copied_text) ||
+        copied_text != L"\x2022 first paragraph\n\n\x2022 second paragraph\n\n") {
+        std::cerr << "list clipboard spacing failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));
 #if !TINTA_ENABLE_LOCAL_IMAGES
     if (compiled_options.flags & TINTA_OPTION_LOCAL_IMAGES) {
         std::cerr << "disabled local images were reported as supported\n";

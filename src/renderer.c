@@ -987,11 +987,11 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
         bool inline_active = false;
         size_t child;
         if (item->task)
-            wcscpy_s(marker, 32, item->task_checked ? L"\x2611" : L"\x2610");
+            wcscpy_s(marker, 32, item->task_checked ? L"\x2611 " : L"\x2610 ");
         else if (element->ordered)
-            _snwprintf_s(marker, 32, _TRUNCATE, L"%d.", number++);
+            _snwprintf_s(marker, 32, _TRUNCATE, L"%d. ", number++);
         else
-            wcscpy_s(marker, 32, L"•");
+            wcscpy_s(marker, 32, L"• ");
         if (!append_run(app, marker, wcslen(marker), app->body_format, app->theme->text,
                         left, *y, NULL, NULL)) return false;
         for (child = 0; child < item->child_count; child++) {
@@ -1052,7 +1052,11 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
             if (!tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
         }
         *y = maxf(*y, item_start + scale(app, 28));
-        if (!tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
+        if ((!app->doc_text.len ||
+             app->doc_text.data[app->doc_text.len - 1] != L'\n') &&
+            !tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
+        if (!element->tight &&
+            !tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
     }
     *y += scale(app, 8);
     return true;

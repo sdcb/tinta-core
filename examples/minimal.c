@@ -12,7 +12,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message,
             g_view = CreateWindowExW(
                 0, TINTA_MARKDOWN_VIEW_CLASSW,
                 L"# Tinta Core\n\nThis Markdown was supplied with `WM_SETTEXT`.\n\n"
-                L"- Select and copy text\n- Use Ctrl+mouse wheel to zoom\n"
+                L"- Select and copy text\n- Use Ctrl+0, Ctrl++/-, or Ctrl+mouse wheel to zoom\n"
                 L"- Visit [OpenAI](https://openai.com)",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 0, 0, 1, 1, hwnd, (HMENU)100, GetModuleHandleW(NULL), NULL);

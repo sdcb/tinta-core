@@ -84,6 +84,9 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - The control owns parsing, Direct2D drawing, scrolling, selection, zoom,
   search highlights, TOC data, image decoding and UI Automation. File dialogs,
   persistence, search UI and context menus belong to the host.
+- With keyboard navigation enabled, `Ctrl+0` resets zoom to 100% and
+  `Ctrl++`/`Ctrl+-` adjust it by 10%. `Ctrl+mouse wheel` uses the same steps
+  when mouse zoom is enabled.
 - External links send `TMN_LINKACTIVATE`; returning zero permits the default
   `ShellExecuteW` behavior. Images send `TMN_RESOURCEOPENING`; the host can
   return default, block, or replace the resource URI.

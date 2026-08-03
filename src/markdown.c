@@ -178,11 +178,22 @@ static int enter_block(MD_BLOCKTYPE type, void *detail, void *userdata) {
             break;
         }
         case MD_BLOCK_QUOTE: element = tinta_element_create(TINTA_ELEMENT_BLOCK_QUOTE); break;
-        case MD_BLOCK_UL: element = tinta_element_create(TINTA_ELEMENT_LIST); break;
-        case MD_BLOCK_OL:
+        case MD_BLOCK_UL: {
+            MD_BLOCK_UL_DETAIL *list = (MD_BLOCK_UL_DETAIL *)detail;
             element = tinta_element_create(TINTA_ELEMENT_LIST);
-            if (element) { element->ordered = true; element->start = (int)((MD_BLOCK_OL_DETAIL *)detail)->start; }
+            if (element) element->tight = list->is_tight != 0;
             break;
+        }
+        case MD_BLOCK_OL: {
+            MD_BLOCK_OL_DETAIL *list = (MD_BLOCK_OL_DETAIL *)detail;
+            element = tinta_element_create(TINTA_ELEMENT_LIST);
+            if (element) {
+                element->ordered = true;
+                element->tight = list->is_tight != 0;
+                element->start = (int)list->start;
+            }
+            break;
+        }
         case MD_BLOCK_LI: {
             MD_BLOCK_LI_DETAIL *item = (MD_BLOCK_LI_DETAIL *)detail;
             element = tinta_element_create(TINTA_ELEMENT_LIST_ITEM);
@@ -775,7 +786,10 @@ static bool parse_html_into_elements(const char *html, TintaElement *parent) {
                     TintaElement *current = TINTA_VEC_AT(TintaElement *, stack, stack.len - 1);
                     if (!element) { html_tag_destroy(&tag); goto failed; }
                     element->level = heading_level;
-                    if (type == TINTA_ELEMENT_LIST) element->ordered = strcmp(tag.name.data, "ol") == 0;
+                    if (type == TINTA_ELEMENT_LIST) {
+                        element->ordered = strcmp(tag.name.data, "ol") == 0;
+                        element->tight = true;
+                    }
                     if (type == TINTA_ELEMENT_LINK &&
                         (!replace_string(&element->url, tag.href.data ? tag.href.data : "", tag.href.len) ||
                          !replace_string(&element->title, tag.title.data ? tag.title.data : "", tag.title.len))) {
