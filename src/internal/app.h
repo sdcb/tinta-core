@@ -110,6 +110,7 @@ typedef struct TintaDrawBitmap {
 typedef struct TintaCodeBlock {
     RECT rect;
     wchar_t *text;
+    wchar_t *language;
 } TintaCodeBlock;
 
 typedef struct TintaHeading {
@@ -213,6 +214,7 @@ struct TintaApp {
     IDWriteTextFormat *code_format;
     IDWriteTextFormat *heading_formats[6];
     IDWriteTextFormat *ui_format;
+    IDWriteTextFormat *chrome_format;
 
     TintaParseResult document;
     uint64_t document_revision;
@@ -260,7 +262,7 @@ struct TintaApp {
     int hovered_code_block;
     bool tracking_mouse;
     TintaNoticeKind notice_kind;
-    ULONGLONG notice_tick;
+    int notice_code_block;
 
     bool selecting;
     size_t selection_anchor;
@@ -336,8 +338,8 @@ bool tinta_scrollbar_drag(TintaApp *app, int x, int y);
 bool tinta_scrollbar_end_drag(TintaApp *app, int x, int y);
 void tinta_hit_test(TintaApp *app, float x, float y, size_t *position, const char **url);
 bool tinta_text_at(TintaApp *app, float x, float y, const char **url);
-void tinta_copy_selection(TintaApp *app);
-bool tinta_copy_code_at(TintaApp *app, int x, int y);
+bool tinta_copy_selection(TintaApp *app);
+bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied);
 int tinta_code_block_at(const TintaApp *app, int x, int y);
 bool tinta_code_button_at(const TintaApp *app, int x, int y);
 bool tinta_jump_to_internal_link(TintaApp *app, const char *url);

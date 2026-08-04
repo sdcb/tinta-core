@@ -59,7 +59,7 @@ bool tinta_read_file_bytes(const wchar_t *path, TintaStr8 *output) {
         goto done;
     while (offset < (size_t)size.QuadPart) {
         size_t remaining = (size_t)size.QuadPart - offset;
-        DWORD chunk = (DWORD)(remaining > DWORD_MAX ? DWORD_MAX : remaining);
+        DWORD chunk = (DWORD)(remaining > MAXDWORD ? MAXDWORD : remaining);
         DWORD read = 0;
         if (!ReadFile(file, loaded.data + offset, chunk, &read, NULL) ||
             read != chunk)

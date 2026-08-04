@@ -766,10 +766,22 @@ static void control_copy_selection(TintaControl *control) {
     if (!control ||
         control->view.selection_anchor == control->view.selection_focus)
         return;
-    tinta_copy_selection(&control->view);
-    KillTimer(control->view.hwnd, TINTA_TIMER_NOTIFICATION);
-    control->view.notice_kind = TINTA_NOTICE_NONE;
-    notify_code(control, TMN_COPYCOMPLETED);
+    if (tinta_copy_selection(&control->view))
+        notify_code(control, TMN_COPYCOMPLETED);
+    else
+        notify_error(control, E_FAIL, L"copy",
+                     L"The selected text could not be copied to the clipboard.");
+}
+
+static void control_begin_selection(TintaControl *control, int x, int y) {
+    const char *url = NULL;
+    if (!control || !(control->options.flags & TINTA_OPTION_SELECTION)) return;
+    tinta_hit_test(&control->view, (float)x, (float)y,
+                   &control->view.selection_anchor, &url);
+    control->view.selection_focus = control->view.selection_anchor;
+    control->view.selecting = true;
+    SetCapture(control->view.hwnd);
+    InvalidateRect(control->view.hwnd, NULL, FALSE);
 }
 
 static void control_handle_key(TintaControl *control, WPARAM key) {
@@ -1119,6 +1131,18 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             }
             if (!(control->options.flags & TINTA_OPTION_SELECTION))
                 view->selection_anchor = view->selection_focus = 0;
+            if ((old_flags ^ control->options.flags) &
+                TINTA_OPTION_CODE_COPY_BUTTON) {
+                if (!(control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON)) {
+                    KillTimer(view->hwnd, TINTA_TIMER_NOTIFICATION);
+                    view->notice_kind = TINTA_NOTICE_NONE;
+                    view->notice_code_block = -1;
+                }
+                view->hovered_code_block =
+                    (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) ?
+                    tinta_code_block_at(view, view->mouse_x, view->mouse_y) : -1;
+                InvalidateRect(view->hwnd, NULL, FALSE);
+            }
             return TRUE;
         }
         case TMM_GETOPTIONS: {
@@ -1506,19 +1530,20 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 SetFocus(hwnd);
                 if (tinta_scrollbar_begin_drag(&control->view, x, y)) {
                     SetCapture(hwnd);
-                } else if ((control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) &&
-                           tinta_copy_code_at(&control->view, x, y)) {
-                    KillTimer(hwnd, TINTA_TIMER_NOTIFICATION);
-                    control->view.notice_kind = TINTA_NOTICE_NONE;
-                    notify_code(control, TMN_COPYCOMPLETED);
-                } else if (control->options.flags & TINTA_OPTION_SELECTION) {
-                    const char *url = NULL;
-                    tinta_hit_test(&control->view, (float)x, (float)y,
-                                   &control->view.selection_anchor, &url);
-                    control->view.selection_focus = control->view.selection_anchor;
-                    control->view.selecting = true;
-                    SetCapture(hwnd);
-                    InvalidateRect(hwnd, NULL, FALSE);
+                } else {
+                    bool handled = false;
+                    bool copied = false;
+                    if ((control->options.flags &
+                         TINTA_OPTION_CODE_COPY_BUTTON) &&
+                        tinta_copy_code_at(&control->view, x, y, &copied)) {
+                        handled = true;
+                        if (copied)
+                            notify_code(control, TMN_COPYCOMPLETED);
+                        else
+                            notify_error(control, E_FAIL, L"copy-code",
+                                L"The code block could not be copied to the clipboard.");
+                    }
+                    if (!handled) control_begin_selection(control, x, y);
                 }
             }
             return 0;
@@ -1526,6 +1551,10 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
             if (control) {
                 int x = GET_X_LPARAM(lparam);
                 int y = GET_Y_LPARAM(lparam);
+                bool old_over_copy_button =
+                    (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) &&
+                    tinta_code_button_at(&control->view,
+                        control->view.mouse_x, control->view.mouse_y);
                 control->view.mouse_x = x;
                 control->view.mouse_y = y;
                 if (!control->view.tracking_mouse) {
@@ -1543,12 +1572,25 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     InvalidateRect(hwnd, NULL, FALSE);
                 } else {
                     const char *url = NULL;
+                    int old_code_block = control->view.hovered_code_block;
+                    bool hover_changed;
+                    bool over_copy_button;
                     bool text = tinta_text_at(&control->view, (float)x, (float)y,
                                               &url);
-                    tinta_scrollbar_update_hover(&control->view, x, y);
+                    hover_changed = tinta_scrollbar_update_hover(
+                        &control->view, x, y);
                     control->view.hovered_code_block =
-                        tinta_code_block_at(&control->view, x, y);
-                    SetCursor(LoadCursorW(NULL, url && url[0] ? IDC_HAND :
+                        (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) ?
+                        tinta_code_block_at(&control->view, x, y) : -1;
+                    over_copy_button =
+                        control->view.hovered_code_block >= 0 &&
+                        tinta_code_button_at(&control->view, x, y);
+                    if (hover_changed || old_code_block !=
+                        control->view.hovered_code_block ||
+                        old_over_copy_button != over_copy_button)
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    SetCursor(LoadCursorW(NULL,
+                        over_copy_button || (url && url[0]) ? IDC_HAND :
                         text ? IDC_IBEAM : IDC_ARROW));
                 }
             }
@@ -1678,6 +1720,8 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
             if (control && wparam == TINTA_TIMER_NOTIFICATION) {
                 KillTimer(hwnd, TINTA_TIMER_NOTIFICATION);
                 control->view.notice_kind = TINTA_NOTICE_NONE;
+                control->view.notice_code_block = -1;
+                InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
             break;

@@ -1,8 +1,51 @@
 #ifndef TINTA_WIN_GRAPHICS_C_H
 #define TINTA_WIN_GRAPHICS_C_H
 
+/* Keep the flattened COM layouts below authoritative under MinGW as well. */
+#if defined(__MINGW32__)
+#define ID2D1Factory TintaMingwID2D1Factory
+#define ID2D1HwndRenderTarget TintaMingwID2D1HwndRenderTarget
+#define ID2D1SolidColorBrush TintaMingwID2D1SolidColorBrush
+#define ID2D1Bitmap TintaMingwID2D1Bitmap
+#define ID2D1PathGeometry TintaMingwID2D1PathGeometry
+#define ID2D1GeometrySink TintaMingwID2D1GeometrySink
+#endif
+
 #define D2D_USE_C_DEFINITIONS
 #include <d2d1.h>
+
+#if defined(__MINGW32__)
+#undef ID2D1Factory
+#undef ID2D1HwndRenderTarget
+#undef ID2D1SolidColorBrush
+#undef ID2D1Bitmap
+#undef ID2D1PathGeometry
+#undef ID2D1GeometrySink
+
+typedef struct ID2D1Factory ID2D1Factory;
+typedef struct ID2D1HwndRenderTarget ID2D1HwndRenderTarget;
+typedef struct ID2D1SolidColorBrush ID2D1SolidColorBrush;
+typedef struct ID2D1Bitmap ID2D1Bitmap;
+typedef struct ID2D1PathGeometry ID2D1PathGeometry;
+typedef struct ID2D1GeometrySink ID2D1GeometrySink;
+
+/* MinGW's d2d1.h replaces this shared COM macro without restoring it. */
+#undef DECLARE_INTERFACE
+#undef DECLARE_INTERFACE_
+#ifdef CONST_VTABLE
+#define DECLARE_INTERFACE(iface)                                      \
+    typedef interface iface { const struct iface##Vtbl *lpVtbl; } iface; \
+    typedef const struct iface##Vtbl iface##Vtbl;                     \
+    const struct iface##Vtbl
+#else
+#define DECLARE_INTERFACE(iface)                                \
+    typedef interface iface { struct iface##Vtbl *lpVtbl; } iface; \
+    typedef struct iface##Vtbl iface##Vtbl;                      \
+    struct iface##Vtbl
+#endif
+#define DECLARE_INTERFACE_(iface, baseiface) DECLARE_INTERFACE(iface)
+#endif
+
 #include <wincodec.h>
 
 typedef enum TintaDWriteFactoryType {
