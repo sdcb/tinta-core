@@ -761,6 +761,30 @@ int main() {
             std::cerr << "Mermaid options restore failed\n";
             return 1;
         }
+        const wchar_t *subgraph_mermaid =
+            L"```mermaid\nflowchart LR\nStart --> cluster --> Finish\n"
+            L"subgraph cluster [Searchable Group]\n"
+            L"direction TB\nA --> inner\n"
+            L"subgraph inner [Nested Workers]\n"
+            L"direction RL\nB --> C\nend\nA --> B\nend\n```";
+        TintaContentSize subgraph_size{};
+        TintaFindRequest subgraph_find{};
+        TintaFindState subgraph_state{};
+        subgraph_find.cb_size = sizeof(subgraph_find);
+        subgraph_find.text = L"Nested Workers";
+        subgraph_find.text_length = 14;
+        subgraph_find.flags = TINTA_FIND_WRAP;
+        subgraph_state.cb_size = sizeof(subgraph_state);
+        if (!load_and_measure(subgraph_mermaid, &subgraph_size) ||
+            subgraph_size.width > 640.5f ||
+            !SendMessageW(view, TMM_FIND, 0,
+                          reinterpret_cast<LPARAM>(&subgraph_find)) ||
+            !SendMessageW(view, TMM_GETFINDSTATE, 0,
+                          reinterpret_cast<LPARAM>(&subgraph_state)) ||
+            subgraph_state.match_count != 1) {
+            std::cerr << "Mermaid subgraph title was not searchable\n";
+            return 1;
+        }
     }
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));

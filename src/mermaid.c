@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +19,7 @@ typedef struct NodeSpec {
     TintaMermaidNodeShape shape;
     bool has_definition;
     size_t source_offset;
+    size_t parent_subgraph;
 } NodeSpec;
 
 typedef struct ArrowSpec {
@@ -36,13 +38,44 @@ typedef struct Delimiter {
 typedef struct ParseState {
     TintaVec nodes;
     TintaVec edges;
+    TintaVec raw_edges;
+    TintaVec subgraphs;
     TintaVec class_styles;
+    TintaVec style_assignments;
+    TintaVec class_assignments;
+    TintaVec subgraph_stack;
     TintaStringMap node_ids;
+    TintaStringMap subgraph_ids;
     TintaStringMap class_ids;
     TintaMermaidDirection direction;
     size_t max_nodes;
     size_t max_edges;
 } ParseState;
+
+typedef struct RawEdge {
+    char *from_id;
+    char *to_id;
+    char *label;
+    bool directed;
+    bool dashed;
+    float stroke_scale;
+} RawEdge;
+
+typedef struct StyleAssignment {
+    char *id;
+    TintaMermaidStyle style;
+} StyleAssignment;
+
+typedef struct ClassAssignment {
+    char *id;
+    char *class_name;
+    size_t source_offset;
+} ClassAssignment;
+
+typedef struct LayoutEdge {
+    size_t from;
+    size_t to;
+} LayoutEdge;
 
 typedef struct IndexList {
     TintaVec values;
@@ -355,6 +388,7 @@ static void node_spec_destroy(NodeSpec *spec) {
 static bool node_spec_init(NodeSpec *spec) {
     memset(spec, 0, sizeof(*spec));
     spec->shape = TINTA_MERMAID_RECTANGLE;
+    spec->parent_subgraph = SIZE_MAX;
     return tinta_str8_init(&spec->id) && tinta_str8_init(&spec->label) &&
            tinta_str8_init(&spec->class_name);
 }
@@ -486,6 +520,31 @@ static void edge_destroy(TintaMermaidEdge *edge) {
     memset(edge, 0, sizeof(*edge));
 }
 
+static void raw_edge_destroy(RawEdge *edge) {
+    free(edge->from_id);
+    free(edge->to_id);
+    free(edge->label);
+    memset(edge, 0, sizeof(*edge));
+}
+
+static void subgraph_destroy(TintaMermaidSubgraph *subgraph) {
+    free(subgraph->id);
+    free(subgraph->label);
+    free(subgraph->class_name);
+    memset(subgraph, 0, sizeof(*subgraph));
+}
+
+static void style_assignment_destroy(StyleAssignment *assignment) {
+    free(assignment->id);
+    memset(assignment, 0, sizeof(*assignment));
+}
+
+static void class_assignment_destroy(ClassAssignment *assignment) {
+    free(assignment->id);
+    free(assignment->class_name);
+    memset(assignment, 0, sizeof(*assignment));
+}
+
 static void class_style_destroy(TintaMermaidClassStyle *style) {
     free(style->name);
     memset(style, 0, sizeof(*style));
@@ -496,36 +555,76 @@ static bool parse_state_init(ParseState *state) {
     state->direction = TINTA_MERMAID_TOP_TO_BOTTOM;
     return tinta_vec_init(&state->nodes, sizeof(TintaMermaidNode)) &&
            tinta_vec_init(&state->edges, sizeof(TintaMermaidEdge)) &&
+           tinta_vec_init(&state->raw_edges, sizeof(RawEdge)) &&
+           tinta_vec_init(&state->subgraphs, sizeof(TintaMermaidSubgraph)) &&
            tinta_vec_init(&state->class_styles, sizeof(TintaMermaidClassStyle)) &&
-           tinta_map_init(&state->node_ids) && tinta_map_init(&state->class_ids);
+           tinta_vec_init(&state->style_assignments, sizeof(StyleAssignment)) &&
+           tinta_vec_init(&state->class_assignments, sizeof(ClassAssignment)) &&
+           tinta_vec_init(&state->subgraph_stack, sizeof(size_t)) &&
+           tinta_map_init(&state->node_ids) &&
+           tinta_map_init(&state->subgraph_ids) &&
+           tinta_map_init(&state->class_ids);
 }
 
 static void parse_state_destroy(ParseState *state) {
     size_t i;
     for (i = 0; i < state->nodes.len; i++) node_destroy(TINTA_VEC_PTR(TintaMermaidNode, state->nodes, i));
     for (i = 0; i < state->edges.len; i++) edge_destroy(TINTA_VEC_PTR(TintaMermaidEdge, state->edges, i));
+    for (i = 0; i < state->raw_edges.len; i++) raw_edge_destroy(TINTA_VEC_PTR(RawEdge, state->raw_edges, i));
+    for (i = 0; i < state->subgraphs.len; i++) subgraph_destroy(TINTA_VEC_PTR(TintaMermaidSubgraph, state->subgraphs, i));
     for (i = 0; i < state->class_styles.len; i++) class_style_destroy(TINTA_VEC_PTR(TintaMermaidClassStyle, state->class_styles, i));
+    for (i = 0; i < state->style_assignments.len; i++) style_assignment_destroy(TINTA_VEC_PTR(StyleAssignment, state->style_assignments, i));
+    for (i = 0; i < state->class_assignments.len; i++) class_assignment_destroy(TINTA_VEC_PTR(ClassAssignment, state->class_assignments, i));
     tinta_vec_destroy(&state->nodes);
     tinta_vec_destroy(&state->edges);
+    tinta_vec_destroy(&state->raw_edges);
+    tinta_vec_destroy(&state->subgraphs);
     tinta_vec_destroy(&state->class_styles);
+    tinta_vec_destroy(&state->style_assignments);
+    tinta_vec_destroy(&state->class_assignments);
+    tinta_vec_destroy(&state->subgraph_stack);
     tinta_map_destroy(&state->node_ids);
+    tinta_map_destroy(&state->subgraph_ids);
     tinta_map_destroy(&state->class_ids);
 }
 
-static bool ensure_node(ParseState *state, const NodeSpec *spec, size_t *index) {
+static bool ensure_node(ParseState *state, const NodeSpec *spec, size_t *index,
+                        char **error) {
     size_t existing;
+    if (tinta_map_get(&state->subgraph_ids, spec->id.data,
+                      spec->id.len, &existing)) {
+        if (spec->has_definition)
+            return set_error(error,
+                "A Mermaid identifier cannot name both a node and a subgraph");
+        *index = SIZE_MAX;
+        return true;
+    }
     if (tinta_map_get(&state->node_ids, spec->id.data, spec->id.len, &existing)) {
         TintaMermaidNode *node = TINTA_VEC_PTR(TintaMermaidNode, state->nodes, existing);
+        if (spec->parent_subgraph != SIZE_MAX) {
+            if (node->parent_subgraph == SIZE_MAX) {
+                if (node->has_definition && spec->has_definition)
+                    return set_error(error,
+                        "A Mermaid node cannot belong to multiple subgraphs");
+                if (!node->has_definition || spec->has_definition)
+                    node->parent_subgraph = spec->parent_subgraph;
+            }
+            else if (node->parent_subgraph != spec->parent_subgraph &&
+                     spec->has_definition)
+                return set_error(error,
+                    "A Mermaid node cannot belong to multiple subgraphs");
+        }
         if (spec->has_definition) {
             char *label = tinta_str8_dup(spec->label.data, spec->label.len);
-            if (!label) return false;
+            if (!label) return set_error(error, "Out of memory");
             free(node->label);
             node->label = label;
             node->shape = spec->shape;
+            node->has_definition = true;
         }
         if (spec->class_name.len) {
             char *class_name = tinta_str8_dup(spec->class_name.data, spec->class_name.len);
-            if (!class_name) return false;
+            if (!class_name) return set_error(error, "Out of memory");
             free(node->class_name);
             node->class_name = class_name;
         }
@@ -535,24 +634,27 @@ static bool ensure_node(ParseState *state, const NodeSpec *spec, size_t *index) 
     }
     {
         TintaMermaidNode node;
-        if (state->max_nodes && state->nodes.len >= state->max_nodes)
-            return false;
+        if (state->max_nodes &&
+            state->nodes.len + state->subgraphs.len >= state->max_nodes)
+            return set_error(error, "Mermaid node limit exceeded");
         memset(&node, 0, sizeof(node));
         node.id = tinta_str8_dup(spec->id.data, spec->id.len);
         node.label = tinta_str8_dup(spec->label.data, spec->label.len);
         node.class_name = tinta_str8_dup(spec->class_name.data, spec->class_name.len);
         node.shape = spec->shape;
         node.source_offset = spec->source_offset;
+        node.parent_subgraph = spec->parent_subgraph;
+        node.has_definition = spec->has_definition;
         node.style.stroke_width = 1.0f;
         if (!node.id || !node.label || !node.class_name) {
             node_destroy(&node);
-            return false;
+            return set_error(error, "Out of memory");
         }
         *index = state->nodes.len;
         if (!tinta_vec_push(&state->nodes, &node) ||
             !tinta_map_set(&state->node_ids, spec->id.data, spec->id.len, *index)) {
             if (state->nodes.len == *index) node_destroy(&node);
-            return false;
+            return set_error(error, "Out of memory");
         }
     }
     return true;
@@ -580,6 +682,226 @@ static bool set_class_style(ParseState *state, View name, const TintaMermaidStyl
     return true;
 }
 
+static size_t current_subgraph(const ParseState *state) {
+    if (!state || !state->subgraph_stack.len) return SIZE_MAX;
+    return TINTA_VEC_AT(size_t, state->subgraph_stack,
+                        state->subgraph_stack.len - 1);
+}
+
+static bool rebuild_node_map(ParseState *state) {
+    size_t i;
+    tinta_map_destroy(&state->node_ids);
+    if (!tinta_map_init(&state->node_ids)) return false;
+    for (i = 0; i < state->nodes.len; i++) {
+        TintaMermaidNode *node = TINTA_VEC_PTR(
+            TintaMermaidNode, state->nodes, i);
+        if (!tinta_map_set(&state->node_ids, node->id,
+                           strlen(node->id), i)) return false;
+    }
+    return true;
+}
+
+static bool remove_placeholder_node(ParseState *state, size_t index) {
+    TintaMermaidNode *nodes;
+    if (!state || index >= state->nodes.len) return false;
+    nodes = (TintaMermaidNode *)state->nodes.data;
+    node_destroy(&nodes[index]);
+    if (index + 1 < state->nodes.len)
+        memmove(&nodes[index], &nodes[index + 1],
+                (state->nodes.len - index - 1) * sizeof(*nodes));
+    state->nodes.len--;
+    return rebuild_node_map(state);
+}
+
+static bool parse_subgraph_declaration(ParseState *state, View value,
+                                       size_t source_offset, char **error) {
+    TintaMermaidSubgraph subgraph;
+    TintaStr8 id = {0};
+    TintaStr8 label = {0};
+    size_t existing;
+    size_t position = 0;
+    View trimmed = trim(value);
+    bool generated = false;
+    memset(&subgraph, 0, sizeof(subgraph));
+    if (!tinta_str8_init(&id) || !tinta_str8_init(&label))
+        goto out_of_memory;
+    if (!trimmed.len) {
+        set_error(error, "Expected a title after subgraph");
+        goto failed;
+    }
+    if (state->subgraph_stack.len >= 64) {
+        set_error(error, "Mermaid subgraph nesting limit exceeded");
+        goto failed;
+    }
+    if (trimmed.data[0] == '"' || trimmed.data[0] == '\'') {
+        char quote = trimmed.data[0];
+        size_t close = 1;
+        bool escaped = false;
+        while (close < trimmed.len) {
+            char c = trimmed.data[close];
+            if (c == quote && !escaped) break;
+            escaped = c == '\\' && !escaped;
+            if (c != '\\') escaped = false;
+            close++;
+        }
+        if (close >= trimmed.len || trim(view_make(
+                trimmed.data + close + 1,
+                trimmed.len - close - 1)).len) {
+            set_error(error, "Invalid quoted subgraph title");
+            goto failed;
+        }
+        if (!decode_label(view_make(trimmed.data + 1, close - 1), &label))
+            goto out_of_memory;
+        generated = true;
+    } else {
+        View first;
+        while (position < trimmed.len &&
+               !is_space(trimmed.data[position]) &&
+               trimmed.data[position] != '[') position++;
+        first = view_make(trimmed.data, position);
+        View remainder = trim(view_make(trimmed.data + position,
+                                        trimmed.len - position));
+        if (!first.len) {
+            set_error(error, "Expected a subgraph identifier or title");
+            goto failed;
+        }
+        if (remainder.len && remainder.data[0] == '[') {
+            size_t close = find_char(remainder, ']', 1);
+            View encoded;
+            if (close == SIZE_MAX || trim(view_make(
+                    remainder.data + close + 1,
+                    remainder.len - close - 1)).len) {
+                set_error(error, "Invalid subgraph title delimiter");
+                goto failed;
+            }
+            encoded = trim(view_make(remainder.data + 1, close - 1));
+            if (encoded.len >= 2 &&
+                ((encoded.data[0] == '"' && encoded.data[encoded.len - 1] == '"') ||
+                 (encoded.data[0] == '\'' && encoded.data[encoded.len - 1] == '\''))) {
+                encoded.data++;
+                encoded.len -= 2;
+            }
+            if (!tinta_str8_assign(&id, first.data, first.len) ||
+                !decode_label(encoded, &label)) goto out_of_memory;
+        } else if (remainder.len) {
+            if (!decode_label(trimmed, &label)) goto out_of_memory;
+            generated = true;
+        } else {
+            if (!tinta_str8_assign(&id, first.data, first.len) ||
+                !decode_label(first, &label)) goto out_of_memory;
+        }
+    }
+    if (generated) {
+        char buffer[64];
+        int length = snprintf(buffer, sizeof(buffer), "__subgraph_%zu",
+                              state->subgraphs.len + 1);
+        if (length <= 0 || !tinta_str8_assign(&id, buffer, (size_t)length))
+            goto out_of_memory;
+    }
+    if (tinta_map_get(&state->subgraph_ids, id.data, id.len, &existing)) {
+        set_error(error, "Duplicate Mermaid subgraph identifier");
+        goto failed;
+    }
+    if (tinta_map_get(&state->node_ids, id.data, id.len, &existing)) {
+        TintaMermaidNode *node = TINTA_VEC_PTR(
+            TintaMermaidNode, state->nodes, existing);
+        if (node->has_definition) {
+            set_error(error,
+                "A Mermaid identifier cannot name both a node and a subgraph");
+            goto failed;
+        }
+        if (!remove_placeholder_node(state, existing)) goto out_of_memory;
+    }
+    if (state->max_nodes &&
+        state->nodes.len + state->subgraphs.len >= state->max_nodes) {
+        set_error(error, "Mermaid node limit exceeded");
+        goto failed;
+    }
+    subgraph.id = tinta_str8_dup(id.data, id.len);
+    subgraph.label = tinta_str8_dup(label.data, label.len);
+    subgraph.class_name = tinta_str8_dup("", 0);
+    subgraph.parent_subgraph = current_subgraph(state);
+    subgraph.direction = subgraph.parent_subgraph == SIZE_MAX ?
+        state->direction : TINTA_VEC_AT(TintaMermaidSubgraph,
+            state->subgraphs, subgraph.parent_subgraph).direction;
+    subgraph.source_offset = source_offset;
+    subgraph.style.stroke_width = 1.0f;
+    if (!subgraph.id || !subgraph.label || !subgraph.class_name)
+        goto out_of_memory_subgraph;
+    existing = state->subgraphs.len;
+    if (!tinta_vec_push(&state->subgraphs, &subgraph) ||
+        !tinta_map_set(&state->subgraph_ids, id.data, id.len, existing) ||
+        !tinta_vec_push(&state->subgraph_stack, &existing)) {
+        if (state->subgraphs.len == existing)
+            subgraph_destroy(&subgraph);
+        goto out_of_memory;
+    }
+    tinta_str8_destroy(&id);
+    tinta_str8_destroy(&label);
+    return true;
+
+out_of_memory_subgraph:
+    subgraph_destroy(&subgraph);
+out_of_memory:
+    set_error(error, "Out of memory");
+failed:
+    tinta_str8_destroy(&id);
+    tinta_str8_destroy(&label);
+    return false;
+}
+
+static bool add_raw_edge(ParseState *state, const NodeSpec *from,
+                         const NodeSpec *to, const ArrowSpec *arrow,
+                         char **error) {
+    RawEdge edge;
+    memset(&edge, 0, sizeof(edge));
+    if (state->max_edges && state->raw_edges.len >= state->max_edges)
+        return set_error(error, "Mermaid edge limit exceeded");
+    edge.from_id = tinta_str8_dup(from->id.data, from->id.len);
+    edge.to_id = tinta_str8_dup(to->id.data, to->id.len);
+    edge.label = tinta_str8_dup(arrow->label.data ? arrow->label.data : "",
+                                arrow->label.len);
+    edge.directed = arrow->directed;
+    edge.dashed = arrow->dashed;
+    edge.stroke_scale = arrow->stroke_scale;
+    if (!edge.from_id || !edge.to_id || !edge.label ||
+        !tinta_vec_push(&state->raw_edges, &edge)) {
+        raw_edge_destroy(&edge);
+        return set_error(error, "Out of memory");
+    }
+    return true;
+}
+
+static bool add_style_assignment(ParseState *state, View id,
+                                 const TintaMermaidStyle *style,
+                                 char **error) {
+    StyleAssignment assignment;
+    memset(&assignment, 0, sizeof(assignment));
+    assignment.id = tinta_str8_dup(id.data, id.len);
+    assignment.style = *style;
+    if (!assignment.id ||
+        !tinta_vec_push(&state->style_assignments, &assignment)) {
+        style_assignment_destroy(&assignment);
+        return set_error(error, "Out of memory");
+    }
+    return true;
+}
+
+static bool add_class_assignment(ParseState *state, View id, View class_name,
+                                 size_t source_offset, char **error) {
+    ClassAssignment assignment;
+    memset(&assignment, 0, sizeof(assignment));
+    assignment.id = tinta_str8_dup(id.data, id.len);
+    assignment.class_name = tinta_str8_dup(class_name.data, class_name.len);
+    assignment.source_offset = source_offset;
+    if (!assignment.id || !assignment.class_name ||
+        !tinta_vec_push(&state->class_assignments, &assignment)) {
+        class_assignment_destroy(&assignment);
+        return set_error(error, "Out of memory");
+    }
+    return true;
+}
+
 static bool parse_direction(View value, TintaMermaidDirection *direction) {
     if (view_eq_text_icase(value, "TB") || view_eq_text_icase(value, "TD"))
         *direction = TINTA_MERMAID_TOP_TO_BOTTOM;
@@ -587,6 +909,110 @@ static bool parse_direction(View value, TintaMermaidDirection *direction) {
     else if (view_eq_text_icase(value, "LR")) *direction = TINTA_MERMAID_LEFT_TO_RIGHT;
     else if (view_eq_text_icase(value, "RL")) *direction = TINTA_MERMAID_RIGHT_TO_LEFT;
     else return false;
+    return true;
+}
+
+static bool ensure_named_placeholder(ParseState *state, const char *id,
+                                     size_t source_offset, char **error) {
+    NodeSpec spec;
+    size_t index;
+    if (!node_spec_init(&spec)) return set_error(error, "Out of memory");
+    if (!tinta_str8_assign(&spec.id, id, strlen(id)) ||
+        !tinta_str8_assign(&spec.label, id, strlen(id))) {
+        node_spec_destroy(&spec);
+        return set_error(error, "Out of memory");
+    }
+    spec.source_offset = source_offset;
+    if (!ensure_node(state, &spec, &index, error)) {
+        node_spec_destroy(&spec);
+        return false;
+    }
+    node_spec_destroy(&spec);
+    return true;
+}
+
+static bool resolve_symbol(ParseState *state, const char *id,
+                           bool *subgraph, size_t *index) {
+    size_t value;
+    if (tinta_map_get(&state->subgraph_ids, id, strlen(id), &value)) {
+        *subgraph = true;
+        *index = value;
+        return true;
+    }
+    if (tinta_map_get(&state->node_ids, id, strlen(id), &value)) {
+        *subgraph = false;
+        *index = value;
+        return true;
+    }
+    return false;
+}
+
+static bool finalize_assignments(ParseState *state, char **error) {
+    size_t i;
+    for (i = 0; i < state->style_assignments.len; i++) {
+        StyleAssignment *assignment = TINTA_VEC_PTR(
+            StyleAssignment, state->style_assignments, i);
+        bool is_subgraph;
+        size_t index;
+        if (!resolve_symbol(state, assignment->id, &is_subgraph, &index)) {
+            if (!ensure_named_placeholder(state, assignment->id, 0, error) ||
+                !resolve_symbol(state, assignment->id, &is_subgraph, &index))
+                return false;
+        }
+        if (is_subgraph)
+            merge_style(&TINTA_VEC_AT(TintaMermaidSubgraph,
+                state->subgraphs, index).style, &assignment->style);
+        else
+            merge_style(&TINTA_VEC_AT(TintaMermaidNode,
+                state->nodes, index).style, &assignment->style);
+    }
+    for (i = 0; i < state->class_assignments.len; i++) {
+        ClassAssignment *assignment = TINTA_VEC_PTR(
+            ClassAssignment, state->class_assignments, i);
+        bool is_subgraph;
+        size_t index;
+        char **target;
+        char *copy;
+        if (!resolve_symbol(state, assignment->id, &is_subgraph, &index)) {
+            if (!ensure_named_placeholder(state, assignment->id,
+                    assignment->source_offset, error) ||
+                !resolve_symbol(state, assignment->id,
+                                &is_subgraph, &index)) return false;
+        }
+        target = is_subgraph ?
+            &TINTA_VEC_AT(TintaMermaidSubgraph,
+                state->subgraphs, index).class_name :
+            &TINTA_VEC_AT(TintaMermaidNode,
+                state->nodes, index).class_name;
+        copy = tinta_str8_dup(assignment->class_name,
+                              strlen(assignment->class_name));
+        if (!copy) return set_error(error, "Out of memory");
+        free(*target);
+        *target = copy;
+    }
+    return true;
+}
+
+static bool finalize_edges(ParseState *state, char **error) {
+    size_t i;
+    for (i = 0; i < state->raw_edges.len; i++) {
+        RawEdge *raw = TINTA_VEC_PTR(RawEdge, state->raw_edges, i);
+        TintaMermaidEdge edge;
+        memset(&edge, 0, sizeof(edge));
+        if (!resolve_symbol(state, raw->from_id,
+                            &edge.from_subgraph, &edge.from) ||
+            !resolve_symbol(state, raw->to_id,
+                            &edge.to_subgraph, &edge.to))
+            return set_error(error, "Unknown Mermaid edge endpoint");
+        edge.label = tinta_str8_dup(raw->label, strlen(raw->label));
+        edge.directed = raw->directed;
+        edge.dashed = raw->dashed;
+        edge.stroke_scale = raw->stroke_scale;
+        if (!edge.label || !tinta_vec_push(&state->edges, &edge)) {
+            edge_destroy(&edge);
+            return set_error(error, "Out of memory");
+        }
+    }
     return true;
 }
 
@@ -650,6 +1076,7 @@ TintaMermaidParseResult tinta_mermaid_parse_limited(
         return result;
     }
     if (!parse_state_init(&state)) {
+        parse_state_destroy(&state);
         result.error = tinta_str8_dup("Out of memory", 13);
         return result;
     }
@@ -704,33 +1131,18 @@ TintaMermaidParseResult tinta_mermaid_parse_limited(
                 while (id_position <= ids.len) {
                     size_t comma = find_char(ids, ',', id_position);
                     View id;
-                    NodeSpec spec;
-                    size_t index;
                     if (comma == SIZE_MAX) comma = ids.len;
                     id = trim(view_make(ids.data + id_position, comma - id_position));
-                    if (id.len) {
-                        node_spec_init(&spec);
-                        if (!tinta_str8_assign(&spec.id, id.data, id.len) ||
-                            !tinta_str8_assign(&spec.label, id.data, id.len) ||
-                            !tinta_str8_assign(&spec.class_name, class_name.data, class_name.len)) {
-                            node_spec_destroy(&spec);
-                            return fail_result(&state, normalized, line_number, error);
-                        }
-                        spec.source_offset = line_offset;
-                        if (!ensure_node(&state, &spec, &index)) {
-                            node_spec_destroy(&spec);
-                            return fail_result(&state, normalized, line_number, error);
-                        }
-                        node_spec_destroy(&spec);
-                    }
+                    if (id.len && !add_class_assignment(
+                            &state, id, class_name, line_offset, &error))
+                        return fail_result(&state, normalized,
+                                           line_number, error);
                     if (comma == ids.len) break;
                     id_position = comma + 1;
                 }
             } else if (view_eq_text_icase(keyword, "style")) {
                 View id = read_word(line, &position);
                 TintaMermaidStyle style;
-                NodeSpec spec;
-                size_t index;
                 memset(&style, 0, sizeof(style)); style.stroke_width = 1.0f;
                 if (!id.len) {
                     set_error(&error, "Expected a node ID after style");
@@ -738,21 +1150,40 @@ TintaMermaidParseResult tinta_mermaid_parse_limited(
                 }
                 if (!parse_style_list(trim(view_make(line.data + position, line.len - position)), &style, &error))
                     return fail_result(&state, normalized, line_number, error);
-                node_spec_init(&spec);
-                if (!tinta_str8_assign(&spec.id, id.data, id.len) ||
-                    !tinta_str8_assign(&spec.label, id.data, id.len)) {
-                    node_spec_destroy(&spec);
+                if (!add_style_assignment(&state, id, &style, &error))
                     return fail_result(&state, normalized, line_number, error);
+            } else if (view_eq_text_icase(keyword, "subgraph")) {
+                if (!parse_subgraph_declaration(
+                        &state, view_make(line.data + position,
+                                         line.len - position),
+                        line_offset, &error))
+                    return fail_result(&state, normalized,
+                                       line_number, error);
+            } else if (view_eq_text_icase(keyword, "end")) {
+                if (!state.subgraph_stack.len ||
+                    trim(view_make(line.data + position,
+                                   line.len - position)).len) {
+                    set_error(&error, "Unexpected Mermaid subgraph end");
+                    return fail_result(&state, normalized,
+                                       line_number, error);
                 }
-                spec.source_offset = line_offset;
-                if (!ensure_node(&state, &spec, &index)) {
-                    node_spec_destroy(&spec);
-                    return fail_result(&state, normalized, line_number, error);
+                state.subgraph_stack.len--;
+            } else if (view_eq_text_icase(keyword, "direction")) {
+                TintaMermaidDirection direction;
+                size_t parent = current_subgraph(&state);
+                View value = trim(view_make(line.data + position,
+                                            line.len - position));
+                if (parent == SIZE_MAX || !parse_direction(value, &direction)) {
+                    set_error(&error, "Invalid subgraph direction");
+                    return fail_result(&state, normalized,
+                                       line_number, error);
                 }
-                node_spec_destroy(&spec);
-                merge_style(&TINTA_VEC_AT(TintaMermaidNode, state.nodes, index).style, &style);
-            } else if (view_eq_text_icase(keyword, "subgraph") || view_eq_text_icase(keyword, "end") ||
-                       view_eq_text_icase(keyword, "click") || view_eq_text_icase(keyword, "linkStyle")) {
+                TINTA_VEC_AT(TintaMermaidSubgraph,
+                             state.subgraphs, parent).direction = direction;
+                TINTA_VEC_AT(TintaMermaidSubgraph,
+                             state.subgraphs, parent).has_direction = true;
+            } else if (view_eq_text_icase(keyword, "click") ||
+                       view_eq_text_icase(keyword, "linkStyle")) {
                 set_error(&error, "This Mermaid flowchart statement is not supported");
                 return fail_result(&state, normalized, line_number, error);
             } else {
@@ -760,45 +1191,38 @@ TintaMermaidParseResult tinta_mermaid_parse_limited(
                 size_t current_node;
                 position = 0;
                 node_spec_init(&current);
+                current.parent_subgraph = current_subgraph(&state);
                 if (!parse_node_spec(line, &position, line_offset, &current, &error) ||
-                    !ensure_node(&state, &current, &current_node)) {
+                    !ensure_node(&state, &current, &current_node, &error)) {
                     node_spec_destroy(&current);
                     return fail_result(&state, normalized, line_number, error);
                 }
-                node_spec_destroy(&current);
                 for (;;) {
                     ArrowSpec arrow;
                     NodeSpec next;
                     size_t next_node;
-                    TintaMermaidEdge edge;
                     skip_spaces(line, &position);
                     if (position >= line.len) break;
                     arrow_spec_init(&arrow);
                     node_spec_init(&next);
+                    next.parent_subgraph = current_subgraph(&state);
                     if (!parse_arrow(line, &position, &arrow, &error) ||
                         !parse_node_spec(line, &position, line_offset, &next, &error) ||
-                        !ensure_node(&state, &next, &next_node)) {
+                        !ensure_node(&state, &next, &next_node, &error) ||
+                        !add_raw_edge(&state, &current, &next,
+                                      &arrow, &error)) {
                         arrow_spec_destroy(&arrow);
                         node_spec_destroy(&next);
+                        node_spec_destroy(&current);
                         return fail_result(&state, normalized, line_number, error);
                     }
-                    memset(&edge, 0, sizeof(edge));
-                    edge.from = current_node;
-                    edge.to = next_node;
-                    edge.label = tinta_str8_dup(arrow.label.data ? arrow.label.data : "", arrow.label.len);
-                    edge.directed = arrow.directed;
-                    edge.dashed = arrow.dashed;
-                    edge.stroke_scale = arrow.stroke_scale;
                     arrow_spec_destroy(&arrow);
-                    node_spec_destroy(&next);
-                    if ((state.max_edges &&
-                         state.edges.len >= state.max_edges) ||
-                        !edge.label || !tinta_vec_push(&state.edges, &edge)) {
-                        edge_destroy(&edge);
-                        return fail_result(&state, normalized, line_number, error);
-                    }
+                    node_spec_destroy(&current);
+                    current = next;
+                    memset(&next, 0, sizeof(next));
                     current_node = next_node;
                 }
+                node_spec_destroy(&current);
             }
         }
         if (line_end == length) break;
@@ -808,8 +1232,15 @@ TintaMermaidParseResult tinta_mermaid_parse_limited(
         set_error(&error, "Only Mermaid flowchart and graph diagrams are supported");
         return fail_result(&state, normalized, 0, error);
     }
-    if (!state.nodes.len) {
-        set_error(&error, "The Mermaid flowchart has no nodes");
+    if (state.subgraph_stack.len) {
+        set_error(&error, "Unterminated Mermaid subgraph");
+        return fail_result(&state, normalized, line_number, error);
+    }
+    if (!finalize_assignments(&state, &error) ||
+        !finalize_edges(&state, &error))
+        return fail_result(&state, normalized, line_number, error);
+    if (!state.nodes.len && !state.subgraphs.len) {
+        set_error(&error, "The Mermaid flowchart has no nodes or subgraphs");
         return fail_result(&state, normalized, 0, error);
     }
     result.diagram.direction = state.direction;
@@ -817,10 +1248,14 @@ TintaMermaidParseResult tinta_mermaid_parse_limited(
     result.diagram.node_count = state.nodes.len;
     result.diagram.edges = (TintaMermaidEdge *)state.edges.data;
     result.diagram.edge_count = state.edges.len;
+    result.diagram.subgraphs = (TintaMermaidSubgraph *)state.subgraphs.data;
+    result.diagram.subgraph_count = state.subgraphs.len;
     result.diagram.class_styles = (TintaMermaidClassStyle *)state.class_styles.data;
     result.diagram.class_style_count = state.class_styles.len;
-    state.nodes.data = state.edges.data = state.class_styles.data = NULL;
-    state.nodes.len = state.edges.len = state.class_styles.len = 0;
+    state.nodes.data = state.edges.data = state.subgraphs.data =
+        state.class_styles.data = NULL;
+    state.nodes.len = state.edges.len = state.subgraphs.len =
+        state.class_styles.len = 0;
     parse_state_destroy(&state);
     free(normalized);
     result.success = true;
@@ -836,12 +1271,25 @@ void tinta_mermaid_parse_result_destroy(TintaMermaidParseResult *result) {
     if (!result) return;
     for (i = 0; i < result->diagram.node_count; i++) node_destroy(&result->diagram.nodes[i]);
     for (i = 0; i < result->diagram.edge_count; i++) edge_destroy(&result->diagram.edges[i]);
+    for (i = 0; i < result->diagram.subgraph_count; i++)
+        subgraph_destroy(&result->diagram.subgraphs[i]);
     for (i = 0; i < result->diagram.class_style_count; i++) class_style_destroy(&result->diagram.class_styles[i]);
     free(result->diagram.nodes);
     free(result->diagram.edges);
+    free(result->diagram.subgraphs);
     free(result->diagram.class_styles);
     free(result->error);
     memset(result, 0, sizeof(*result));
+}
+
+const TintaMermaidSubgraph *tinta_mermaid_find_subgraph(
+        const TintaMermaidDiagram *diagram, const char *id) {
+    size_t i;
+    if (!diagram || !id) return NULL;
+    for (i = 0; i < diagram->subgraph_count; i++)
+        if (strcmp(diagram->subgraphs[i].id, id) == 0)
+            return &diagram->subgraphs[i];
+    return NULL;
 }
 
 const TintaMermaidNode *tinta_mermaid_find_node(const TintaMermaidDiagram *diagram,
@@ -881,20 +1329,65 @@ static float barycenter(size_t node, const IndexList *incoming, const size_t *ra
     return count ? total / (float)count : (float)node;
 }
 
-TintaMermaidLayout tinta_mermaid_layout(const TintaMermaidDiagram *diagram,
-                                         const TintaMermaidSize *node_sizes,
-                                         size_t node_size_count,
-                                         float node_gap, float rank_gap) {
-    TintaMermaidLayout result;
+typedef struct FlatLayout {
+    TintaMermaidRect *items;
+    size_t *ranks;
+    size_t count;
+    float width;
+    float height;
+} FlatLayout;
+
+typedef struct ScopeItem {
+    bool subgraph;
+    size_t index;
+    TintaMermaidSize size;
+} ScopeItem;
+
+typedef struct ScopeProjection {
+    bool from_subgraph;
+    bool to_subgraph;
+    size_t from;
+    size_t to;
+} ScopeProjection;
+
+typedef struct ScopeLists {
+    TintaVec nodes;
+    TintaVec subgraphs;
+    TintaVec projections;
+} ScopeLists;
+
+typedef struct HierarchyLayoutContext {
+    const TintaMermaidDiagram *diagram;
+    const TintaMermaidSize *node_sizes;
+    const TintaMermaidSize *title_sizes;
+    float scale_factor;
+    float node_gap;
+    float rank_gap;
+    TintaMermaidLayout *result;
+    ScopeLists *scopes;
+    size_t scope_count;
+} HierarchyLayoutContext;
+
+static void flat_layout_destroy(FlatLayout *layout) {
+    if (!layout) return;
+    free(layout->items);
+    free(layout->ranks);
+    memset(layout, 0, sizeof(*layout));
+}
+
+static FlatLayout layout_flat(TintaMermaidDirection direction,
+                              const TintaMermaidSize *sizes, size_t n,
+                              const LayoutEdge *edges, size_t edge_count,
+                              float node_gap, float rank_gap) {
+    FlatLayout result;
     IndexList *outgoing = NULL, *incoming = NULL, *levels = NULL;
     size_t *indegree = NULL, *rank = NULL, *queue = NULL;
     bool *processed = NULL;
     float *order = NULL, *rank_widths = NULL, *rank_heights = NULL;
-    size_t n, i, max_rank = 0, queue_head = 0, queue_tail = 0, next_rank;
+    size_t i, max_rank = 0, queue_head = 0, queue_tail = 0, next_rank;
     bool processed_any = false;
     memset(&result, 0, sizeof(result));
-    if (!diagram || !node_sizes || !diagram->node_count || node_size_count != diagram->node_count) return result;
-    n = diagram->node_count;
+    if (!n) return result;
     node_gap = maxf(0.0f, node_gap);
     rank_gap = maxf(0.0f, rank_gap);
     outgoing = (IndexList *)calloc(n, sizeof(*outgoing));
@@ -909,8 +1402,8 @@ TintaMermaidLayout tinta_mermaid_layout(const TintaMermaidDiagram *diagram,
         tinta_vec_init(&outgoing[i].values, sizeof(size_t));
         tinta_vec_init(&incoming[i].values, sizeof(size_t));
     }
-    for (i = 0; i < diagram->edge_count; i++) {
-        const TintaMermaidEdge *edge = &diagram->edges[i];
+    for (i = 0; i < edge_count; i++) {
+        const LayoutEdge *edge = &edges[i];
         if (edge->from >= n || edge->to >= n) continue;
         if (!tinta_vec_push(&outgoing[edge->from].values, &edge->to) ||
             !tinta_vec_push(&incoming[edge->to].values, &edge->from)) goto cleanup;
@@ -934,13 +1427,13 @@ TintaMermaidLayout tinta_mermaid_layout(const TintaMermaidDiagram *diagram,
     levels = (IndexList *)calloc(max_rank + 1, sizeof(*levels));
     rank_widths = (float *)calloc(max_rank + 1, sizeof(*rank_widths));
     rank_heights = (float *)calloc(max_rank + 1, sizeof(*rank_heights));
-    result.nodes = (TintaMermaidRect *)calloc(n, sizeof(*result.nodes));
+    result.items = (TintaMermaidRect *)calloc(n, sizeof(*result.items));
     result.ranks = (size_t *)malloc(n * sizeof(*result.ranks));
-    if (!levels || !rank_widths || !rank_heights || !result.nodes || !result.ranks) goto cleanup;
+    if (!levels || !rank_widths || !rank_heights || !result.items || !result.ranks) goto cleanup;
     for (i = 0; i <= max_rank; i++) tinta_vec_init(&levels[i].values, sizeof(size_t));
     for (i = 0; i < n; i++) if (!tinta_vec_push(&levels[rank[i]].values, &i)) goto cleanup;
     memcpy(result.ranks, rank, n * sizeof(*rank));
-    result.node_count = result.rank_count = n;
+    result.count = n;
     for (i = 0; i <= max_rank; i++) {
         TintaVec *nodes = &levels[i].values;
         size_t j;
@@ -959,14 +1452,14 @@ TintaMermaidLayout tinta_mermaid_layout(const TintaMermaidDiagram *diagram,
         }
         for (j = 0; j < nodes->len; j++) order[TINTA_VEC_AT(size_t, *nodes, j)] = (float)j;
     }
-    if (diagram->direction == TINTA_MERMAID_TOP_TO_BOTTOM || diagram->direction == TINTA_MERMAID_BOTTOM_TO_TOP) {
+    if (direction == TINTA_MERMAID_TOP_TO_BOTTOM || direction == TINTA_MERMAID_BOTTOM_TO_TOP) {
         float y = 0.0f;
         for (i = 0; i <= max_rank; i++) {
             size_t j;
             for (j = 0; j < levels[i].values.len; j++) {
                 size_t node = TINTA_VEC_AT(size_t, levels[i].values, j);
-                rank_widths[i] += maxf(1.0f, node_sizes[node].width);
-                rank_heights[i] = maxf(rank_heights[i], maxf(1.0f, node_sizes[node].height));
+                rank_widths[i] += maxf(1.0f, sizes[node].width);
+                rank_heights[i] = maxf(rank_heights[i], maxf(1.0f, sizes[node].height));
             }
             if (levels[i].values.len > 1) rank_widths[i] += node_gap * (float)(levels[i].values.len - 1);
             result.width = maxf(result.width, rank_widths[i]);
@@ -976,22 +1469,22 @@ TintaMermaidLayout tinta_mermaid_layout(const TintaMermaidDiagram *diagram,
             size_t j;
             for (j = 0; j < levels[i].values.len; j++) {
                 size_t node = TINTA_VEC_AT(size_t, levels[i].values, j);
-                float width = maxf(1.0f, node_sizes[node].width);
-                float height = maxf(1.0f, node_sizes[node].height);
+                float width = maxf(1.0f, sizes[node].width);
+                float height = maxf(1.0f, sizes[node].height);
                 float node_y = y + (rank_heights[i] - height) * 0.5f;
-                result.nodes[node].left = x; result.nodes[node].top = node_y;
-                result.nodes[node].right = x + width; result.nodes[node].bottom = node_y + height;
+                result.items[node].left = x; result.items[node].top = node_y;
+                result.items[node].right = x + width; result.items[node].bottom = node_y + height;
                 x += width + node_gap;
             }
             y += rank_heights[i];
             if (i < max_rank) y += rank_gap;
         }
         result.height = y;
-        if (diagram->direction == TINTA_MERMAID_BOTTOM_TO_TOP) {
+        if (direction == TINTA_MERMAID_BOTTOM_TO_TOP) {
             for (i = 0; i < n; i++) {
-                float old_top = result.nodes[i].top;
-                result.nodes[i].top = result.height - result.nodes[i].bottom;
-                result.nodes[i].bottom = result.height - old_top;
+                float old_top = result.items[i].top;
+                result.items[i].top = result.height - result.items[i].bottom;
+                result.items[i].bottom = result.height - old_top;
             }
         }
     } else {
@@ -1000,8 +1493,8 @@ TintaMermaidLayout tinta_mermaid_layout(const TintaMermaidDiagram *diagram,
             size_t j;
             for (j = 0; j < levels[i].values.len; j++) {
                 size_t node = TINTA_VEC_AT(size_t, levels[i].values, j);
-                rank_widths[i] = maxf(rank_widths[i], maxf(1.0f, node_sizes[node].width));
-                rank_heights[i] += maxf(1.0f, node_sizes[node].height);
+                rank_widths[i] = maxf(rank_widths[i], maxf(1.0f, sizes[node].width));
+                rank_heights[i] += maxf(1.0f, sizes[node].height);
             }
             if (levels[i].values.len > 1) rank_heights[i] += node_gap * (float)(levels[i].values.len - 1);
             result.height = maxf(result.height, rank_heights[i]);
@@ -1011,22 +1504,22 @@ TintaMermaidLayout tinta_mermaid_layout(const TintaMermaidDiagram *diagram,
             size_t j;
             for (j = 0; j < levels[i].values.len; j++) {
                 size_t node = TINTA_VEC_AT(size_t, levels[i].values, j);
-                float width = maxf(1.0f, node_sizes[node].width);
-                float height = maxf(1.0f, node_sizes[node].height);
+                float width = maxf(1.0f, sizes[node].width);
+                float height = maxf(1.0f, sizes[node].height);
                 float node_x = x + (rank_widths[i] - width) * 0.5f;
-                result.nodes[node].left = node_x; result.nodes[node].top = y;
-                result.nodes[node].right = node_x + width; result.nodes[node].bottom = y + height;
+                result.items[node].left = node_x; result.items[node].top = y;
+                result.items[node].right = node_x + width; result.items[node].bottom = y + height;
                 y += height + node_gap;
             }
             x += rank_widths[i];
             if (i < max_rank) x += rank_gap;
         }
         result.width = x;
-        if (diagram->direction == TINTA_MERMAID_RIGHT_TO_LEFT) {
+        if (direction == TINTA_MERMAID_RIGHT_TO_LEFT) {
             for (i = 0; i < n; i++) {
-                float old_left = result.nodes[i].left;
-                result.nodes[i].left = result.width - result.nodes[i].right;
-                result.nodes[i].right = result.width - old_left;
+                float old_left = result.items[i].left;
+                result.items[i].left = result.width - result.items[i].right;
+                result.items[i].right = result.width - old_left;
             }
         }
     }
@@ -1037,13 +1530,291 @@ cleanup:
     index_lists_destroy(levels, levels ? max_rank + 1 : 0);
     free(indegree); free(rank); free(queue); free(processed); free(order);
     free(rank_widths); free(rank_heights);
-    if (result.node_count != n) tinta_mermaid_layout_destroy(&result);
+    if (result.count != n) flat_layout_destroy(&result);
+    return result;
+}
+
+static bool endpoint_direct_child(const TintaMermaidDiagram *diagram,
+                                  size_t scope, bool endpoint_subgraph,
+                                  size_t endpoint, bool *child_subgraph,
+                                  size_t *child_index) {
+    size_t group;
+    if (endpoint_subgraph) {
+        if (endpoint >= diagram->subgraph_count || endpoint == scope)
+            return false;
+        group = endpoint;
+    } else {
+        if (endpoint >= diagram->node_count) return false;
+        group = diagram->nodes[endpoint].parent_subgraph;
+        if (group == scope) {
+            *child_subgraph = false;
+            *child_index = endpoint;
+            return true;
+        }
+        if (group == SIZE_MAX) return false;
+    }
+    while (group < diagram->subgraph_count &&
+           diagram->subgraphs[group].parent_subgraph != scope) {
+        group = diagram->subgraphs[group].parent_subgraph;
+        if (group == SIZE_MAX) return false;
+    }
+    if (group >= diagram->subgraph_count) return false;
+    *child_subgraph = true;
+    *child_index = group;
+    return true;
+}
+
+static size_t scope_item_index(const TintaVec *items, bool subgraph,
+                               size_t index) {
+    size_t i;
+    for (i = 0; i < items->len; i++) {
+        const ScopeItem *item = TINTA_VEC_PTR(ScopeItem, *items, i);
+        if (item->subgraph == subgraph && item->index == index) return i;
+    }
+    return SIZE_MAX;
+}
+
+static size_t scope_slot(const HierarchyLayoutContext *context,
+                         size_t scope) {
+    return scope == SIZE_MAX ? context->diagram->subgraph_count : scope;
+}
+
+static void scope_lists_destroy(HierarchyLayoutContext *context) {
+    size_t i;
+    if (!context || !context->scopes) return;
+    for (i = 0; i < context->scope_count; i++) {
+        tinta_vec_destroy(&context->scopes[i].nodes);
+        tinta_vec_destroy(&context->scopes[i].subgraphs);
+        tinta_vec_destroy(&context->scopes[i].projections);
+    }
+    free(context->scopes);
+    context->scopes = NULL;
+    context->scope_count = 0;
+}
+
+static bool scope_lists_build(HierarchyLayoutContext *context) {
+    const TintaMermaidDiagram *diagram = context->diagram;
+    size_t i;
+    context->scope_count = diagram->subgraph_count + 1;
+    context->scopes = (ScopeLists *)calloc(
+        context->scope_count, sizeof(*context->scopes));
+    if (!context->scopes) return false;
+    for (i = 0; i < context->scope_count; i++) {
+        if (!tinta_vec_init(&context->scopes[i].nodes, sizeof(size_t)) ||
+            !tinta_vec_init(&context->scopes[i].subgraphs, sizeof(size_t)) ||
+            !tinta_vec_init(&context->scopes[i].projections,
+                            sizeof(ScopeProjection))) return false;
+    }
+    for (i = 0; i < diagram->node_count; i++) {
+        size_t slot = diagram->nodes[i].parent_subgraph == SIZE_MAX ?
+            diagram->subgraph_count : diagram->nodes[i].parent_subgraph;
+        if (slot >= context->scope_count ||
+            !tinta_vec_push(&context->scopes[slot].nodes, &i)) return false;
+    }
+    for (i = 0; i < diagram->subgraph_count; i++) {
+        size_t slot = diagram->subgraphs[i].parent_subgraph == SIZE_MAX ?
+            diagram->subgraph_count : diagram->subgraphs[i].parent_subgraph;
+        if (slot >= context->scope_count ||
+            !tinta_vec_push(&context->scopes[slot].subgraphs, &i)) return false;
+    }
+    for (i = 0; i < diagram->edge_count; i++) {
+        const TintaMermaidEdge *edge = &diagram->edges[i];
+        size_t scope = SIZE_MAX;
+        size_t depth;
+        for (depth = 0; depth <= 64; depth++) {
+            ScopeProjection projection;
+            if (!endpoint_direct_child(diagram, scope,
+                    edge->from_subgraph, edge->from,
+                    &projection.from_subgraph, &projection.from) ||
+                !endpoint_direct_child(diagram, scope,
+                    edge->to_subgraph, edge->to,
+                    &projection.to_subgraph, &projection.to)) break;
+            if (projection.from_subgraph == projection.to_subgraph &&
+                projection.from == projection.to) {
+                if (!projection.from_subgraph) break;
+                scope = projection.from;
+                continue;
+            }
+            if (!tinta_vec_push(
+                    &context->scopes[scope_slot(context, scope)].projections,
+                    &projection)) return false;
+            break;
+        }
+    }
+    return true;
+}
+
+static void translate_subgraph_tree(HierarchyLayoutContext *context,
+                                    size_t group, float dx, float dy) {
+    const ScopeLists *children =
+        &context->scopes[scope_slot(context, group)];
+    size_t i;
+    TintaMermaidRect *rect = &context->result->subgraphs[group];
+    rect->left += dx; rect->right += dx;
+    rect->top += dy; rect->bottom += dy;
+    for (i = 0; i < children->nodes.len; i++) {
+        size_t node_index = TINTA_VEC_AT(size_t, children->nodes, i);
+        TintaMermaidRect *node = &context->result->nodes[node_index];
+        node->left += dx; node->right += dx;
+        node->top += dy; node->bottom += dy;
+    }
+    for (i = 0; i < children->subgraphs.len; i++)
+        translate_subgraph_tree(context,
+            TINTA_VEC_AT(size_t, children->subgraphs, i), dx, dy);
+}
+
+static bool layout_scope(HierarchyLayoutContext *context, size_t scope,
+                         TintaMermaidDirection inherited,
+                         float *out_width, float *out_height) {
+    const TintaMermaidDiagram *diagram = context->diagram;
+    const ScopeLists *scope_lists =
+        &context->scopes[scope_slot(context, scope)];
+    TintaVec items = {0};
+    TintaVec edges = {0};
+    TintaMermaidDirection direction = inherited;
+    FlatLayout flat;
+    size_t i;
+    float width;
+    float height;
+    float offset_x = 0;
+    float offset_y = 0;
+    bool ok = false;
+    memset(&flat, 0, sizeof(flat));
+    if (!tinta_vec_init(&items, sizeof(ScopeItem)) ||
+        !tinta_vec_init(&edges, sizeof(LayoutEdge))) goto cleanup;
+    if (scope != SIZE_MAX) {
+        const TintaMermaidSubgraph *group = &diagram->subgraphs[scope];
+        if (group->has_direction) direction = group->direction;
+    }
+    for (i = 0; i < scope_lists->nodes.len; i++) {
+        ScopeItem item;
+        item.subgraph = false;
+        item.index = TINTA_VEC_AT(size_t, scope_lists->nodes, i);
+        item.size = context->node_sizes[item.index];
+        if (!tinta_vec_push(&items, &item)) goto cleanup;
+    }
+    for (i = 0; i < scope_lists->subgraphs.len; i++) {
+        ScopeItem item;
+        item.subgraph = true;
+        item.index = TINTA_VEC_AT(size_t, scope_lists->subgraphs, i);
+        if (!layout_scope(context, item.index, direction,
+                          &item.size.width, &item.size.height) ||
+            !tinta_vec_push(&items, &item)) goto cleanup;
+    }
+    for (i = 0; i < scope_lists->projections.len; i++) {
+        const ScopeProjection *source = TINTA_VEC_PTR(
+            ScopeProjection, scope_lists->projections, i);
+        LayoutEdge edge;
+        edge.from = scope_item_index(&items,
+            source->from_subgraph, source->from);
+        edge.to = scope_item_index(&items,
+            source->to_subgraph, source->to);
+        if (edge.from == SIZE_MAX || edge.to == SIZE_MAX ||
+            edge.from == edge.to) continue;
+        if (!tinta_vec_push(&edges, &edge)) goto cleanup;
+    }
+    if (items.len) {
+        TintaMermaidSize *sizes = (TintaMermaidSize *)calloc(
+            items.len, sizeof(*sizes));
+        if (!sizes) goto cleanup;
+        for (i = 0; i < items.len; i++)
+            sizes[i] = TINTA_VEC_AT(ScopeItem, items, i).size;
+        flat = layout_flat(direction, sizes, items.len,
+                           (const LayoutEdge *)edges.data, edges.len,
+                           context->node_gap, context->rank_gap);
+        free(sizes);
+        if (flat.count != items.len) goto cleanup;
+    }
+    width = flat.width;
+    height = flat.height;
+    if (scope != SIZE_MAX) {
+        const TintaMermaidSize title = context->title_sizes[scope];
+        float title_area = maxf(36.0f * context->scale_factor,
+                                title.height + 12.0f * context->scale_factor);
+        width = maxf(160.0f * context->scale_factor,
+            maxf(width + 40.0f * context->scale_factor,
+                 title.width + 40.0f * context->scale_factor));
+        height = maxf(84.0f * context->scale_factor,
+                      height + title_area + 20.0f * context->scale_factor);
+        offset_x = (width - flat.width) * 0.5f;
+        offset_y = title_area;
+        context->result->subgraphs[scope] =
+            (TintaMermaidRect){0, 0, width, height};
+    }
+    for (i = 0; i < items.len; i++) {
+        const ScopeItem *item = TINTA_VEC_PTR(ScopeItem, items, i);
+        const TintaMermaidRect *position = &flat.items[i];
+        float dx = position->left + offset_x;
+        float dy = position->top + offset_y;
+        if (item->subgraph)
+            translate_subgraph_tree(context, item->index, dx, dy);
+        else {
+            TintaMermaidRect *node = &context->result->nodes[item->index];
+            node->left = dx;
+            node->top = dy;
+            node->right = dx + item->size.width;
+            node->bottom = dy + item->size.height;
+            context->result->ranks[item->index] = flat.ranks ? flat.ranks[i] : 0;
+        }
+    }
+    *out_width = width;
+    *out_height = height;
+    ok = true;
+cleanup:
+    flat_layout_destroy(&flat);
+    tinta_vec_destroy(&items);
+    tinta_vec_destroy(&edges);
+    return ok;
+}
+
+TintaMermaidLayout tinta_mermaid_layout(
+        const TintaMermaidDiagram *diagram,
+        const TintaMermaidSize *node_sizes, size_t node_size_count,
+        const TintaMermaidSize *subgraph_title_sizes,
+        size_t subgraph_title_size_count,
+        float scale_factor,
+        float node_gap, float rank_gap) {
+    TintaMermaidLayout result;
+    HierarchyLayoutContext context;
+    memset(&result, 0, sizeof(result));
+    if (!diagram || node_size_count != diagram->node_count ||
+        subgraph_title_size_count != diagram->subgraph_count ||
+        (diagram->node_count && !node_sizes) ||
+        (diagram->subgraph_count && !subgraph_title_sizes)) return result;
+    result.nodes = (TintaMermaidRect *)calloc(
+        diagram->node_count ? diagram->node_count : 1, sizeof(*result.nodes));
+    result.subgraphs = (TintaMermaidRect *)calloc(
+        diagram->subgraph_count ? diagram->subgraph_count : 1,
+        sizeof(*result.subgraphs));
+    result.ranks = (size_t *)calloc(
+        diagram->node_count ? diagram->node_count : 1,
+        sizeof(*result.ranks));
+    if (!result.nodes || !result.subgraphs || !result.ranks) {
+        tinta_mermaid_layout_destroy(&result);
+        return result;
+    }
+    result.node_count = result.rank_count = diagram->node_count;
+    result.subgraph_count = diagram->subgraph_count;
+    memset(&context, 0, sizeof(context));
+    context.diagram = diagram;
+    context.node_sizes = node_sizes;
+    context.title_sizes = subgraph_title_sizes;
+    context.scale_factor = maxf(0.01f, scale_factor);
+    context.node_gap = maxf(0, node_gap);
+    context.rank_gap = maxf(0, rank_gap);
+    context.result = &result;
+    if (!scope_lists_build(&context) ||
+        !layout_scope(&context, SIZE_MAX, diagram->direction,
+                      &result.width, &result.height))
+        tinta_mermaid_layout_destroy(&result);
+    scope_lists_destroy(&context);
     return result;
 }
 
 void tinta_mermaid_layout_destroy(TintaMermaidLayout *layout) {
     if (!layout) return;
     free(layout->nodes);
+    free(layout->subgraphs);
     free(layout->ranks);
     memset(layout, 0, sizeof(*layout));
 }

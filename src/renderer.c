@@ -1804,7 +1804,9 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
     TintaStr8 source={0};
     TintaMermaidParseResult parsed;
     const TintaMermaidParseResult *cached;
-    TintaMermaidSize *sizes = NULL; TintaMermaidLayout graph; size_t i; float top = *y;
+    TintaMermaidSize *sizes = NULL;
+    TintaMermaidSize *subgraph_title_sizes = NULL;
+    TintaMermaidLayout graph; size_t i; float top = *y;
     size_t region_index = SIZE_MAX;
     size_t mermaid_block_index = SIZE_MAX;
     TintaVec label_boxes;
@@ -1825,8 +1827,13 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
         fallback = layout_code(app, element, y, left, right);
         return fallback;
     }
-    sizes = (TintaMermaidSize *)calloc(parsed.diagram.node_count, sizeof(*sizes));
-    if (!sizes) goto failed;
+    sizes = (TintaMermaidSize *)calloc(
+        parsed.diagram.node_count ? parsed.diagram.node_count : 1,
+        sizeof(*sizes));
+    subgraph_title_sizes = (TintaMermaidSize *)calloc(
+        parsed.diagram.subgraph_count ? parsed.diagram.subgraph_count : 1,
+        sizeof(*subgraph_title_sizes));
+    if (!sizes || !subgraph_title_sizes) goto failed;
     for (i = 0; i < parsed.diagram.node_count; i++) {
         TintaStr16 wide = {0};
         SIZE wrapped;
@@ -1850,6 +1857,20 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
             sizes[i].width = side;
             sizes[i].height = side;
         }
+        tinta_str16_destroy(&wide);
+    }
+    for (i = 0; i < parsed.diagram.subgraph_count; i++) {
+        TintaStr16 wide = {0};
+        SIZE wrapped;
+        if (!tinta_utf8_to_utf16(parsed.diagram.subgraphs[i].label,
+                strlen(parsed.diagram.subgraphs[i].label), &wide)) {
+            tinta_str16_destroy(&wide);
+            goto failed;
+        }
+        wrapped = measure_wrapped(app, app->bold_format,
+                                  wide.data, wide.len, scale(app, 280));
+        subgraph_title_sizes[i].width = (float)wrapped.cx;
+        subgraph_title_sizes[i].height = (float)wrapped.cy;
         tinta_str16_destroy(&wide);
     }
     {
@@ -1878,9 +1899,13 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
         }
         graph = tinta_mermaid_layout(&parsed.diagram, sizes,
                                      parsed.diagram.node_count,
+                                     subgraph_title_sizes,
+                                     parsed.diagram.subgraph_count,
+                                     scale(app, 1),
                                      scale(app, 32), rank_gap);
     }
-    if (graph.node_count != parsed.diagram.node_count) goto failed;
+    if (graph.node_count != parsed.diagram.node_count ||
+        graph.subgraph_count != parsed.diagram.subgraph_count) goto failed;
     {
         float block_top = top;
         float block_right = left + maxf(right - left, scale(app, 240));
@@ -1923,25 +1948,86 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
         offset = left + maxf(0, (block_right - left - graph.width) * 0.5f);
         float diagram_bottom = content_top + graph.height;
         size_t exterior_lane = 0;
+        for (i = 0; i < parsed.diagram.subgraph_count; i++) {
+            const TintaMermaidSubgraph *subgraph =
+                &parsed.diagram.subgraphs[i];
+            const TintaMermaidStyle *class_style =
+                tinta_mermaid_find_class_style(
+                    &parsed.diagram, subgraph->class_name);
+            TintaMermaidRect box = graph.subgraphs[i];
+            uint32_t fill = subgraph->style.has_fill ?
+                subgraph->style.fill.rgb :
+                class_style && class_style->has_fill ?
+                    class_style->fill.rgb : app->theme->code_background;
+            float opacity = subgraph->style.has_fill ?
+                subgraph->style.fill.alpha :
+                class_style && class_style->has_fill ?
+                    class_style->fill.alpha : 0.38f;
+            TintaStr16 title = {0};
+            SIZE title_size;
+            D2D1_RECT_F title_rect;
+            float title_area;
+            box.left += offset; box.right += offset;
+            box.top += content_top; box.bottom += content_top;
+            if (!add_rect_alpha(app, box.left, box.top,
+                    box.right, box.bottom, fill, opacity,
+                    scale(app, 4), false, 0)) goto failed;
+            if (!tinta_utf8_to_utf16(subgraph->label,
+                    strlen(subgraph->label), &title)) {
+                tinta_str16_destroy(&title);
+                goto failed;
+            }
+            title_size = measure_wrapped(app, app->bold_format,
+                title.data, title.len,
+                maxf(1, box.right - box.left - scale(app, 40)));
+            title_area = maxf(scale(app, 36),
+                              title_size.cy + scale(app, 12));
+            title_rect = (D2D1_RECT_F){
+                box.left + scale(app, 20),
+                box.top + maxf(0, (title_area - title_size.cy) * 0.5f),
+                box.right - scale(app, 20),
+                box.top + maxf(0, (title_area - title_size.cy) * 0.5f) +
+                    title_size.cy
+            };
+            if (!tinta_vec_push(&label_boxes, &title_rect)) {
+                tinta_str16_destroy(&title);
+                goto failed;
+            }
+            tinta_str16_destroy(&title);
+        }
         for (i = 0; i < parsed.diagram.edge_count; i++) {
             const TintaMermaidEdge *edge = &parsed.diagram.edges[i];
-            TintaMermaidRect a = graph.nodes[edge->from], b = graph.nodes[edge->to];
-            bool horizontal=parsed.diagram.direction==TINTA_MERMAID_LEFT_TO_RIGHT||parsed.diagram.direction==TINTA_MERMAID_RIGHT_TO_LEFT;
+            TintaMermaidRect a;
+            TintaMermaidRect b;
+            bool horizontal;
             ConnectorPath path = {0};
             float from_center_x, from_center_y, to_center_x, to_center_y;
-            bool self_loop = edge->from == edge->to;
+            bool self_loop = edge->from_subgraph == edge->to_subgraph &&
+                             edge->from == edge->to;
             bool skips_ranks = false;
             size_t p;
+            if ((edge->from_subgraph && edge->from >= graph.subgraph_count) ||
+                (!edge->from_subgraph && edge->from >= graph.node_count) ||
+                (edge->to_subgraph && edge->to >= graph.subgraph_count) ||
+                (!edge->to_subgraph && edge->to >= graph.node_count))
+                goto failed;
+            a = edge->from_subgraph ? graph.subgraphs[edge->from] :
+                                      graph.nodes[edge->from];
+            b = edge->to_subgraph ? graph.subgraphs[edge->to] :
+                                    graph.nodes[edge->to];
             a.left += offset; a.right += offset; a.top += content_top; a.bottom += content_top;
             b.left += offset; b.right += offset; b.top += content_top; b.bottom += content_top;
             from_center_x=(a.left+a.right)*.5f;from_center_y=(a.top+a.bottom)*.5f;
             to_center_x=(b.left+b.right)*.5f;to_center_y=(b.top+b.bottom)*.5f;
-            if(graph.ranks&&edge->from<graph.rank_count&&edge->to<graph.rank_count){
+            horizontal = fabsf(to_center_x - from_center_x) >=
+                         fabsf(to_center_y - from_center_y);
+            if(!edge->from_subgraph && !edge->to_subgraph &&
+               graph.ranks&&edge->from<graph.rank_count&&edge->to<graph.rank_count){
                 size_t from_rank=graph.ranks[edge->from],to_rank=graph.ranks[edge->to];
                 skips_ranks=(from_rank>to_rank?from_rank-to_rank:to_rank-from_rank)>1;
             }
             if(horizontal){
-                bool left_to_right=parsed.diagram.direction==TINTA_MERMAID_LEFT_TO_RIGHT;
+                bool left_to_right=to_center_x>=from_center_x;
                 bool forward=!self_loop&&!skips_ranks&&
                     (left_to_right?to_center_x>from_center_x:to_center_x<from_center_x);
                 if(self_loop){
@@ -1967,7 +2053,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                     path.points[3]=(D2D1_POINT_2F){to_center_x,b.bottom};path.count=4;
                 }
             }else{
-                bool top_to_bottom=parsed.diagram.direction==TINTA_MERMAID_TOP_TO_BOTTOM;
+                bool top_to_bottom=to_center_y>=from_center_y;
                 bool forward=!self_loop&&!skips_ranks&&
                     (top_to_bottom?to_center_y>from_center_y:to_center_y<from_center_y);
                 if(self_loop){
@@ -2135,6 +2221,74 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
             }
             tinta_str16_destroy(&wide);
         }
+        for (i = 0; i < parsed.diagram.subgraph_count; i++) {
+            const TintaMermaidSubgraph *subgraph =
+                &parsed.diagram.subgraphs[i];
+            const TintaMermaidStyle *class_style =
+                tinta_mermaid_find_class_style(
+                    &parsed.diagram, subgraph->class_name);
+            TintaMermaidRect box = graph.subgraphs[i];
+            uint32_t stroke = subgraph->style.has_stroke ?
+                subgraph->style.stroke.rgb :
+                class_style && class_style->has_stroke ?
+                    class_style->stroke.rgb : app->theme->quote;
+            uint32_t text = subgraph->style.has_text ?
+                subgraph->style.text.rgb :
+                class_style && class_style->has_text ?
+                    class_style->text.rgb : app->theme->text;
+            float stroke_opacity = subgraph->style.has_stroke ?
+                subgraph->style.stroke.alpha :
+                class_style && class_style->has_stroke ?
+                    class_style->stroke.alpha : 0.85f;
+            float text_opacity = subgraph->style.has_text ?
+                subgraph->style.text.alpha :
+                class_style && class_style->has_text ?
+                    class_style->text.alpha : 0.92f;
+            float stroke_width = subgraph->style.has_stroke_width ?
+                subgraph->style.stroke_width :
+                class_style && class_style->has_stroke_width ?
+                    class_style->stroke_width : 1.0f;
+            TintaStr16 title = {0};
+            SIZE title_size;
+            TintaTextRun *title_run = NULL;
+            float title_width;
+            float title_y;
+            float title_area;
+            box.left += offset; box.right += offset;
+            box.top += content_top; box.bottom += content_top;
+            if (!add_line_alpha(app, box.left, box.top,
+                    box.right, box.top, stroke,
+                    scale(app, stroke_width), stroke_opacity) ||
+                !add_line_alpha(app, box.right, box.top,
+                    box.right, box.bottom, stroke,
+                    scale(app, stroke_width), stroke_opacity) ||
+                !add_line_alpha(app, box.right, box.bottom,
+                    box.left, box.bottom, stroke,
+                    scale(app, stroke_width), stroke_opacity) ||
+                !add_line_alpha(app, box.left, box.bottom,
+                    box.left, box.top, stroke,
+                    scale(app, stroke_width), stroke_opacity)) goto failed;
+            if (!tinta_utf8_to_utf16(subgraph->label,
+                    strlen(subgraph->label), &title)) {
+                tinta_str16_destroy(&title);
+                goto failed;
+            }
+            title_width = maxf(1, box.right - box.left - scale(app, 40));
+            title_size = measure_wrapped(app, app->bold_format,
+                title.data, title.len, title_width);
+            title_area = maxf(scale(app, 36),
+                              title_size.cy + scale(app, 12));
+            title_y = box.top +
+                maxf(0, (title_area - title_size.cy) * 0.5f);
+            if (!append_centered_run_width(app, title.data, title.len,
+                    app->bold_format, text, box.left + scale(app, 20),
+                    title_y, title_width, &title_run)) {
+                tinta_str16_destroy(&title);
+                goto failed;
+            }
+            if (title_run) title_run->opacity = text_opacity;
+            tinta_str16_destroy(&title);
+        }
         {
             TintaHorizontalRegion *region = horizontal_region(app, region_index);
             if (region) region->viewport.bottom = (LONG)diagram_bottom;
@@ -2150,7 +2304,8 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                     app, region_index);
                 for (i = 0; i < parsed.diagram.edge_count; i++) {
                     size_t target = parsed.diagram.edges[i].to;
-                    if (target < parsed.diagram.node_count)
+                    if (!parsed.diagram.edges[i].to_subgraph &&
+                        target < parsed.diagram.node_count)
                         has_incoming[target] = true;
                 }
                 for (i = 0; i < parsed.diagram.node_count; i++) {
@@ -2196,10 +2351,14 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
             *y = visible_bottom + scale(app, 24);
         }
     }
-    tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return true;
+    tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source);
+    free(sizes); free(subgraph_title_sizes);
+    tinta_vec_destroy(&label_boxes); return true;
 failed:
     app->active_horizontal_region = SIZE_MAX;
-    tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return false;
+    tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source);
+    free(sizes); free(subgraph_title_sizes);
+    tinta_vec_destroy(&label_boxes); return false;
 }
 #endif
 

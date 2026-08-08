@@ -313,6 +313,92 @@ void test_mermaid_layout(TintaApp &app) {
               "expanded Mermaid restores its diagram");
     }
 }
+
+void test_mermaid_subgraph_layout(TintaApp &app) {
+    const char *source =
+        "```mermaid\n"
+        "flowchart LR\n"
+        "Start --> outer --> Finish\n"
+        "subgraph outer [Pipeline]\n"
+        "  direction TB\n"
+        "  A --> inner\n"
+        "  subgraph inner [Workers]\n"
+        "    direction RL\n"
+        "    B --> C\n"
+        "  end\n"
+        "  A --> B\n"
+        "end\n"
+        "```\n";
+    check(load(app, source), "nested Mermaid subgraph document lays out");
+    if (!app.layout_complete) return;
+    auto *pipeline = find_run(app, L"Pipeline");
+    auto *workers = find_run(app, L"Workers");
+    auto *a = find_run(app, L"A");
+    auto *b = find_run(app, L"B");
+    auto *c = find_run(app, L"C");
+    TintaDrawRect *outer = nullptr;
+    TintaDrawRect *inner = nullptr;
+    for (size_t i = 0; i < app.rects.len; i++) {
+        auto *rect = TINTA_VEC_PTR(TintaDrawRect, app.rects, i);
+        if (!rect->outline && rect->opacity > 0.37f &&
+            rect->opacity < 0.39f) {
+            if (!outer ||
+                (rect->rect.right - rect->rect.left) *
+                    (rect->rect.bottom - rect->rect.top) >
+                (outer->rect.right - outer->rect.left) *
+                    (outer->rect.bottom - outer->rect.top)) {
+                inner = outer;
+                outer = rect;
+            } else {
+                inner = rect;
+            }
+        }
+    }
+    check(outer && inner, "nested subgraph containers are rendered");
+    if (outer && inner) {
+        check(inner->rect.left >= outer->rect.left + 20 &&
+                  inner->rect.right <= outer->rect.right - 20 &&
+                  inner->rect.top >= outer->rect.top + 36 &&
+                  inner->rect.bottom <= outer->rect.bottom - 20,
+              "nested rendered group respects container padding");
+        check(pipeline && std::fabs(
+                  pipeline->x + pipeline->width * 0.5f -
+                  (outer->rect.left + outer->rect.right) * 0.5f) < 2.0f,
+              "outer subgraph title is centered");
+        check(workers && std::fabs(
+                  workers->x + workers->width * 0.5f -
+                  (inner->rect.left + inner->rect.right) * 0.5f) < 2.0f,
+              "inner subgraph title is centered");
+    }
+    check(a && b && c && a->y + a->height < b->y && b->x > c->x,
+          "nested local TB and RL directions survive rendering");
+    if (pipeline) {
+        size_t position = SIZE_MAX;
+        tinta_hit_test(&app, pipeline->x + 1, pipeline->y + 1,
+                       &position, nullptr);
+        check(position >= pipeline->doc_start &&
+                  position <= pipeline->doc_start + pipeline->doc_length,
+              "subgraph title participates in text hit testing");
+    }
+    if (app.mermaid_blocks.len == 1) {
+        auto *block = TINTA_VEC_PTR(TintaMermaidBlock,
+                                    app.mermaid_blocks, 0);
+        check(tinta_toggle_collapsible_at(
+                  &app, block->rect.left + 40,
+                  block->rect.top + 16, false) &&
+                  tinta_layout_document(&app),
+              "nested Subgraph Mermaid block collapses normally");
+        pipeline = find_run(app, L"Pipeline");
+        check(pipeline && !tinta_run_is_visually_exposed(&app, pipeline),
+              "collapsed Mermaid hides Subgraph titles");
+        check(pipeline && tinta_expand_run_block(&app, pipeline) &&
+                  tinta_layout_document(&app),
+              "Subgraph title access expands the Mermaid block");
+        pipeline = find_run(app, L"Pipeline");
+        check(pipeline && tinta_run_is_visually_exposed(&app, pipeline),
+              "expanded Mermaid restores Subgraph title geometry");
+    }
+}
 #endif
 
 }  // namespace
@@ -360,6 +446,7 @@ int main() {
     test_block_collapse(app);
 #if TINTA_ENABLE_MERMAID
     test_mermaid_layout(app);
+    test_mermaid_subgraph_layout(app);
 #endif
 
     if (app.hwnd) DestroyWindow(app.hwnd);

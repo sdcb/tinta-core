@@ -106,6 +106,9 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - Mermaid node labels are centered with shape-aware padding. Diamonds,
   hexagons, circles, and rectangles reserve dimensions appropriate to their
   outlines while retaining block-local horizontal scrolling.
+- Mermaid flowcharts support nested Subgraphs, explicit IDs and titles,
+  group endpoints, per-group directions, and `style`/`classDef` styling.
+  Groups use recursive layout so nested members remain inside their containers.
 - Wide code and Mermaid blocks scroll horizontally inside the block instead
   of widening the document. Blocks keep a 240-DIP minimum width in extremely
   narrow hosts; their internal bars support dragging, horizontal wheel input,

@@ -46,11 +46,26 @@ typedef struct TintaMermaidNode {
     char *class_name;
     TintaMermaidStyle style;
     size_t source_offset;
+    size_t parent_subgraph;
+    bool has_definition;
 } TintaMermaidNode;
+
+typedef struct TintaMermaidSubgraph {
+    char *id;
+    char *label;
+    char *class_name;
+    TintaMermaidStyle style;
+    TintaMermaidDirection direction;
+    size_t parent_subgraph;
+    size_t source_offset;
+    bool has_direction;
+} TintaMermaidSubgraph;
 
 typedef struct TintaMermaidEdge {
     size_t from;
     size_t to;
+    bool from_subgraph;
+    bool to_subgraph;
     char *label;
     bool directed;
     bool dashed;
@@ -68,6 +83,8 @@ typedef struct TintaMermaidDiagram {
     size_t node_count;
     TintaMermaidEdge *edges;
     size_t edge_count;
+    TintaMermaidSubgraph *subgraphs;
+    size_t subgraph_count;
     TintaMermaidClassStyle *class_styles;
     size_t class_style_count;
 } TintaMermaidDiagram;
@@ -94,6 +111,8 @@ typedef struct TintaMermaidRect {
 typedef struct TintaMermaidLayout {
     TintaMermaidRect *nodes;
     size_t node_count;
+    TintaMermaidRect *subgraphs;
+    size_t subgraph_count;
     size_t *ranks;
     size_t rank_count;
     float width;
@@ -106,6 +125,8 @@ TintaMermaidParseResult tinta_mermaid_parse_limited(
 void tinta_mermaid_parse_result_destroy(TintaMermaidParseResult *result);
 const TintaMermaidNode *tinta_mermaid_find_node(
     const TintaMermaidDiagram *diagram, const char *id);
+const TintaMermaidSubgraph *tinta_mermaid_find_subgraph(
+    const TintaMermaidDiagram *diagram, const char *id);
 const TintaMermaidStyle *tinta_mermaid_find_class_style(
     const TintaMermaidDiagram *diagram, const char *name);
 
@@ -113,6 +134,9 @@ TintaMermaidLayout tinta_mermaid_layout(
     const TintaMermaidDiagram *diagram,
     const TintaMermaidSize *node_sizes,
     size_t node_size_count,
+    const TintaMermaidSize *subgraph_title_sizes,
+    size_t subgraph_title_size_count,
+    float scale_factor,
     float node_gap,
     float rank_gap);
 void tinta_mermaid_layout_destroy(TintaMermaidLayout *layout);
