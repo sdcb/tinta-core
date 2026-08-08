@@ -197,6 +197,10 @@ struct TintaApp {
     float scroll_x;
     float content_height;
     float content_width;
+    float page_margin_left;
+    float page_margin_top;
+    float page_margin_right;
+    float page_margin_bottom;
     int theme_index;
     const TintaTheme *theme;
 

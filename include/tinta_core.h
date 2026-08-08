@@ -105,6 +105,15 @@ typedef struct TintaAutoSize {
     float max_height;             /* Used with TINTA_AUTOSIZE_MAX_HEIGHT. */
 } TintaAutoSize;
 
+/* Page margins in 96-DPI device-independent pixels. */
+typedef struct TintaPageMargins {
+    UINT cb_size;
+    float left;
+    float top;
+    float right;
+    float bottom;
+} TintaPageMargins;
+
 typedef struct TintaLimits {
     UINT cb_size;
     size_t max_document_bytes;    /* UTF-8 bytes, including buffered stream data. */
@@ -317,6 +326,7 @@ typedef struct TintaStats {
  * TMM_SETBASEURI        lParam = const wchar_t *; rejected during a stream.
  * TMM_SET/GETOPTIONS    lParam = TintaOptions *.
  * TMM_SET/GETAUTOSIZE   lParam = TintaAutoSize *.
+ * TMM_SET/GETPAGEMARGINS lParam = TintaPageMargins *.
  * TMM_SET/GETLIMITS     lParam = TintaLimits *.
  * TMM_SETBUILTINTHEME   wParam = TintaBuiltinTheme.
  * TMM_SETCUSTOMTHEME    lParam = const TintaThemeSpec *.
@@ -380,6 +390,8 @@ typedef struct TintaStats {
 #define TMM_GETVERSION            (TMM_FIRST + 31)
 #define TMM_GETCAPABILITIES       (TMM_FIRST + 32)
 #define TMM_GETSTATS              (TMM_FIRST + 33)
+#define TMM_SETPAGEMARGINS        (TMM_FIRST + 34)
+#define TMM_GETPAGEMARGINS        (TMM_FIRST + 35)
 
 /*
  * WM_NOTIFY codes sent synchronously to the parent window.

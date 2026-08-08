@@ -1677,7 +1677,10 @@ static void validate_document_positions(TintaApp *app) {
 
 bool tinta_layout_document(TintaApp *app) {
     uint64_t start = performance_time_us();
-    float width = viewport_width(app), margin = scale(app, 40), y = scale(app, 20);
+    float width = viewport_width(app);
+    float left = scale(app, app->page_margin_left);
+    float right = scale(app, app->page_margin_right);
+    float y = scale(app, app->page_margin_top);
     if (!app->document.root || width <= 0) {
         app->layout_complete = true;
         app->layout_dirty = false;
@@ -1685,8 +1688,9 @@ bool tinta_layout_document(TintaApp *app) {
     }
     capture_scroll_anchor(app);
     tinta_layout_clear(app); app->content_width = width;
-    if (!layout_element(app, app->document.root, &y, margin, maxf(margin + 1, width - margin))) return false;
-    app->content_height = y + scale(app, 40);
+    if (!layout_element(app, app->document.root, &y, left,
+                        maxf(left + 1, width - right))) return false;
+    app->content_height = y + scale(app, app->page_margin_bottom);
     app->layout_time_us = (size_t)(performance_time_us() - start);
     app->layout_next_block = app->document.root->child_count;
     app->layout_cursor_y = y;
@@ -1702,7 +1706,8 @@ static bool layout_incremental_chunk(TintaApp *app, DWORD time_budget_ms,
                                      float target_y) {
     const TintaElement *root = app->document.root;
     float width = viewport_width(app);
-    float margin = scale(app, 40);
+    float left = scale(app, app->page_margin_left);
+    float right = scale(app, app->page_margin_right);
     uint64_t start = performance_time_us();
     bool laid_out_block = false;
     if (!root || width <= 0) {
@@ -1712,8 +1717,8 @@ static bool layout_incremental_chunk(TintaApp *app, DWORD time_budget_ms,
     }
     while (app->layout_next_block < root->child_count) {
         const TintaElement *block = root->children[app->layout_next_block];
-        if (!layout_element(app, block, &app->layout_cursor_y, margin,
-                            maxf(margin + 1, width - margin))) return false;
+        if (!layout_element(app, block, &app->layout_cursor_y, left,
+                            maxf(left + 1, width - right))) return false;
         app->layout_next_block++;
         laid_out_block = true;
         if (app->layout_cursor_y >= target_y) break;
@@ -1722,7 +1727,8 @@ static bool layout_incremental_chunk(TintaApp *app, DWORD time_budget_ms,
     }
     app->layout_time_us += (size_t)(performance_time_us() - start);
     app->layout_complete = app->layout_next_block >= root->child_count;
-    app->content_height = app->layout_cursor_y + scale(app, 40);
+    app->content_height = app->layout_cursor_y +
+                          scale(app, app->page_margin_bottom);
     if (!laid_out_block && !root->child_count) app->layout_complete = true;
     if (app->layout_complete) validate_document_positions(app);
     restore_scroll_anchor(app, app->layout_complete);
@@ -1738,7 +1744,7 @@ bool tinta_layout_document_viewport_first(TintaApp *app) {
     app->content_height = 0;
     app->layout_time_us = 0;
     app->layout_next_block = 0;
-    app->layout_cursor_y = scale(app, 20);
+    app->layout_cursor_y = scale(app, app->page_margin_top);
     app->layout_complete = false;
     app->layout_chunk_posted = false;
     app->layout_dirty = false;

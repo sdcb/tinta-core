@@ -49,6 +49,7 @@ typedef struct TintaControl {
     bool stream_ending;
     bool content_update_pending;
     TintaAutoSize auto_size;
+    TintaPageMargins page_margins;
     unsigned int notification_depth;
     TintaStreamAsync *stream_async;
 } TintaControl;
@@ -177,6 +178,7 @@ static bool control_reentrant_message_allowed(UINT message) {
         case TMM_GETVERSION:
         case TMM_GETCAPABILITIES:
         case TMM_GETSTATS:
+        case TMM_GETPAGEMARGINS:
         case WM_GETTEXT:
         case WM_GETTEXTLENGTH:
         case WM_SIZE:
@@ -1384,6 +1386,30 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             stats->draw_calls = view->draw_calls;
             return TRUE;
         }
+        case TMM_SETPAGEMARGINS: {
+            const TintaPageMargins *margins =
+                (const TintaPageMargins *)lparam;
+            if (!margins || margins->cb_size < sizeof(*margins) ||
+                !isfinite(margins->left) || margins->left < 0 ||
+                !isfinite(margins->top) || margins->top < 0 ||
+                !isfinite(margins->right) || margins->right < 0 ||
+                !isfinite(margins->bottom) || margins->bottom < 0)
+                return FALSE;
+            control->page_margins = *margins;
+            view->page_margin_left = margins->left;
+            view->page_margin_top = margins->top;
+            view->page_margin_right = margins->right;
+            view->page_margin_bottom = margins->bottom;
+            view->layout_dirty = true;
+            InvalidateRect(view->hwnd, NULL, FALSE);
+            return TRUE;
+        }
+        case TMM_GETPAGEMARGINS: {
+            TintaPageMargins *margins = (TintaPageMargins *)lparam;
+            if (!margins || margins->cb_size < sizeof(*margins)) return FALSE;
+            *margins = control->page_margins;
+            return TRUE;
+        }
     }
     return 0;
 }
@@ -1425,6 +1451,15 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
     control->use_system_theme = true;
     control->redraw_enabled = true;
     control->auto_size.cb_size = sizeof(control->auto_size);
+    control->page_margins.cb_size = sizeof(control->page_margins);
+    control->page_margins.left = 40.0f;
+    control->page_margins.top = 20.0f;
+    control->page_margins.right = 40.0f;
+    control->page_margins.bottom = 40.0f;
+    control->view.page_margin_left = control->page_margins.left;
+    control->view.page_margin_top = control->page_margins.top;
+    control->view.page_margin_right = control->page_margins.right;
+    control->view.page_margin_bottom = control->page_margins.bottom;
     tinta_str16_init(&control->base_uri);
     tinta_str8_init(&control->stream_buffer);
     return tinta_app_update_formats(&control->view);
@@ -1446,7 +1481,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
     if (control && control->notification_depth &&
         !control_reentrant_message_allowed(message))
         return FALSE;
-    if (message >= TMM_FIRST && message <= TMM_GETSTATS && control)
+    if (message >= TMM_FIRST && message <= TMM_GETPAGEMARGINS && control)
         return control_custom_message(control, message, wparam, lparam);
     switch (message) {
         case WM_NCCREATE: {

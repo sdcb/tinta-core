@@ -4,6 +4,8 @@
 
 - Added an opt-in Copy button at the document's top-right that scrolls with
   the content and copies the displayed revision's original Markdown source.
+- Added runtime-configurable left, top, right, and bottom page margins through
+  `TMM_SETPAGEMARGINS` and `TMM_GETPAGEMARGINS`.
 
 ## 1.0.0
 

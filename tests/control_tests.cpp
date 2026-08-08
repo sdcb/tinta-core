@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <windows.h>
 
@@ -461,6 +462,82 @@ int main() {
         std::cerr << "statistics query failed\n";
         return 1;
     }
+    TintaPageMargins default_margins{};
+    default_margins.cb_size = sizeof(default_margins);
+    if (!SendMessageW(view, TMM_GETPAGEMARGINS, 0,
+                      reinterpret_cast<LPARAM>(&default_margins)) ||
+        default_margins.left != 40.0f || default_margins.top != 20.0f ||
+        default_margins.right != 40.0f || default_margins.bottom != 40.0f) {
+        std::cerr << "default page margins failed\n";
+        return 1;
+    }
+    TintaPageMargins invalid_margins = default_margins;
+    invalid_margins.left = -1.0f;
+    if (SendMessageW(view, TMM_SETPAGEMARGINS, 0,
+                     reinterpret_cast<LPARAM>(&invalid_margins))) {
+        std::cerr << "negative page margin was accepted\n";
+        return 1;
+    }
+    invalid_margins = default_margins;
+    invalid_margins.top = std::numeric_limits<float>::quiet_NaN();
+    if (SendMessageW(view, TMM_SETPAGEMARGINS, 0,
+                     reinterpret_cast<LPARAM>(&invalid_margins))) {
+        std::cerr << "non-finite page margin was accepted\n";
+        return 1;
+    }
+    std::wstring margin_document;
+    for (int word = 0; word < 240; word++) margin_document += L"margin word ";
+    int margin_ready_target = document_ready_notifications + 1;
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(margin_document.c_str()));
+    if (!pump_until(view, &document_ready_notifications,
+                    margin_ready_target, 2000)) {
+        std::cerr << "page margin test document did not finish layout\n";
+        return 1;
+    }
+    TintaContentSize default_margin_size{};
+    default_margin_size.cb_size = sizeof(default_margin_size);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&default_margin_size))) {
+        std::cerr << "default margin content size failed\n";
+        return 1;
+    }
+    TintaPageMargins compact_margins{};
+    compact_margins.cb_size = sizeof(compact_margins);
+    compact_margins.left = 8.0f;
+    compact_margins.top = 6.0f;
+    compact_margins.right = 10.0f;
+    compact_margins.bottom = 12.0f;
+    if (!SendMessageW(view, TMM_SETPAGEMARGINS, 0,
+                      reinterpret_cast<LPARAM>(&compact_margins))) {
+        std::cerr << "compact page margins failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    TintaContentSize compact_margin_size{};
+    compact_margin_size.cb_size = sizeof(compact_margin_size);
+    TintaPageMargins queried_margins{};
+    queried_margins.cb_size = sizeof(queried_margins);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&compact_margin_size)) ||
+        !SendMessageW(view, TMM_GETPAGEMARGINS, 0,
+                      reinterpret_cast<LPARAM>(&queried_margins)) ||
+        queried_margins.left != compact_margins.left ||
+        queried_margins.top != compact_margins.top ||
+        queried_margins.right != compact_margins.right ||
+        queried_margins.bottom != compact_margins.bottom ||
+        compact_margin_size.height >= default_margin_size.height) {
+        std::cerr << "page margins did not affect layout\n";
+        return 1;
+    }
+    if (!SendMessageW(view, TMM_SETPAGEMARGINS, 0,
+                      reinterpret_cast<LPARAM>(&default_margins))) {
+        std::cerr << "page margin restore failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));
+    SendMessageW(view, WM_PAINT, 0, 0);
     TintaFindRequest find{};
     find.cb_size = sizeof(find);
     find.text = L"hello";
