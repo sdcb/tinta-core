@@ -1764,6 +1764,20 @@ static RECT code_button_rect(const TintaApp *app, const TintaCodeBlock *block) {
     return result;
 }
 
+static RECT document_button_rect(const TintaApp *app) {
+    LONG width = (LONG)ui_scale(app, 78);
+    LONG height = (LONG)ui_scale(app, 28);
+    LONG right_padding = (LONG)ui_scale(
+        app, app->content_height > app->height ? 20.0f : 12.0f);
+    LONG top_padding = (LONG)ui_scale(app, 12);
+    RECT result;
+    result.right = (LONG)(app->scroll_x + viewport_width(app)) - right_padding;
+    result.left = result.right - width;
+    result.top = top_padding;
+    result.bottom = result.top + height;
+    return result;
+}
+
 int tinta_code_block_at(const TintaApp *app, int x, int y) {
     size_t i;
     float document_x = x - viewport_x(app) + app->scroll_x;
@@ -1785,6 +1799,19 @@ bool tinta_code_button_at(const TintaApp *app, int x, int y) {
     if (index < 0) return false;
     button = code_button_rect(app, TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, index));
     return document_x >= button.left && document_x <= button.right &&
+           document_y >= button.top && document_y <= button.bottom;
+}
+
+bool tinta_document_button_at(const TintaApp *app, int x, int y) {
+    float document_x;
+    float document_y;
+    RECT button;
+    if (!app || !app->document_copy_button_enabled) return false;
+    document_x = x - viewport_x(app) + app->scroll_x;
+    document_y = y + app->scroll_y;
+    button = document_button_rect(app);
+    return button.left >= app->scroll_x &&
+           document_x >= button.left && document_x <= button.right &&
            document_y >= button.top && document_y <= button.bottom;
 }
 
@@ -2082,6 +2109,65 @@ static void draw_code_header(TintaApp *app, const TintaCodeBlock *block,
     }
 }
 
+static void draw_copy_button(TintaApp *app, D2D1_RECT_F rect,
+                             bool copied, bool hovered) {
+    const wchar_t *button_text = copied ? L"Copied" : L"Copy";
+    size_t button_text_length = copied ? 6 : 4;
+    D2D1_ROUNDED_RECT button = {rect, ui_scale(app, 4), ui_scale(app, 4)};
+    IDWriteTextLayout *label = NULL;
+    float icon_size = ui_scale(app, 12);
+    float icon_left = rect.left + ui_scale(app, 7);
+    float icon_top = rect.top + (rect.bottom - rect.top - icon_size) * 0.5f;
+    float text_left = icon_left + icon_size + ui_scale(app, 7);
+    uint32_t foreground = copied ? app->theme->accent :
+                                   app->theme->syntax_comment;
+    if (hovered || copied) {
+        set_brush_alpha(app, copied ? app->theme->accent : app->theme->quote,
+                        copied ? 0.12f : 0.16f);
+        app->render_target->lpVtbl->FillRoundedRectangle(
+            app->render_target, &button, (ID2D1Brush *)app->brush);
+    }
+    set_brush_alpha(app, foreground, hovered || copied ? 1.0f : 0.82f);
+    if (copied) {
+        D2D1_POINT_2F a = {icon_left, icon_top + icon_size * 0.55f};
+        D2D1_POINT_2F b = {icon_left + icon_size * 0.36f,
+                           icon_top + icon_size * 0.88f};
+        D2D1_POINT_2F c = {icon_left + icon_size,
+                           icon_top + icon_size * 0.12f};
+        app->render_target->lpVtbl->DrawLine(
+            app->render_target, a, b, (ID2D1Brush *)app->brush,
+            ui_scale(app, 1.5f), NULL);
+        app->render_target->lpVtbl->DrawLine(
+            app->render_target, b, c, (ID2D1Brush *)app->brush,
+            ui_scale(app, 1.5f), NULL);
+    } else {
+        D2D1_RECT_F back = {icon_left + ui_scale(app, 3), icon_top,
+            icon_left + icon_size, icon_top + icon_size - ui_scale(app, 3)};
+        D2D1_RECT_F front = {icon_left, icon_top + ui_scale(app, 3),
+            icon_left + icon_size - ui_scale(app, 3), icon_top + icon_size};
+        app->render_target->lpVtbl->DrawRectangle(
+            app->render_target, &back, (ID2D1Brush *)app->brush,
+            ui_scale(app, 1.1f), NULL);
+        app->render_target->lpVtbl->DrawRectangle(
+            app->render_target, &front, (ID2D1Brush *)app->brush,
+            ui_scale(app, 1.1f), NULL);
+    }
+    if (SUCCEEDED(app->dwrite_factory->lpVtbl->CreateTextLayout(
+            app->dwrite_factory, button_text, (UINT32)button_text_length,
+            app->chrome_format, rect.right - text_left - ui_scale(app, 4),
+            rect.bottom - rect.top, &label))) {
+        D2D1_POINT_2F origin = {text_left, rect.top};
+        apply_font_fallback(app, label);
+        label->lpVtbl->SetParagraphAlignment(
+            label, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        set_brush_alpha(app, foreground, hovered || copied ? 1.0f : 0.82f);
+        tinta_draw_text_layout(app, origin, label,
+            (ID2D1Brush *)app->brush,
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        label->lpVtbl->Release(label);
+    }
+}
+
 
 void tinta_render(TintaApp *app) {
     size_t i;
@@ -2208,81 +2294,32 @@ void tinta_render(TintaApp *app) {
                 TintaCodeBlock, app->code_blocks, (size_t)app->hovered_code_block);
             bool copied = app->notice_kind == TINTA_NOTICE_COPIED &&
                           app->notice_code_block == app->hovered_code_block;
-            const wchar_t *button_text = copied ? L"Copied" : L"Copy";
-            size_t button_text_length = copied ? 6 : 4;
             bool over_button = tinta_code_button_at(
                 app, app->mouse_x, app->mouse_y);
             RECT document_button = code_button_rect(app, block);
-            D2D1_ROUNDED_RECT button;
-            IDWriteTextLayout *label = NULL;
-            button.rect.left = document_button.left + vx;
-            button.rect.right = document_button.right + vx;
-            button.rect.top = document_button.top - scroll;
-            button.rect.bottom = document_button.bottom - scroll;
-            button.radiusX = ui_scale(app, 4); button.radiusY = ui_scale(app, 4);
-            if (button.rect.bottom > 0 && button.rect.top < app->height) {
-                float icon_size = ui_scale(app, 12);
-                float icon_left = button.rect.left + ui_scale(app, 7);
-                float icon_top = button.rect.top +
-                    (button.rect.bottom - button.rect.top - icon_size) * 0.5f;
-                float text_left = icon_left + icon_size + ui_scale(app, 7);
-                uint32_t foreground = copied ? app->theme->accent :
-                                              app->theme->syntax_comment;
-                if (over_button || copied) {
-                    set_brush_alpha(app, copied ? app->theme->accent :
-                                                  app->theme->quote,
-                                    copied ? 0.12f : 0.16f);
-                    app->render_target->lpVtbl->FillRoundedRectangle(
-                        app->render_target, &button,
-                        (ID2D1Brush *)app->brush);
-                }
-                set_brush_alpha(app, foreground,
-                                over_button || copied ? 1.0f : 0.82f);
-                if (copied) {
-                    D2D1_POINT_2F a = {icon_left,
-                                       icon_top + icon_size * 0.55f};
-                    D2D1_POINT_2F b = {icon_left + icon_size * 0.36f,
-                                       icon_top + icon_size * 0.88f};
-                    D2D1_POINT_2F c = {icon_left + icon_size,
-                                       icon_top + icon_size * 0.12f};
-                    app->render_target->lpVtbl->DrawLine(
-                        app->render_target, a, b,
-                        (ID2D1Brush *)app->brush, ui_scale(app, 1.5f), NULL);
-                    app->render_target->lpVtbl->DrawLine(
-                        app->render_target, b, c,
-                        (ID2D1Brush *)app->brush, ui_scale(app, 1.5f), NULL);
-                } else {
-                    D2D1_RECT_F back = {icon_left + ui_scale(app, 3), icon_top,
-                        icon_left + icon_size, icon_top + icon_size - ui_scale(app, 3)};
-                    D2D1_RECT_F front = {icon_left, icon_top + ui_scale(app, 3),
-                        icon_left + icon_size - ui_scale(app, 3),
-                        icon_top + icon_size};
-                    app->render_target->lpVtbl->DrawRectangle(
-                        app->render_target, &back,
-                        (ID2D1Brush *)app->brush, ui_scale(app, 1.1f), NULL);
-                    app->render_target->lpVtbl->DrawRectangle(
-                        app->render_target, &front,
-                        (ID2D1Brush *)app->brush, ui_scale(app, 1.1f), NULL);
-                }
-                if (SUCCEEDED(app->dwrite_factory->lpVtbl->CreateTextLayout(
-                        app->dwrite_factory, button_text,
-                        (UINT32)button_text_length, app->chrome_format,
-                        button.rect.right - text_left - ui_scale(app, 4),
-                        button.rect.bottom - button.rect.top, &label))) {
-                    D2D1_POINT_2F origin = {text_left, button.rect.top};
-                    apply_font_fallback(app, label);
-                    label->lpVtbl->SetParagraphAlignment(
-                        label, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                    set_brush_alpha(app, foreground,
-                                    over_button || copied ? 1.0f : 0.82f);
-                    tinta_draw_text_layout(app, origin, label,
-                        (ID2D1Brush *)app->brush,
-                        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    label->lpVtbl->Release(label);
-                }
-            }
+            D2D1_RECT_F button = {(float)document_button.left + vx,
+                                  (float)document_button.top - scroll,
+                                  (float)document_button.right + vx,
+                                  (float)document_button.bottom - scroll};
+            if (button.bottom > 0 && button.top < app->height)
+                draw_copy_button(app, button, copied, over_button);
         }
         app->render_target->lpVtbl->PopAxisAlignedClip(app->render_target);
+        if (app->document_copy_button_enabled) {
+            RECT document_button = document_button_rect(app);
+            D2D1_RECT_F button = {
+                (float)document_button.left + vx,
+                (float)document_button.top - scroll,
+                (float)document_button.right + vx,
+                (float)document_button.bottom - scroll};
+            bool copied = app->notice_kind == TINTA_NOTICE_COPIED &&
+                          app->notice_code_block < 0;
+            if (document_button.left >= app->scroll_x &&
+                button.bottom > 0 && button.top < app->height)
+                draw_copy_button(app, button, copied,
+                    tinta_document_button_at(
+                        app, app->mouse_x, app->mouse_y));
+        }
         {
             float visible = viewport_width(app);
             bool vertical = app->content_height > app->height;
@@ -2588,6 +2625,22 @@ bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied) {
     success = tinta_set_clipboard_text(
         app->hwnd, block->text, wcslen(block->text));
     if (success) show_copied_notice(app, index);
+    if (copied) *copied = success;
+    return true;
+}
+
+bool tinta_copy_document_at(TintaApp *app, int x, int y, bool *copied) {
+    TintaStr16 wide = {0};
+    bool success = false;
+    if (copied) *copied = false;
+    if (!tinta_document_button_at(app, x, y)) return false;
+    if (tinta_utf8_to_utf16(app->source.data ? app->source.data : "",
+                            app->source.len, &wide)) {
+        success = tinta_set_clipboard_text(
+            app->hwnd, wide.data ? wide.data : L"", wide.len);
+    }
+    tinta_str16_destroy(&wide);
+    if (success) show_copied_notice(app, -1);
     if (copied) *copied = success;
     return true;
 }

@@ -261,6 +261,7 @@ struct TintaApp {
     void *uia_provider;
     int hovered_code_block;
     bool tracking_mouse;
+    bool document_copy_button_enabled;
     TintaNoticeKind notice_kind;
     int notice_code_block;
 
@@ -340,6 +341,8 @@ void tinta_hit_test(TintaApp *app, float x, float y, size_t *position, const cha
 bool tinta_text_at(TintaApp *app, float x, float y, const char **url);
 bool tinta_copy_selection(TintaApp *app);
 bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied);
+bool tinta_copy_document_at(TintaApp *app, int x, int y, bool *copied);
+bool tinta_document_button_at(const TintaApp *app, int x, int y);
 int tinta_code_block_at(const TintaApp *app, int x, int y);
 bool tinta_code_button_at(const TintaApp *app, int x, int y);
 bool tinta_jump_to_internal_link(TintaApp *app, const char *url);

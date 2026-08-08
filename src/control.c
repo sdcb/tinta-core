@@ -113,6 +113,7 @@ static DWORD supported_option_flags(void) {
                   TINTA_OPTION_KEYBOARD_NAVIGATION |
                   TINTA_OPTION_MOUSE_ZOOM |
                   TINTA_OPTION_CODE_COPY_BUTTON |
+                  TINTA_OPTION_DOCUMENT_COPY_BUTTON |
                   TINTA_OPTION_OPEN_UNHANDLED_LINKS;
 #if TINTA_ENABLE_LOCAL_IMAGES
     flags |= TINTA_OPTION_LOCAL_IMAGES;
@@ -1134,13 +1135,30 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             if ((old_flags ^ control->options.flags) &
                 TINTA_OPTION_CODE_COPY_BUTTON) {
                 if (!(control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON)) {
-                    KillTimer(view->hwnd, TINTA_TIMER_NOTIFICATION);
-                    view->notice_kind = TINTA_NOTICE_NONE;
-                    view->notice_code_block = -1;
+                    if (view->notice_kind == TINTA_NOTICE_COPIED &&
+                        view->notice_code_block >= 0) {
+                        KillTimer(view->hwnd, TINTA_TIMER_NOTIFICATION);
+                        view->notice_kind = TINTA_NOTICE_NONE;
+                        view->notice_code_block = -1;
+                    }
                 }
                 view->hovered_code_block =
                     (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) ?
                     tinta_code_block_at(view, view->mouse_x, view->mouse_y) : -1;
+                InvalidateRect(view->hwnd, NULL, FALSE);
+            }
+            if ((old_flags ^ control->options.flags) &
+                TINTA_OPTION_DOCUMENT_COPY_BUTTON) {
+                view->document_copy_button_enabled =
+                    (control->options.flags &
+                     TINTA_OPTION_DOCUMENT_COPY_BUTTON) != 0;
+                if (!view->document_copy_button_enabled &&
+                    view->notice_kind == TINTA_NOTICE_COPIED &&
+                    view->notice_code_block < 0) {
+                    KillTimer(view->hwnd, TINTA_TIMER_NOTIFICATION);
+                    view->notice_kind = TINTA_NOTICE_NONE;
+                    view->notice_code_block = -1;
+                }
                 InvalidateRect(view->hwnd, NULL, FALSE);
             }
             return TRUE;
@@ -1387,6 +1405,8 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
     control->view.dpi_scale = GetDpiForWindow(hwnd) / 96.0f;
     control->options.cb_size = sizeof(control->options);
     control->options.flags = default_option_flags();
+    control->view.document_copy_button_enabled =
+        (control->options.flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON) != 0;
     control->limits = default_limits();
     control->view.max_ast_nodes = control->limits.max_ast_nodes;
     control->view.max_ast_depth = control->limits.max_ast_depth;
@@ -1534,7 +1554,16 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     bool handled = false;
                     bool copied = false;
                     if ((control->options.flags &
-                         TINTA_OPTION_CODE_COPY_BUTTON) &&
+                         TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
+                        tinta_copy_document_at(&control->view, x, y, &copied)) {
+                        handled = true;
+                        if (copied)
+                            notify_code(control, TMN_COPYCOMPLETED);
+                        else
+                            notify_error(control, E_FAIL, L"copy-document",
+                                L"The Markdown document could not be copied to the clipboard.");
+                    } else if ((control->options.flags &
+                                TINTA_OPTION_CODE_COPY_BUTTON) &&
                         tinta_copy_code_at(&control->view, x, y, &copied)) {
                         handled = true;
                         if (copied)
@@ -1554,6 +1583,11 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 bool old_over_copy_button =
                     (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) &&
                     tinta_code_button_at(&control->view,
+                        control->view.mouse_x, control->view.mouse_y);
+                bool old_over_document_button =
+                    (control->options.flags &
+                     TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
+                    tinta_document_button_at(&control->view,
                         control->view.mouse_x, control->view.mouse_y);
                 control->view.mouse_x = x;
                 control->view.mouse_y = y;
@@ -1575,6 +1609,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     int old_code_block = control->view.hovered_code_block;
                     bool hover_changed;
                     bool over_copy_button;
+                    bool over_document_button;
                     bool text = tinta_text_at(&control->view, (float)x, (float)y,
                                               &url);
                     hover_changed = tinta_scrollbar_update_hover(
@@ -1585,12 +1620,18 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     over_copy_button =
                         control->view.hovered_code_block >= 0 &&
                         tinta_code_button_at(&control->view, x, y);
+                    over_document_button =
+                        (control->options.flags &
+                         TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
+                        tinta_document_button_at(&control->view, x, y);
                     if (hover_changed || old_code_block !=
                         control->view.hovered_code_block ||
-                        old_over_copy_button != over_copy_button)
+                        old_over_copy_button != over_copy_button ||
+                        old_over_document_button != over_document_button)
                         InvalidateRect(hwnd, NULL, FALSE);
                     SetCursor(LoadCursorW(NULL,
-                        over_copy_button || (url && url[0]) ? IDC_HAND :
+                        over_document_button || over_copy_button ||
+                        (url && url[0]) ? IDC_HAND :
                         text ? IDC_IBEAM : IDC_ARROW));
                 }
             }
@@ -1632,6 +1673,8 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
         case WM_MOUSELEAVE:
             if (control) {
                 control->view.tracking_mouse = false;
+                control->view.mouse_x = -1;
+                control->view.mouse_y = -1;
                 control->view.hovered_code_block = -1;
                 tinta_scrollbar_update_hover(&control->view, -1, -1);
                 InvalidateRect(hwnd, NULL, FALSE);

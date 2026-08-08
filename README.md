@@ -90,6 +90,10 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - Code blocks show their Markdown language info verbatim in a non-selectable
   header. Blocks without a language are labeled `Plain text`; the Copy button
   shares the header and briefly changes to `Copied` after a successful copy.
+- `TINTA_OPTION_DOCUMENT_COPY_BUTTON` adds an opt-in Copy button at the
+  document's top-right. It is always visible at the top, scrolls away with the
+  document, copies the exact source for the displayed revision, and briefly
+  changes to `Copied`.
 - External links send `TMN_LINKACTIVATE`; returning zero permits the default
   `ShellExecuteW` behavior. Images send `TMN_RESOURCEOPENING`; the host can
   return default, block, or replace the resource URI.

@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 #define TINTA_CORE_VERSION_MAJOR 1
-#define TINTA_CORE_VERSION_MINOR 0
+#define TINTA_CORE_VERSION_MINOR 1
 #define TINTA_CORE_VERSION_PATCH 0
 
 /* Register this class with TintaCoreInitialize before calling CreateWindowExW. */
@@ -79,7 +79,8 @@ enum {
     TINTA_OPTION_CODE_COPY_BUTTON = 0x0008,
     TINTA_OPTION_LOCAL_IMAGES = 0x0010,
     TINTA_OPTION_REMOTE_IMAGES = 0x0020,
-    TINTA_OPTION_OPEN_UNHANDLED_LINKS = 0x0040
+    TINTA_OPTION_OPEN_UNHANDLED_LINKS = 0x0040,
+    TINTA_OPTION_DOCUMENT_COPY_BUTTON = 0x0080
 };
 
 typedef struct TintaOptions {

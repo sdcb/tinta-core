@@ -90,17 +90,25 @@ static bool send_control_key(HWND view, WPARAM key) {
 }
 
 static bool read_clipboard_text(HWND owner, std::wstring *copied) {
-    HANDLE data;
-    const wchar_t *text;
-    if (!copied || !OpenClipboard(owner)) return false;
-    data = GetClipboardData(CF_UNICODETEXT);
-    text = data ? static_cast<const wchar_t *>(GlobalLock(data)) : nullptr;
-    if (text) {
-        *copied = text;
-        GlobalUnlock(data);
+    if (!copied) return false;
+    for (int attempt = 0; attempt < 50; attempt++) {
+        HANDLE data;
+        const wchar_t *text;
+        if (!OpenClipboard(owner)) {
+            Sleep(1);
+            continue;
+        }
+        data = GetClipboardData(CF_UNICODETEXT);
+        text = data ? static_cast<const wchar_t *>(GlobalLock(data)) : nullptr;
+        if (text) {
+            *copied = text;
+            GlobalUnlock(data);
+        }
+        CloseClipboard();
+        if (text) return true;
+        Sleep(1);
     }
-    CloseClipboard();
-    return text != nullptr;
+    return false;
 }
 
 static bool copy_document_text(HWND view, const wchar_t *markdown,
@@ -144,10 +152,12 @@ int main() {
     capabilities.cb_size = sizeof(capabilities);
     if (!SendMessageW(view, TMM_GETVERSION, 0,
                       reinterpret_cast<LPARAM>(&version)) ||
-        version.major != 1 ||
+        version.major != 1 || version.minor != 1 ||
         !SendMessageW(view, TMM_GETCAPABILITIES, 0,
                       reinterpret_cast<LPARAM>(&capabilities)) ||
-        !(capabilities.flags & TINTA_CAPABILITY_STREAMING)) {
+        !(capabilities.flags & TINTA_CAPABILITY_STREAMING) ||
+        !(capabilities.option_flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON) ||
+        (compiled_options.flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON)) {
         std::cerr << "version/capability query failed\n";
         return 1;
     }
@@ -232,6 +242,148 @@ int main() {
     }
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    int document_copy_x = code_client.right -
+        static_cast<int>(51.0f * dpi_scale);
+    int document_copy_y = static_cast<int>(26.0f * dpi_scale);
+    int disabled_copy_target = copy_notifications;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != L"copy me\n" ||
+        copy_notifications != disabled_copy_target) {
+        std::cerr << "disabled document copy button was active\n";
+        return 1;
+    }
+    const wchar_t *document_markdown =
+        L"# Heading\r\n\r\n**bold** caf\u00e9 and [link](https://example.test)\r\n";
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(document_markdown));
+    TintaOptions document_options = compiled_options;
+    document_options.flags |= TINTA_OPTION_DOCUMENT_COPY_BUTTON;
+    if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&document_options)) ||
+        !SendMessageW(view, TMM_GETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&document_options)) ||
+        !(document_options.flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON)) {
+        std::cerr << "document copy option failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_MOUSELEAVE, 0, 0);
+    SendMessageW(view, WM_PAINT, 0, 0);
+    ValidateRect(view, nullptr);
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    if (!GetUpdateRect(view, nullptr, FALSE)) {
+        std::cerr << "document copy hover did not invalidate\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    int document_copy_target = copy_notifications + 1;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != document_markdown ||
+        copy_notifications != document_copy_target) {
+        std::cerr << "document copy button did not preserve Markdown source\n";
+        return 1;
+    }
+    const wchar_t *overlap_markdown = L"```text\ncode only\n```";
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(overlap_markdown));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    document_copy_target = copy_notifications + 1;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != overlap_markdown ||
+        copy_notifications != document_copy_target) {
+        std::cerr << "document copy button did not take click priority\n";
+        return 1;
+    }
+    std::wstring scrolling_markdown = L"# Fixed copy button\n\n";
+    for (int line = 0; line < 80; line++)
+        scrolling_markdown += L"- scrolling line\n";
+    int scroll_ready_target = document_ready_notifications + 1;
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(scrolling_markdown.c_str()));
+    if (!pump_until(view, &document_ready_notifications,
+                    scroll_ready_target, 2000)) {
+        std::cerr << "scrolling document did not finish layout\n";
+        return 1;
+    }
+    TintaScrollPosition scroll_position{};
+    scroll_position.cb_size = sizeof(scroll_position);
+    scroll_position.y = 200.0f;
+    if (!SendMessageW(view, TMM_SETSCROLLPOS, 0,
+                      reinterpret_cast<LPARAM>(&scroll_position))) {
+        std::cerr << "document copy scroll setup failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    scroll_position.y = 0;
+    if (!SendMessageW(view, TMM_GETSCROLLPOS, 0,
+                      reinterpret_cast<LPARAM>(&scroll_position)) ||
+        scroll_position.y <= 0) {
+        std::cerr << "document did not scroll\n";
+        return 1;
+    }
+    document_copy_x = code_client.right -
+        static_cast<int>(59.0f * dpi_scale);
+    int scrolled_copy_target = copy_notifications;
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != overlap_markdown ||
+        copy_notifications != scrolled_copy_target) {
+        std::cerr << "document copy button followed the vertical scroll\n";
+        return 1;
+    }
+    scroll_position.y = 0;
+    if (!SendMessageW(view, TMM_SETSCROLLPOS, 0,
+                      reinterpret_cast<LPARAM>(&scroll_position))) {
+        std::cerr << "document copy scroll reset failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    document_copy_target = copy_notifications + 1;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != scrolling_markdown ||
+        copy_notifications != document_copy_target) {
+        std::cerr << "document copy button was not available at the top\n";
+        return 1;
+    }
+    document_options.flags &= ~TINTA_OPTION_DOCUMENT_COPY_BUTTON;
+    if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&document_options))) {
+        std::cerr << "document copy option disable failed\n";
+        return 1;
+    }
+    int disabled_after_copy_target = copy_notifications;
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(document_copy_x, document_copy_y));
+    if (!read_clipboard_text(view, &copied_text)) {
+        std::cerr << "clipboard read failed after document copy disable\n";
+        return 1;
+    }
+    if (copied_text != scrolling_markdown) {
+        std::cerr << "clipboard changed after document copy disable\n";
+        return 1;
+    }
+    if (copy_notifications != disabled_after_copy_target) {
+        std::cerr << "copy notification fired after document copy disable\n";
+        return 1;
+    }
     ShowWindow(parent, SW_HIDE);
 #if !TINTA_ENABLE_LOCAL_IMAGES
     if (compiled_options.flags & TINTA_OPTION_LOCAL_IMAGES) {
@@ -379,6 +531,19 @@ int main() {
     }
     SetWindowPos(view, nullptr, 0, 0, 640, 480,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    TintaOptions stream_options{};
+    stream_options.cb_size = sizeof(stream_options);
+    if (!SendMessageW(view, TMM_GETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&stream_options))) {
+        std::cerr << "stream options query failed\n";
+        return 1;
+    }
+    stream_options.flags |= TINTA_OPTION_DOCUMENT_COPY_BUTTON;
+    if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&stream_options))) {
+        std::cerr << "stream document copy option failed\n";
+        return 1;
+    }
     TintaStreamBegin stream_begin{};
     stream_begin.cb_size = sizeof(stream_begin);
     stream_begin.base_uri = L"C:\\temp\\stream.md";
@@ -446,9 +611,34 @@ int main() {
     wchar_t *stream_text = new wchar_t[static_cast<size_t>(stream_text_length) + 1];
     GetWindowTextW(view, stream_text, stream_text_length + 1);
     bool stream_text_ok = std::wcsstr(stream_text, L"caf\u00e9 more") != nullptr;
+    std::wstring displayed_stream_markdown(stream_text);
     delete[] stream_text;
     if (!stream_text_ok) {
         std::cerr << "stream final text mismatch\n";
+        return 1;
+    }
+    TintaContentSize stream_content{};
+    stream_content.cb_size = sizeof(stream_content);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&stream_content))) {
+        std::cerr << "stream content size query failed\n";
+        return 1;
+    }
+    RECT stream_client{};
+    GetClientRect(view, &stream_client);
+    float stream_right_padding =
+        stream_content.height > stream_client.bottom ? 20.0f : 12.0f;
+    int stream_copy_x = stream_client.right - static_cast<int>(
+        (stream_right_padding + 39.0f) * dpi_scale);
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(stream_copy_x, document_copy_y));
+    int stream_copy_target = copy_notifications + 1;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(stream_copy_x, document_copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != displayed_stream_markdown ||
+        copy_notifications != stream_copy_target) {
+        std::cerr << "stream document copy did not use displayed revision\n";
         return 1;
     }
     RECT fixed_client{};

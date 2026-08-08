@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0
+
+- Added an opt-in Copy button at the document's top-right that scrolls with
+  the content and copies the displayed revision's original Markdown source.
+
 ## 1.0.0
 
 - Stabilized the public Win32 control ABI and added runtime version,
