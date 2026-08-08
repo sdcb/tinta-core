@@ -26,6 +26,9 @@ set(TINTA_CORE_SOURCES
     vendor/md4c/src/md4c.c
     src/app.c
     src/control.c
+    src/control_api.c
+    src/control_document.c
+    src/control_input.c
     src/core.c
     src/document.c
     src/markdown.c
