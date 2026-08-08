@@ -35,13 +35,6 @@ typedef struct InlineStyle {
     bool fixed_size;
 } InlineStyle;
 
-#if TINTA_ENABLE_MERMAID
-typedef struct ConnectorPath {
-    D2D1_POINT_2F points[5];
-    size_t count;
-} ConnectorPath;
-#endif
-
 static float maxf(float a, float b) { return a > b ? a : b; }
 static float minf(float a, float b) { return a < b ? a : b; }
 static float scale(const TintaApp *app, float value) { return value * app->dpi_scale * app->zoom; }
@@ -626,6 +619,7 @@ void tinta_layout_clear(TintaApp *app) {
     }
     tinta_vec_clear(&app->text_runs); tinta_vec_clear(&app->rects);
     tinta_vec_clear(&app->lines); tinta_vec_clear(&app->headings);
+    tinta_vec_clear(&app->paths); tinta_vec_clear(&app->path_points);
     tinta_vec_clear(&app->scroll_anchors);
     tinta_vec_clear(&app->hit_entries);
     app->hit_index_dirty = true;
@@ -842,6 +836,7 @@ static bool add_rect(TintaApp *app, float left, float top, float right, float bo
     item.rect.right = (LONG)right; item.rect.bottom = (LONG)bottom;
     item.color = color; item.opacity = 1.0f; item.radius = radius;
     item.outline = outline; item.stroke = stroke; item.shape = 0;
+    item.layer = 0;
     item.horizontal_region = app->active_horizontal_region;
     track_horizontal_extent(app, left, right);
     return tinta_vec_push(&app->rects, &item) != NULL;
@@ -868,6 +863,7 @@ static bool add_shape(TintaApp *app, float left, float top, float right, float b
     item.color=color; item.opacity=opacity;
     item.radius=shape==TINTA_DRAW_SHAPE_STADIUM?(bottom-top)*.5f:scale(app,6);
     item.outline=outline; item.stroke=stroke; item.shape=shape;
+    item.layer = 2;
     item.horizontal_region = app->active_horizontal_region;
     track_horizontal_extent(app, left, right);
     return tinta_vec_push(&app->rects,&item)!=NULL;
@@ -879,22 +875,61 @@ static bool add_line(TintaApp *app, float x1, float y1, float x2, float y2,
     TintaDrawLine item;
     item.a.x = (LONG)x1; item.a.y = (LONG)y1; item.b.x = (LONG)x2; item.b.y = (LONG)y2;
     item.color = color; item.stroke = stroke; item.opacity = 1.0f; item.dashed = false;
+    item.layer = 0;
     item.horizontal_region = app->active_horizontal_region;
     track_horizontal_extent(app, minf(x1, x2), maxf(x1, x2));
     return tinta_vec_push(&app->lines, &item) != NULL;
 }
 
 #if TINTA_ENABLE_MERMAID
-static bool add_connector_line(TintaApp *app, float x1, float y1, float x2, float y2,
-                               uint32_t color, float stroke, bool dashed) {
-    TintaDrawLine item;
-    item.a.x = (LONG)x1; item.a.y = (LONG)y1;
-    item.b.x = (LONG)x2; item.b.y = (LONG)y2;
-    item.color = color; item.stroke = stroke; item.opacity = 1.0f;
+static void set_recent_rect_layer(TintaApp *app, size_t count,
+                                  unsigned char layer) {
+    size_t start = count < app->rects.len ? app->rects.len - count : 0;
+    size_t i;
+    for (i = start; i < app->rects.len; i++)
+        TINTA_VEC_AT(TintaDrawRect, app->rects, i).layer = layer;
+}
+
+static void set_recent_line_layer(TintaApp *app, size_t count,
+                                  unsigned char layer) {
+    size_t start = count < app->lines.len ? app->lines.len - count : 0;
+    size_t i;
+    for (i = start; i < app->lines.len; i++)
+        TINTA_VEC_AT(TintaDrawLine, app->lines, i).layer = layer;
+}
+
+static bool add_connector_path(TintaApp *app, const D2D1_POINT_2F *points,
+                               size_t count, uint32_t color, float stroke,
+                               bool dashed) {
+    TintaDrawPath item;
+    size_t old_length = app->path_points.len;
+    size_t i;
+    float left;
+    float right;
+    if (!points || count < 4 || ((count - 1) % 3) != 0) return false;
+    left = right = points[0].x;
+    for (i = 0; i < count; i++) {
+        left = minf(left, points[i].x);
+        right = maxf(right, points[i].x);
+        if (!tinta_vec_push(&app->path_points, &points[i])) {
+            app->path_points.len = old_length;
+            return false;
+        }
+    }
+    item.point_offset = old_length;
+    item.point_count = count;
+    item.color = color;
+    item.stroke = stroke;
+    item.opacity = 1.0f;
     item.dashed = dashed;
+    item.layer = 1;
     item.horizontal_region = app->active_horizontal_region;
-    track_horizontal_extent(app, minf(x1, x2), maxf(x1, x2));
-    return tinta_vec_push(&app->lines, &item) != NULL;
+    if (!tinta_vec_push(&app->paths, &item)) {
+        app->path_points.len = old_length;
+        return false;
+    }
+    track_horizontal_extent(app, left, right);
+    return true;
 }
 #endif
 
@@ -905,6 +940,7 @@ static bool add_line_alpha(TintaApp *app, float x1, float y1, float x2, float y2
     item.a.x = (LONG)x1; item.a.y = (LONG)y1;
     item.b.x = (LONG)x2; item.b.y = (LONG)y2;
     item.color = color; item.stroke = stroke; item.opacity = opacity; item.dashed = false;
+    item.layer = 0;
     item.horizontal_region = app->active_horizontal_region;
     track_horizontal_extent(app, minf(x1, x2), maxf(x1, x2));
     return tinta_vec_push(&app->lines, &item) != NULL;
@@ -1727,6 +1763,7 @@ static bool mermaid_label_collides(const TintaMermaidLayout *graph,
     }
     return false;
 }
+
 #endif
 
 static bool layout_image_placeholder(TintaApp *app, const TintaElement *element,
@@ -1809,9 +1846,12 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
     TintaMermaidLayout graph; size_t i; float top = *y;
     size_t region_index = SIZE_MAX;
     size_t mermaid_block_index = SIZE_MAX;
-    TintaVec label_boxes;
+    TintaVec label_boxes = {0};
     memset(&graph, 0, sizeof(graph));
-    if (!tinta_vec_init(&label_boxes, sizeof(D2D1_RECT_F))) return false;
+    if (!tinta_vec_init(&label_boxes, sizeof(D2D1_RECT_F))) {
+        tinta_vec_destroy(&label_boxes);
+        return false;
+    }
     if(!flatten(element,&source)) {
         tinta_vec_destroy(&label_boxes);
         return false;
@@ -1947,7 +1987,6 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
         }
         offset = left + maxf(0, (block_right - left - graph.width) * 0.5f);
         float diagram_bottom = content_top + graph.height;
-        size_t exterior_lane = 0;
         for (i = 0; i < parsed.diagram.subgraph_count; i++) {
             const TintaMermaidSubgraph *subgraph =
                 &parsed.diagram.subgraphs[i];
@@ -1995,107 +2034,59 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
             }
             tinta_str16_destroy(&title);
         }
+        if (graph.edge_count != parsed.diagram.edge_count) goto failed;
         for (i = 0; i < parsed.diagram.edge_count; i++) {
             const TintaMermaidEdge *edge = &parsed.diagram.edges[i];
-            TintaMermaidRect a;
-            TintaMermaidRect b;
-            bool horizontal;
-            ConnectorPath path = {0};
-            float from_center_x, from_center_y, to_center_x, to_center_y;
-            bool self_loop = edge->from_subgraph == edge->to_subgraph &&
-                             edge->from == edge->to;
-            bool skips_ranks = false;
+            const TintaMermaidEdgeRoute *route = &graph.edges[i];
+            const TintaMermaidPoint *source_points;
+            D2D1_POINT_2F *path;
+            D2D1_POINT_2F tip;
+            D2D1_POINT_2F previous;
+            float route_dx;
+            float route_dy;
             size_t p;
-            if ((edge->from_subgraph && edge->from >= graph.subgraph_count) ||
-                (!edge->from_subgraph && edge->from >= graph.node_count) ||
-                (edge->to_subgraph && edge->to >= graph.subgraph_count) ||
-                (!edge->to_subgraph && edge->to >= graph.node_count))
+            if (route->point_count < 4 ||
+                ((route->point_count - 1) % 3) != 0 ||
+                route->point_offset + route->point_count > graph.point_count)
                 goto failed;
-            a = edge->from_subgraph ? graph.subgraphs[edge->from] :
-                                      graph.nodes[edge->from];
-            b = edge->to_subgraph ? graph.subgraphs[edge->to] :
-                                    graph.nodes[edge->to];
-            a.left += offset; a.right += offset; a.top += content_top; a.bottom += content_top;
-            b.left += offset; b.right += offset; b.top += content_top; b.bottom += content_top;
-            from_center_x=(a.left+a.right)*.5f;from_center_y=(a.top+a.bottom)*.5f;
-            to_center_x=(b.left+b.right)*.5f;to_center_y=(b.top+b.bottom)*.5f;
-            horizontal = fabsf(to_center_x - from_center_x) >=
-                         fabsf(to_center_y - from_center_y);
-            if(!edge->from_subgraph && !edge->to_subgraph &&
-               graph.ranks&&edge->from<graph.rank_count&&edge->to<graph.rank_count){
-                size_t from_rank=graph.ranks[edge->from],to_rank=graph.ranks[edge->to];
-                skips_ranks=(from_rank>to_rank?from_rank-to_rank:to_rank-from_rank)>1;
+            source_points = graph.points + route->point_offset;
+            path = (D2D1_POINT_2F *)calloc(
+                route->point_count, sizeof(*path));
+            if (!path) goto failed;
+            for (p = 0; p < route->point_count; p++) {
+                path[p].x = source_points[p].x + offset;
+                path[p].y = source_points[p].y + content_top;
+                diagram_bottom = maxf(diagram_bottom, path[p].y);
             }
-            if(horizontal){
-                bool left_to_right=to_center_x>=from_center_x;
-                bool forward=!self_loop&&!skips_ranks&&
-                    (left_to_right?to_center_x>from_center_x:to_center_x<from_center_x);
-                if(self_loop){
-                    float lane=scale(app,36+(float)exterior_lane++*14);
-                    path.points[0]=(D2D1_POINT_2F){from_center_x,a.bottom};
-                    path.points[1]=(D2D1_POINT_2F){from_center_x,a.bottom+lane};
-                    path.points[2]=(D2D1_POINT_2F){a.right+lane,a.bottom+lane};
-                    path.points[3]=(D2D1_POINT_2F){a.right+lane,from_center_y};
-                    path.points[4]=(D2D1_POINT_2F){a.right,from_center_y};path.count=5;
-                }else if(forward){
-                    float start_x=left_to_right?a.right:a.left,end_x=left_to_right?b.left:b.right;
-                    float middle_x=(start_x+end_x)*.5f;
-                    path.points[0]=(D2D1_POINT_2F){start_x,from_center_y};
-                    path.points[1]=(D2D1_POINT_2F){middle_x,from_center_y};
-                    path.points[2]=(D2D1_POINT_2F){middle_x,to_center_y};
-                    path.points[3]=(D2D1_POINT_2F){end_x,to_center_y};path.count=4;
-                }else{
-                    float lane=scale(app,36+(float)exterior_lane++*14);
-                    float lane_y=maxf(a.bottom,b.bottom)+lane;
-                    path.points[0]=(D2D1_POINT_2F){from_center_x,a.bottom};
-                    path.points[1]=(D2D1_POINT_2F){from_center_x,lane_y};
-                    path.points[2]=(D2D1_POINT_2F){to_center_x,lane_y};
-                    path.points[3]=(D2D1_POINT_2F){to_center_x,b.bottom};path.count=4;
-                }
-            }else{
-                bool top_to_bottom=to_center_y>=from_center_y;
-                bool forward=!self_loop&&!skips_ranks&&
-                    (top_to_bottom?to_center_y>from_center_y:to_center_y<from_center_y);
-                if(self_loop){
-                    float lane=scale(app,36+(float)exterior_lane++*14);
-                    path.points[0]=(D2D1_POINT_2F){a.right,from_center_y};
-                    path.points[1]=(D2D1_POINT_2F){a.right+lane,from_center_y};
-                    path.points[2]=(D2D1_POINT_2F){a.right+lane,a.bottom+lane};
-                    path.points[3]=(D2D1_POINT_2F){from_center_x,a.bottom+lane};
-                    path.points[4]=(D2D1_POINT_2F){from_center_x,a.bottom};path.count=5;
-                }else if(forward){
-                    float start_y=top_to_bottom?a.bottom:a.top,end_y=top_to_bottom?b.top:b.bottom;
-                    float middle_y=(start_y+end_y)*.5f;
-                    path.points[0]=(D2D1_POINT_2F){from_center_x,start_y};
-                    path.points[1]=(D2D1_POINT_2F){from_center_x,middle_y};
-                    path.points[2]=(D2D1_POINT_2F){to_center_x,middle_y};
-                    path.points[3]=(D2D1_POINT_2F){to_center_x,end_y};path.count=4;
-                }else{
-                    float lane=scale(app,36+(float)exterior_lane++*14);
-                    float lane_x=maxf(a.right,b.right)+lane;
-                    path.points[0]=(D2D1_POINT_2F){a.right,from_center_y};
-                    path.points[1]=(D2D1_POINT_2F){lane_x,from_center_y};
-                    path.points[2]=(D2D1_POINT_2F){lane_x,to_center_y};
-                    path.points[3]=(D2D1_POINT_2F){b.right,to_center_y};path.count=4;
-                }
+            if (!add_connector_path(app, path, route->point_count,
+                    app->theme->quote, edge->stroke_scale * 1.5f,
+                    edge->dashed)) {
+                free(path);
+                goto failed;
             }
-            for(p=1;p<path.count;p++){
-                if(!add_connector_line(app,path.points[p-1].x,path.points[p-1].y,
-                        path.points[p].x,path.points[p].y,app->theme->quote,
-                        edge->stroke_scale*1.5f,edge->dashed))goto failed;
-                diagram_bottom=maxf(diagram_bottom,maxf(path.points[p-1].y,path.points[p].y));
-            }
+            tip = path[route->point_count - 1];
+            previous = path[route->point_count - 2];
+            route_dx = tip.x - path[0].x;
+            route_dy = tip.y - path[0].y;
             if(edge->directed) {
-                D2D1_POINT_2F tip=path.points[path.count-1],previous=path.points[path.count-2];
                 float angle=atan2f(tip.y-previous.y,tip.x-previous.x),arrow=scale(app,9);
-                add_line(app,tip.x,tip.y,tip.x-cosf(angle-.5f)*arrow,tip.y-sinf(angle-.5f)*arrow,app->theme->quote,1.5f);
-                add_line(app,tip.x,tip.y,tip.x-cosf(angle+.5f)*arrow,tip.y-sinf(angle+.5f)*arrow,app->theme->quote,1.5f);
+                if (!add_line(app,tip.x,tip.y,
+                        tip.x-cosf(angle-.5f)*arrow,
+                        tip.y-sinf(angle-.5f)*arrow,
+                        app->theme->quote,1.5f) ||
+                    !add_line(app,tip.x,tip.y,
+                        tip.x-cosf(angle+.5f)*arrow,
+                        tip.y-sinf(angle+.5f)*arrow,
+                        app->theme->quote,1.5f)) {
+                    free(path);
+                    goto failed;
+                }
+                set_recent_line_layer(app, 2, 1);
             }
             if(edge->label && edge->label[0]) {
                 TintaStr16 label={0}; SIZE label_size;
-                size_t middle=path.count/2;
-                D2D1_POINT_2F label_a=path.points[middle-1],label_b=path.points[middle];
-                float label_x=(label_a.x+label_b.x)*.5f,label_y=(label_a.y+label_b.y)*.5f;
+                float label_x=route->label_x+offset;
+                float label_y=route->label_y+content_top;
                 D2D1_RECT_F label_rect;
                 int attempt;
                 tinta_utf8_to_utf16(edge->label,strlen(edge->label),&label);
@@ -2106,8 +2097,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                         scale(app, 12) * magnitude * (attempt & 1 ? 1 : -1);
                     float shifted_x = label_x;
                     float shifted_y = label_y;
-                    if (fabsf(label_b.x - label_a.x) >=
-                        fabsf(label_b.y - label_a.y)) shifted_y += shift;
+                    if (fabsf(route_dx) >= fabsf(route_dy)) shifted_y += shift;
                     else shifted_x += shift;
                     label_rect = (D2D1_RECT_F){
                         shifted_x-label_size.cx*.5f-scale(app,4),
@@ -2124,6 +2114,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                 }
                 if (!tinta_vec_push(&label_boxes, &label_rect)) {
                     tinta_str16_destroy(&label);
+                    free(path);
                     goto failed;
                 }
                 if (!add_rect(app,label_rect.left,label_rect.top,
@@ -2134,18 +2125,22 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                               app->theme->quote,scale(app,2),true,
                               scale(app,1))) {
                     tinta_str16_destroy(&label);
+                    free(path);
                     goto failed;
                 }
+                set_recent_rect_layer(app, 2, 2);
                 if (!append_run(app,label.data,label.len,app->ui_format,
                                 app->theme->text,
                                 label_x-label_size.cx*.5f,
                                 label_y-label_size.cy*.5f,NULL,NULL)) {
                     tinta_str16_destroy(&label);
+                    free(path);
                     goto failed;
                 }
                 diagram_bottom=maxf(diagram_bottom,label_rect.bottom);
                 tinta_str16_destroy(&label);
             }
+            free(path);
         }
         for (i = 0; i < parsed.diagram.node_count; i++) {
             const TintaMermaidNode *node = &parsed.diagram.nodes[i]; TintaMermaidRect box = graph.nodes[i];
@@ -2268,6 +2263,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                 !add_line_alpha(app, box.left, box.bottom,
                     box.left, box.top, stroke,
                     scale(app, stroke_width), stroke_opacity)) goto failed;
+            set_recent_line_layer(app, 4, 3);
             if (!tinta_utf8_to_utf16(subgraph->label,
                     strlen(subgraph->label), &title)) {
                 tinta_str16_destroy(&title);
@@ -2353,12 +2349,14 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
     }
     tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source);
     free(sizes); free(subgraph_title_sizes);
-    tinta_vec_destroy(&label_boxes); return true;
+    tinta_vec_destroy(&label_boxes);
+    return true;
 failed:
     app->active_horizontal_region = SIZE_MAX;
     tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source);
     free(sizes); free(subgraph_title_sizes);
-    tinta_vec_destroy(&label_boxes); return false;
+    tinta_vec_destroy(&label_boxes);
+    return false;
 }
 #endif
 
@@ -2971,6 +2969,85 @@ static void draw_line_item(TintaApp *app, const TintaDrawLine *item,
     }
 }
 
+#if TINTA_ENABLE_MERMAID
+static ID2D1StrokeStyle *mermaid_dashed_stroke(TintaApp *app) {
+    if (!app->dashed_stroke) {
+        D2D1_STROKE_STYLE_PROPERTIES properties;
+        FLOAT dashes[2] = {4.0f, 3.0f};
+        memset(&properties, 0, sizeof(properties));
+        properties.startCap = D2D1_CAP_STYLE_FLAT;
+        properties.endCap = D2D1_CAP_STYLE_FLAT;
+        properties.dashCap = D2D1_CAP_STYLE_FLAT;
+        properties.lineJoin = D2D1_LINE_JOIN_ROUND;
+        properties.miterLimit = 10.0f;
+        properties.dashStyle = D2D1_DASH_STYLE_CUSTOM;
+        properties.dashOffset = 0;
+        if (FAILED(app->d2d_factory->lpVtbl->CreateStrokeStyle(
+                app->d2d_factory, &properties, dashes, 2,
+                &app->dashed_stroke)))
+            app->dashed_stroke = NULL;
+    }
+    return app->dashed_stroke;
+}
+
+static void draw_path_item(TintaApp *app, const TintaDrawPath *item,
+                           float vx, float scroll) {
+    ID2D1PathGeometry *geometry = NULL;
+    ID2D1GeometrySink *sink = NULL;
+    D2D1_BEZIER_SEGMENT *segments = NULL;
+    const D2D1_POINT_2F *source;
+    D2D1_POINT_2F start;
+    size_t segment_count;
+    size_t i;
+    float minimum_y = FLT_MAX;
+    float maximum_y = -FLT_MAX;
+    HRESULT hr;
+    if (item->point_count < 4 || ((item->point_count - 1) % 3) != 0 ||
+        item->point_offset + item->point_count > app->path_points.len)
+        return;
+    source = (const D2D1_POINT_2F *)app->path_points.data +
+             item->point_offset;
+    for (i = 0; i < item->point_count; i++) {
+        minimum_y = minf(minimum_y, source[i].y - scroll);
+        maximum_y = maxf(maximum_y, source[i].y - scroll);
+    }
+    if (maximum_y < 0 || minimum_y > app->height) return;
+    segment_count = (item->point_count - 1) / 3;
+    segments = (D2D1_BEZIER_SEGMENT *)calloc(
+        segment_count, sizeof(*segments));
+    if (!segments) return;
+    for (i = 0; i < segment_count; i++) {
+        size_t base = 1 + i * 3;
+        segments[i].point1 = (D2D1_POINT_2F){
+            vx + source[base].x, source[base].y - scroll};
+        segments[i].point2 = (D2D1_POINT_2F){
+            vx + source[base + 1].x, source[base + 1].y - scroll};
+        segments[i].point3 = (D2D1_POINT_2F){
+            vx + source[base + 2].x, source[base + 2].y - scroll};
+    }
+    start = (D2D1_POINT_2F){vx + source[0].x, source[0].y - scroll};
+    hr = app->d2d_factory->lpVtbl->CreatePathGeometry(
+        app->d2d_factory, &geometry);
+    if (SUCCEEDED(hr)) hr = geometry->lpVtbl->Open(geometry, &sink);
+    if (SUCCEEDED(hr)) {
+        sink->lpVtbl->BeginFigure(sink, start, D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->lpVtbl->AddBeziers(sink, segments, (UINT)segment_count);
+        sink->lpVtbl->EndFigure(sink, D2D1_FIGURE_END_OPEN);
+        hr = sink->lpVtbl->Close(sink);
+    }
+    if (SUCCEEDED(hr)) {
+        set_brush_alpha(app, item->color, item->opacity);
+        app->render_target->lpVtbl->DrawGeometry(
+            app->render_target, (ID2D1Geometry *)geometry,
+            (ID2D1Brush *)app->brush, item->stroke,
+            item->dashed ? mermaid_dashed_stroke(app) : NULL);
+    }
+    if (sink) sink->lpVtbl->Release(sink);
+    if (geometry) geometry->lpVtbl->Release(geometry);
+    free(segments);
+}
+#endif
+
 static bool push_horizontal_region_clip(TintaApp *app, size_t index,
                                         float vx, float scroll) {
     const TintaHorizontalRegion *region = horizontal_region_const(app, index);
@@ -3225,6 +3302,7 @@ static void draw_copy_button(TintaApp *app, D2D1_RECT_F rect,
 
 void tinta_render(TintaApp *app) {
     size_t i;
+    unsigned char layer;
     float vx;
     float scroll;
     HRESULT hr;
@@ -3252,15 +3330,30 @@ void tinta_render(TintaApp *app) {
         D2D1_RECT_F clip = {viewport_x(app), 0, (FLOAT)app->width, (FLOAT)app->height};
         app->render_target->lpVtbl->PushAxisAlignedClip(
             app->render_target, &clip, D2D1_ANTIALIAS_MODE_ALIASED);
-        for (i = 0; i < app->rects.len; i++) {
-            TintaDrawRect *item = TINTA_VEC_PTR(TintaDrawRect, app->rects, i);
-            if (item->horizontal_region == SIZE_MAX)
-                draw_rect_item(app, item, vx, scroll);
-        }
-        for (i = 0; i < app->lines.len; i++) {
-            TintaDrawLine *item = TINTA_VEC_PTR(TintaDrawLine, app->lines, i);
-            if (item->horizontal_region == SIZE_MAX)
-                draw_line_item(app, item, vx, scroll);
+        for (layer = 0; layer <= 3; layer++) {
+            for (i = 0; i < app->rects.len; i++) {
+                TintaDrawRect *item = TINTA_VEC_PTR(
+                    TintaDrawRect, app->rects, i);
+                if (item->horizontal_region == SIZE_MAX &&
+                    item->layer == layer)
+                    draw_rect_item(app, item, vx, scroll);
+            }
+#if TINTA_ENABLE_MERMAID
+            for (i = 0; i < app->paths.len; i++) {
+                TintaDrawPath *item = TINTA_VEC_PTR(
+                    TintaDrawPath, app->paths, i);
+                if (item->horizontal_region == SIZE_MAX &&
+                    item->layer == layer)
+                    draw_path_item(app, item, vx, scroll);
+            }
+#endif
+            for (i = 0; i < app->lines.len; i++) {
+                TintaDrawLine *item = TINTA_VEC_PTR(
+                    TintaDrawLine, app->lines, i);
+                if (item->horizontal_region == SIZE_MAX &&
+                    item->layer == layer)
+                    draw_line_item(app, item, vx, scroll);
+            }
         }
         {
             size_t region_index;
@@ -3270,19 +3363,33 @@ void tinta_render(TintaApp *app) {
                     app, region_index);
                 if (!push_horizontal_region_clip(
                         app, region_index, vx, scroll)) continue;
-                for (i = 0; i < app->rects.len; i++) {
-                    TintaDrawRect *item = TINTA_VEC_PTR(
-                        TintaDrawRect, app->rects, i);
-                    if (item->horizontal_region == region_index)
-                        draw_rect_item(app, item,
-                            vx + horizontal_region_offset(region), scroll);
-                }
-                for (i = 0; i < app->lines.len; i++) {
-                    TintaDrawLine *item = TINTA_VEC_PTR(
-                        TintaDrawLine, app->lines, i);
-                    if (item->horizontal_region == region_index)
-                        draw_line_item(app, item,
-                            vx + horizontal_region_offset(region), scroll);
+                for (layer = 0; layer <= 3; layer++) {
+                    for (i = 0; i < app->rects.len; i++) {
+                        TintaDrawRect *item = TINTA_VEC_PTR(
+                            TintaDrawRect, app->rects, i);
+                        if (item->horizontal_region == region_index &&
+                            item->layer == layer)
+                            draw_rect_item(app, item,
+                                vx + horizontal_region_offset(region), scroll);
+                    }
+#if TINTA_ENABLE_MERMAID
+                    for (i = 0; i < app->paths.len; i++) {
+                        TintaDrawPath *item = TINTA_VEC_PTR(
+                            TintaDrawPath, app->paths, i);
+                        if (item->horizontal_region == region_index &&
+                            item->layer == layer)
+                            draw_path_item(app, item,
+                                vx + horizontal_region_offset(region), scroll);
+                    }
+#endif
+                    for (i = 0; i < app->lines.len; i++) {
+                        TintaDrawLine *item = TINTA_VEC_PTR(
+                            TintaDrawLine, app->lines, i);
+                        if (item->horizontal_region == region_index &&
+                            item->layer == layer)
+                            draw_line_item(app, item,
+                                vx + horizontal_region_offset(region), scroll);
+                    }
                 }
                 app->render_target->lpVtbl->PopAxisAlignedClip(
                     app->render_target);

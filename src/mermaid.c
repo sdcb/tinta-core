@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,6 +96,7 @@ static const Delimiter DELIMITERS[] = {
 };
 
 static float maxf(float a, float b) { return a > b ? a : b; }
+static float minf(float a, float b) { return a < b ? a : b; }
 
 static bool is_space(char c) {
     return isspace((unsigned char)c) != 0;
@@ -1316,17 +1318,74 @@ static void index_lists_destroy(IndexList *lists, size_t count) {
     free(lists);
 }
 
-static float barycenter(size_t node, const IndexList *incoming, const size_t *rank,
-                        const float *order, size_t level) {
-    const TintaVec *values = &incoming[node].values;
+static float neighbor_barycenter(size_t node, const IndexList *neighbors,
+                                 const size_t *rank, const float *order,
+                                 size_t level, bool predecessors) {
+    const TintaVec *values = &neighbors[node].values;
     float total = 0.0f;
     size_t count = 0, i;
-    if (!values->len) return (float)node;
+    if (!values->len) return order[node];
     for (i = 0; i < values->len; i++) {
-        size_t parent = TINTA_VEC_AT(size_t, *values, i);
-        if (rank[parent] < level) { total += order[parent]; count++; }
+        size_t neighbor = TINTA_VEC_AT(size_t, *values, i);
+        if ((predecessors && rank[neighbor] < level) ||
+            (!predecessors && rank[neighbor] > level)) {
+            total += order[neighbor];
+            count++;
+        }
     }
-    return count ? total / (float)count : (float)node;
+    return count ? total / (float)count : order[node];
+}
+
+static void sort_level_by_neighbors(TintaVec *nodes,
+                                    const IndexList *neighbors,
+                                    const size_t *rank, float *order,
+                                    size_t level, bool predecessors,
+                                    bool bias_right) {
+    size_t j;
+    for (j = 1; j < nodes->len; j++) {
+        size_t value = TINTA_VEC_AT(size_t, *nodes, j), k = j;
+        float value_bary = neighbor_barycenter(
+            value, neighbors, rank, order, level, predecessors);
+        while (k > 0) {
+            size_t previous = TINTA_VEC_AT(size_t, *nodes, k - 1);
+            float previous_bary = neighbor_barycenter(
+                previous, neighbors, rank, order, level, predecessors);
+            if (previous_bary < value_bary ||
+                (previous_bary == value_bary && !bias_right)) break;
+            TINTA_VEC_AT(size_t, *nodes, k) = previous;
+            k--;
+        }
+        TINTA_VEC_AT(size_t, *nodes, k) = value;
+    }
+    for (j = 0; j < nodes->len; j++)
+        order[TINTA_VEC_AT(size_t, *nodes, j)] = (float)j;
+}
+
+static size_t layout_crossing_count(const LayoutEdge *edges,
+                                    size_t edge_count, const size_t *rank,
+                                    const float *order) {
+    size_t crossings = 0, i, j;
+    for (i = 0; i < edge_count; i++) {
+        size_t a0 = edges[i].from, a1 = edges[i].to;
+        size_t ar0 = rank[a0], ar1 = rank[a1];
+        float ao0 = order[a0], ao1 = order[a1];
+        if (ar0 > ar1) {
+            size_t tr = ar0; float to = ao0;
+            ar0 = ar1; ar1 = tr; ao0 = ao1; ao1 = to;
+        }
+        for (j = i + 1; j < edge_count; j++) {
+            size_t b0 = edges[j].from, b1 = edges[j].to;
+            size_t br0 = rank[b0], br1 = rank[b1];
+            float bo0 = order[b0], bo1 = order[b1];
+            if (br0 > br1) {
+                size_t tr = br0; float to = bo0;
+                br0 = br1; br1 = tr; bo0 = bo1; bo1 = to;
+            }
+            if (ar0 == br0 && ar1 == br1 &&
+                (ao0 - bo0) * (ao1 - bo1) < 0.0f) crossings++;
+        }
+    }
+    return crossings;
 }
 
 typedef struct FlatLayout {
@@ -1366,7 +1425,73 @@ typedef struct HierarchyLayoutContext {
     TintaMermaidLayout *result;
     ScopeLists *scopes;
     size_t scope_count;
+    bool *external_connections;
 } HierarchyLayoutContext;
+
+static bool subgraph_is_descendant(const TintaMermaidDiagram *diagram,
+                                   size_t candidate, size_t ancestor) {
+    size_t depth;
+    if (candidate >= diagram->subgraph_count ||
+        ancestor >= diagram->subgraph_count || candidate == ancestor)
+        return false;
+    for (depth = 0; depth <= 64 && candidate < diagram->subgraph_count;
+         depth++) {
+        candidate = diagram->subgraphs[candidate].parent_subgraph;
+        if (candidate == ancestor) return true;
+        if (candidate == SIZE_MAX) break;
+    }
+    return false;
+}
+
+static bool node_is_descendant(const TintaMermaidDiagram *diagram,
+                               size_t node, size_t ancestor) {
+    size_t parent, depth;
+    if (node >= diagram->node_count || ancestor >= diagram->subgraph_count)
+        return false;
+    parent = diagram->nodes[node].parent_subgraph;
+    for (depth = 0; depth <= 64 && parent < diagram->subgraph_count;
+         depth++) {
+        if (parent == ancestor) return true;
+        parent = diagram->subgraphs[parent].parent_subgraph;
+    }
+    return false;
+}
+
+static bool edge_endpoint_inside_group(const TintaMermaidDiagram *diagram,
+                                       bool subgraph, size_t endpoint,
+                                       size_t group) {
+    if (subgraph)
+        return subgraph_is_descendant(diagram, endpoint, group);
+    return node_is_descendant(diagram, endpoint, group);
+}
+
+static bool build_external_connection_flags(HierarchyLayoutContext *context) {
+    const TintaMermaidDiagram *diagram = context->diagram;
+    size_t group, edge_index;
+    context->external_connections = (bool *)calloc(
+        diagram->subgraph_count ? diagram->subgraph_count : 1,
+        sizeof(*context->external_connections));
+    if (!context->external_connections) return false;
+    for (group = 0; group < diagram->subgraph_count; group++) {
+        for (edge_index = 0; edge_index < diagram->edge_count; edge_index++) {
+            const TintaMermaidEdge *edge = &diagram->edges[edge_index];
+            bool from_inside;
+            bool to_inside;
+            if ((edge->from_subgraph && edge->from == group) ||
+                (edge->to_subgraph && edge->to == group))
+                continue;
+            from_inside = edge_endpoint_inside_group(diagram,
+                edge->from_subgraph, edge->from, group);
+            to_inside = edge_endpoint_inside_group(diagram,
+                edge->to_subgraph, edge->to, group);
+            if (from_inside != to_inside) {
+                context->external_connections[group] = true;
+                break;
+            }
+        }
+    }
+    return true;
+}
 
 static void flat_layout_destroy(FlatLayout *layout) {
     if (!layout) return;
@@ -1383,7 +1508,8 @@ static FlatLayout layout_flat(TintaMermaidDirection direction,
     IndexList *outgoing = NULL, *incoming = NULL, *levels = NULL;
     size_t *indegree = NULL, *rank = NULL, *queue = NULL;
     bool *processed = NULL;
-    float *order = NULL, *rank_widths = NULL, *rank_heights = NULL;
+    float *order = NULL, *best_order = NULL;
+    float *rank_widths = NULL, *rank_heights = NULL;
     size_t i, max_rank = 0, queue_head = 0, queue_tail = 0, next_rank;
     bool processed_any = false;
     memset(&result, 0, sizeof(result));
@@ -1397,7 +1523,9 @@ static FlatLayout layout_flat(TintaMermaidDirection direction,
     queue = (size_t *)malloc(n * sizeof(*queue));
     processed = (bool *)calloc(n, sizeof(*processed));
     order = (float *)calloc(n, sizeof(*order));
-    if (!outgoing || !incoming || !indegree || !rank || !queue || !processed || !order) goto cleanup;
+    best_order = (float *)calloc(n, sizeof(*best_order));
+    if (!outgoing || !incoming || !indegree || !rank || !queue ||
+        !processed || !order || !best_order) goto cleanup;
     for (i = 0; i < n; i++) {
         tinta_vec_init(&outgoing[i].values, sizeof(size_t));
         tinta_vec_init(&incoming[i].values, sizeof(size_t));
@@ -1435,22 +1563,50 @@ static FlatLayout layout_flat(TintaMermaidDirection direction,
     memcpy(result.ranks, rank, n * sizeof(*rank));
     result.count = n;
     for (i = 0; i <= max_rank; i++) {
-        TintaVec *nodes = &levels[i].values;
         size_t j;
-        if (i > 0) {
+        for (j = 0; j < levels[i].values.len; j++)
+            order[TINTA_VEC_AT(size_t, levels[i].values, j)] = (float)j;
+    }
+    memcpy(best_order, order, n * sizeof(*order));
+    {
+        size_t best_crossings = SIZE_MAX;
+        size_t pass;
+        for (pass = 0; pass < 8; pass++) {
+            bool bias_right = (pass & 1) != 0;
+            if ((pass & 1) == 0) {
+                for (i = 1; i <= max_rank; i++)
+                    sort_level_by_neighbors(&levels[i].values, incoming,
+                        rank, order, i, true, bias_right);
+            } else {
+                for (i = max_rank; i-- > 0;)
+                    sort_level_by_neighbors(&levels[i].values, outgoing,
+                        rank, order, i, false, bias_right);
+            }
+            {
+                size_t crossings = layout_crossing_count(
+                    edges, edge_count, rank, order);
+                if (crossings < best_crossings) {
+                    best_crossings = crossings;
+                    memcpy(best_order, order, n * sizeof(*order));
+                }
+            }
+        }
+        memcpy(order, best_order, n * sizeof(*order));
+        for (i = 0; i <= max_rank; i++) {
+            TintaVec *nodes = &levels[i].values;
+            size_t j;
             for (j = 1; j < nodes->len; j++) {
                 size_t value = TINTA_VEC_AT(size_t, *nodes, j), k = j;
-                float value_bary = barycenter(value, incoming, rank, order, i);
-                while (k > 0) {
-                    size_t previous = TINTA_VEC_AT(size_t, *nodes, k - 1);
-                    if (barycenter(previous, incoming, rank, order, i) <= value_bary) break;
-                    TINTA_VEC_AT(size_t, *nodes, k) = previous;
+                while (k > 0 &&
+                       order[TINTA_VEC_AT(size_t, *nodes, k - 1)] >
+                           order[value]) {
+                    TINTA_VEC_AT(size_t, *nodes, k) =
+                        TINTA_VEC_AT(size_t, *nodes, k - 1);
                     k--;
                 }
                 TINTA_VEC_AT(size_t, *nodes, k) = value;
             }
         }
-        for (j = 0; j < nodes->len; j++) order[TINTA_VEC_AT(size_t, *nodes, j)] = (float)j;
     }
     if (direction == TINTA_MERMAID_TOP_TO_BOTTOM || direction == TINTA_MERMAID_BOTTOM_TO_TOP) {
         float y = 0.0f;
@@ -1529,6 +1685,7 @@ cleanup:
     index_lists_destroy(incoming, incoming ? n : 0);
     index_lists_destroy(levels, levels ? max_rank + 1 : 0);
     free(indegree); free(rank); free(queue); free(processed); free(order);
+    free(best_order);
     free(rank_widths); free(rank_heights);
     if (result.count != n) flat_layout_destroy(&result);
     return result;
@@ -1684,7 +1841,9 @@ static bool layout_scope(HierarchyLayoutContext *context, size_t scope,
         !tinta_vec_init(&edges, sizeof(LayoutEdge))) goto cleanup;
     if (scope != SIZE_MAX) {
         const TintaMermaidSubgraph *group = &diagram->subgraphs[scope];
-        if (group->has_direction) direction = group->direction;
+        if (group->has_direction &&
+            !context->external_connections[scope])
+            direction = group->direction;
     }
     for (i = 0; i < scope_lists->nodes.len; i++) {
         ScopeItem item;
@@ -1767,6 +1926,335 @@ cleanup:
     return ok;
 }
 
+static TintaMermaidPoint rect_center(TintaMermaidRect rect) {
+    TintaMermaidPoint point = {
+        (rect.left + rect.right) * 0.5f,
+        (rect.top + rect.bottom) * 0.5f
+    };
+    return point;
+}
+
+static TintaMermaidPoint polygon_intersection(
+        const TintaMermaidPoint *polygon, size_t count,
+        TintaMermaidPoint center, TintaMermaidPoint toward) {
+    TintaMermaidPoint result = center;
+    float ray_x = toward.x - center.x;
+    float ray_y = toward.y - center.y;
+    float best = FLT_MAX;
+    size_t i;
+    for (i = 0; i < count; i++) {
+        TintaMermaidPoint a = polygon[i];
+        TintaMermaidPoint b = polygon[(i + 1) % count];
+        float edge_x = b.x - a.x;
+        float edge_y = b.y - a.y;
+        float denominator = ray_x * edge_y - ray_y * edge_x;
+        float offset_x;
+        float offset_y;
+        float ray_t;
+        float edge_t;
+        if (fabsf(denominator) < 0.0001f) continue;
+        offset_x = a.x - center.x;
+        offset_y = a.y - center.y;
+        ray_t = (offset_x * edge_y - offset_y * edge_x) / denominator;
+        edge_t = (offset_x * ray_y - offset_y * ray_x) / denominator;
+        if (ray_t >= 0 && edge_t >= 0 && edge_t <= 1 && ray_t < best) {
+            best = ray_t;
+            result.x = center.x + ray_x * ray_t;
+            result.y = center.y + ray_y * ray_t;
+        }
+    }
+    return result;
+}
+
+static TintaMermaidPoint endpoint_intersection(
+        TintaMermaidRect rect, bool subgraph, TintaMermaidNodeShape shape,
+        TintaMermaidPoint toward) {
+    TintaMermaidPoint center = rect_center(rect);
+    float half_width = maxf(0.5f, (rect.right - rect.left) * 0.5f);
+    float half_height = maxf(0.5f, (rect.bottom - rect.top) * 0.5f);
+    float dx = toward.x - center.x;
+    float dy = toward.y - center.y;
+    float t;
+    if (fabsf(dx) < 0.0001f && fabsf(dy) < 0.0001f) return center;
+    if (!subgraph && shape == TINTA_MERMAID_CIRCLE) {
+        float denominator = sqrtf(dx * dx / (half_width * half_width) +
+                                  dy * dy / (half_height * half_height));
+        t = denominator > 0.0001f ? 1.0f / denominator : 0;
+        return (TintaMermaidPoint){center.x + dx * t, center.y + dy * t};
+    }
+    if (!subgraph && shape == TINTA_MERMAID_DIAMOND) {
+        float denominator = fabsf(dx) / half_width + fabsf(dy) / half_height;
+        t = denominator > 0.0001f ? 1.0f / denominator : 0;
+        return (TintaMermaidPoint){center.x + dx * t, center.y + dy * t};
+    }
+    if (!subgraph && shape == TINTA_MERMAID_HEXAGON) {
+        TintaMermaidPoint polygon[6] = {
+            {rect.left + half_width * 0.5f, rect.top},
+            {rect.right - half_width * 0.5f, rect.top},
+            {rect.right, center.y},
+            {rect.right - half_width * 0.5f, rect.bottom},
+            {rect.left + half_width * 0.5f, rect.bottom},
+            {rect.left, center.y}
+        };
+        return polygon_intersection(polygon, 6, center, toward);
+    }
+    {
+        float tx = fabsf(dx) > 0.0001f ? half_width / fabsf(dx) : FLT_MAX;
+        float ty = fabsf(dy) > 0.0001f ? half_height / fabsf(dy) : FLT_MAX;
+        t = minf(tx, ty);
+    }
+    return (TintaMermaidPoint){center.x + dx * t, center.y + dy * t};
+}
+
+static bool append_route_point(TintaVec *points, float x, float y) {
+    TintaMermaidPoint point = {x, y};
+    return tinta_vec_push(points, &point) != NULL;
+}
+
+static TintaMermaidPoint cubic_point(TintaMermaidPoint a,
+                                    TintaMermaidPoint b,
+                                    TintaMermaidPoint c,
+                                    TintaMermaidPoint d, float t) {
+    float u = 1.0f - t;
+    TintaMermaidPoint result = {
+        u * u * u * a.x + 3 * u * u * t * b.x +
+            3 * u * t * t * c.x + t * t * t * d.x,
+        u * u * u * a.y + 3 * u * u * t * b.y +
+            3 * u * t * t * c.y + t * t * t * d.y
+    };
+    return result;
+}
+
+static size_t cubic_node_collision_count(
+        const TintaMermaidDiagram *diagram, const TintaMermaidLayout *layout,
+        const TintaMermaidEdge *edge, TintaMermaidPoint a,
+        TintaMermaidPoint b, TintaMermaidPoint c, TintaMermaidPoint d,
+        float padding) {
+    size_t collisions = 0, node, sample;
+    if (layout->node_count > 512) return 0;
+    for (node = 0; node < layout->node_count; node++) {
+        TintaMermaidRect rect;
+        if ((!edge->from_subgraph && node == edge->from) ||
+            (!edge->to_subgraph && node == edge->to))
+            continue;
+        rect = layout->nodes[node];
+        rect.left -= padding; rect.right += padding;
+        rect.top -= padding; rect.bottom += padding;
+        for (sample = 1; sample < 24; sample++) {
+            TintaMermaidPoint point = cubic_point(
+                a, b, c, d, (float)sample / 24.0f);
+            if (point.x > rect.left && point.x < rect.right &&
+                point.y > rect.top && point.y < rect.bottom) {
+                collisions++;
+                break;
+            }
+        }
+    }
+    (void)diagram;
+    return collisions;
+}
+
+static size_t parallel_edge_ordinal(const TintaMermaidDiagram *diagram,
+                                    size_t edge_index) {
+    const TintaMermaidEdge *edge = &diagram->edges[edge_index];
+    size_t ordinal = 0, i;
+    for (i = 0; i < edge_index; i++) {
+        const TintaMermaidEdge *other = &diagram->edges[i];
+        if (other->from == edge->from && other->to == edge->to &&
+            other->from_subgraph == edge->from_subgraph &&
+            other->to_subgraph == edge->to_subgraph)
+            ordinal++;
+    }
+    return ordinal;
+}
+
+static bool build_edge_routes(const TintaMermaidDiagram *diagram,
+                              TintaMermaidLayout *layout,
+                              float scale_factor) {
+    TintaVec points = {0};
+    size_t i;
+    if (!tinta_vec_init(&points, sizeof(TintaMermaidPoint))) return false;
+    layout->edges = (TintaMermaidEdgeRoute *)calloc(
+        diagram->edge_count ? diagram->edge_count : 1,
+        sizeof(*layout->edges));
+    if (!layout->edges) {
+        tinta_vec_destroy(&points);
+        return false;
+    }
+    layout->edge_count = diagram->edge_count;
+    for (i = 0; i < diagram->edge_count; i++) {
+        const TintaMermaidEdge *edge = &diagram->edges[i];
+        TintaMermaidEdgeRoute *route = &layout->edges[i];
+        TintaMermaidRect from_rect = edge->from_subgraph ?
+            layout->subgraphs[edge->from] : layout->nodes[edge->from];
+        TintaMermaidRect to_rect = edge->to_subgraph ?
+            layout->subgraphs[edge->to] : layout->nodes[edge->to];
+        TintaMermaidPoint from_center = rect_center(from_rect);
+        TintaMermaidPoint to_center = rect_center(to_rect);
+        TintaMermaidNodeShape from_shape = edge->from_subgraph ?
+            TINTA_MERMAID_RECTANGLE : diagram->nodes[edge->from].shape;
+        TintaMermaidNodeShape to_shape = edge->to_subgraph ?
+            TINTA_MERMAID_RECTANGLE : diagram->nodes[edge->to].shape;
+        size_t ordinal = parallel_edge_ordinal(diagram, i);
+        float parallel_offset = ordinal ?
+            (float)((ordinal + 1) / 2) * 7.0f * scale_factor *
+                (ordinal & 1 ? 1.0f : -1.0f) : 0;
+        route->point_offset = points.len;
+        if (edge->from_subgraph == edge->to_subgraph &&
+            edge->from == edge->to) {
+            float radius = 34.0f * scale_factor + fabsf(parallel_offset);
+            float center_y = from_center.y;
+            TintaMermaidPoint start = {from_rect.right,
+                center_y - minf(10.0f * scale_factor,
+                                (from_rect.bottom - from_rect.top) * 0.2f)};
+            TintaMermaidPoint end = {from_rect.right,
+                center_y + minf(10.0f * scale_factor,
+                                (from_rect.bottom - from_rect.top) * 0.2f)};
+            if (!append_route_point(&points, start.x, start.y) ||
+                !append_route_point(&points, start.x + radius, start.y - radius) ||
+                !append_route_point(&points, start.x + radius, end.y + radius) ||
+                !append_route_point(&points, end.x, end.y)) goto failed;
+        } else {
+            bool horizontal = fabsf(to_center.x - from_center.x) >=
+                              fabsf(to_center.y - from_center.y);
+            TintaMermaidPoint start_toward;
+            TintaMermaidPoint end_toward;
+            TintaMermaidPoint start;
+            TintaMermaidPoint end;
+            TintaMermaidPoint control1;
+            TintaMermaidPoint control2;
+            if (horizontal) {
+                float sign = to_center.x >= from_center.x ? 1.0f : -1.0f;
+                float distance;
+                start_toward = (TintaMermaidPoint){
+                    from_center.x + sign, from_center.y};
+                end_toward = (TintaMermaidPoint){
+                    to_center.x - sign, to_center.y};
+                start = endpoint_intersection(from_rect,
+                    edge->from_subgraph, from_shape, start_toward);
+                end = endpoint_intersection(to_rect,
+                    edge->to_subgraph, to_shape, end_toward);
+                distance = maxf(24.0f * scale_factor,
+                    fabsf(end.x - start.x) * 0.42f);
+                control1 = (TintaMermaidPoint){
+                    start.x + sign * distance,
+                    start.y + parallel_offset};
+                control2 = (TintaMermaidPoint){
+                    end.x - sign * distance,
+                    end.y + parallel_offset};
+            } else {
+                float sign = to_center.y >= from_center.y ? 1.0f : -1.0f;
+                float distance;
+                start_toward = (TintaMermaidPoint){
+                    from_center.x, from_center.y + sign};
+                end_toward = (TintaMermaidPoint){
+                    to_center.x, to_center.y - sign};
+                start = endpoint_intersection(from_rect,
+                    edge->from_subgraph, from_shape, start_toward);
+                end = endpoint_intersection(to_rect,
+                    edge->to_subgraph, to_shape, end_toward);
+                distance = maxf(24.0f * scale_factor,
+                    fabsf(end.y - start.y) * 0.42f);
+                control1 = (TintaMermaidPoint){
+                    start.x + parallel_offset,
+                    start.y + sign * distance};
+                control2 = (TintaMermaidPoint){
+                    end.x + parallel_offset,
+                    end.y - sign * distance};
+            }
+            {
+                TintaMermaidPoint best1 = control1;
+                TintaMermaidPoint best2 = control2;
+                size_t best_collisions = cubic_node_collision_count(
+                    diagram, layout, edge, start, control1, control2, end,
+                    4.0f * scale_factor);
+                size_t attempt;
+                for (attempt = 1; attempt <= 8 && best_collisions; attempt++) {
+                    float magnitude = (float)((attempt + 1) / 2) *
+                                      24.0f * scale_factor;
+                    float shift = (attempt & 1) ? magnitude : -magnitude;
+                    TintaMermaidPoint candidate1 = control1;
+                    TintaMermaidPoint candidate2 = control2;
+                    size_t collisions;
+                    if (horizontal) {
+                        candidate1.y += shift;
+                        candidate2.y += shift;
+                    } else {
+                        candidate1.x += shift;
+                        candidate2.x += shift;
+                    }
+                    collisions = cubic_node_collision_count(
+                        diagram, layout, edge, start, candidate1,
+                        candidate2, end, 4.0f * scale_factor);
+                    if (collisions < best_collisions) {
+                        best_collisions = collisions;
+                        best1 = candidate1;
+                        best2 = candidate2;
+                    }
+                }
+                control1 = best1;
+                control2 = best2;
+            }
+            if (!append_route_point(&points, start.x, start.y) ||
+                !append_route_point(&points, control1.x, control1.y) ||
+                !append_route_point(&points, control2.x, control2.y) ||
+                !append_route_point(&points, end.x, end.y)) goto failed;
+        }
+        route->point_count = points.len - route->point_offset;
+        if (route->point_count == 4) {
+            TintaMermaidPoint *route_points =
+                (TintaMermaidPoint *)points.data + route->point_offset;
+            TintaMermaidPoint middle = cubic_point(route_points[0],
+                route_points[1], route_points[2], route_points[3], 0.5f);
+            route->label_x = middle.x;
+            route->label_y = middle.y;
+        }
+    }
+    layout->points = (TintaMermaidPoint *)points.data;
+    layout->point_count = points.len;
+    return true;
+failed:
+    tinta_vec_destroy(&points);
+    return false;
+}
+
+static void normalize_layout_bounds(TintaMermaidLayout *layout) {
+    float min_x = 0, min_y = 0;
+    float max_x = layout->width, max_y = layout->height;
+    float dx, dy;
+    size_t i;
+    for (i = 0; i < layout->point_count; i++) {
+        min_x = minf(min_x, layout->points[i].x);
+        min_y = minf(min_y, layout->points[i].y);
+        max_x = maxf(max_x, layout->points[i].x);
+        max_y = maxf(max_y, layout->points[i].y);
+    }
+    dx = min_x < 0 ? -min_x : 0;
+    dy = min_y < 0 ? -min_y : 0;
+    if (dx || dy) {
+        for (i = 0; i < layout->node_count; i++) {
+            layout->nodes[i].left += dx; layout->nodes[i].right += dx;
+            layout->nodes[i].top += dy; layout->nodes[i].bottom += dy;
+        }
+        for (i = 0; i < layout->subgraph_count; i++) {
+            layout->subgraphs[i].left += dx;
+            layout->subgraphs[i].right += dx;
+            layout->subgraphs[i].top += dy;
+            layout->subgraphs[i].bottom += dy;
+        }
+        for (i = 0; i < layout->point_count; i++) {
+            layout->points[i].x += dx;
+            layout->points[i].y += dy;
+        }
+        for (i = 0; i < layout->edge_count; i++) {
+            layout->edges[i].label_x += dx;
+            layout->edges[i].label_y += dy;
+        }
+    }
+    layout->width = max_x + dx;
+    layout->height = max_y + dy;
+}
+
 TintaMermaidLayout tinta_mermaid_layout(
         const TintaMermaidDiagram *diagram,
         const TintaMermaidSize *node_sizes, size_t node_size_count,
@@ -1803,11 +2291,16 @@ TintaMermaidLayout tinta_mermaid_layout(
     context.node_gap = maxf(0, node_gap);
     context.rank_gap = maxf(0, rank_gap);
     context.result = &result;
-    if (!scope_lists_build(&context) ||
+    if (!build_external_connection_flags(&context) ||
+        !scope_lists_build(&context) ||
         !layout_scope(&context, SIZE_MAX, diagram->direction,
-                      &result.width, &result.height))
+                      &result.width, &result.height) ||
+        !build_edge_routes(diagram, &result, context.scale_factor))
         tinta_mermaid_layout_destroy(&result);
+    else
+        normalize_layout_bounds(&result);
     scope_lists_destroy(&context);
+    free(context.external_connections);
     return result;
 }
 
@@ -1816,5 +2309,7 @@ void tinta_mermaid_layout_destroy(TintaMermaidLayout *layout) {
     free(layout->nodes);
     free(layout->subgraphs);
     free(layout->ranks);
+    free(layout->edges);
+    free(layout->points);
     memset(layout, 0, sizeof(*layout));
 }

@@ -14,8 +14,10 @@
   blocks, with search and UIA access automatically revealing hidden content.
 - Centered Mermaid node labels and synchronized shape-aware diamond, hexagon,
   circle, and rectangle sizing with the upstream renderer.
-- Added recursively laid-out Mermaid Subgraphs with nesting, group endpoints,
-  local directions, centered titles, and container styling.
+- Added Mermaid Subgraphs with nesting, group endpoints, centered titles,
+  container styling, and upstream-compatible inherited direction semantics.
+- Reworked Mermaid compound layout to emit shape-clipped cubic Direct2D paths,
+  reducing crossings and removing multi-bend exterior routing lanes.
 - Preserved combined nested inline styles, including emphasized and linked
   code spans, and removed the synthetic full-space gap after inline code.
 

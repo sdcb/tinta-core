@@ -6,6 +6,7 @@
 #define ID2D1Factory TintaMingwID2D1Factory
 #define ID2D1HwndRenderTarget TintaMingwID2D1HwndRenderTarget
 #define ID2D1SolidColorBrush TintaMingwID2D1SolidColorBrush
+#define ID2D1StrokeStyle TintaMingwID2D1StrokeStyle
 #define ID2D1Bitmap TintaMingwID2D1Bitmap
 #define ID2D1PathGeometry TintaMingwID2D1PathGeometry
 #define ID2D1GeometrySink TintaMingwID2D1GeometrySink
@@ -18,6 +19,7 @@
 #undef ID2D1Factory
 #undef ID2D1HwndRenderTarget
 #undef ID2D1SolidColorBrush
+#undef ID2D1StrokeStyle
 #undef ID2D1Bitmap
 #undef ID2D1PathGeometry
 #undef ID2D1GeometrySink
@@ -25,6 +27,7 @@
 typedef struct ID2D1Factory ID2D1Factory;
 typedef struct ID2D1HwndRenderTarget ID2D1HwndRenderTarget;
 typedef struct ID2D1SolidColorBrush ID2D1SolidColorBrush;
+typedef struct ID2D1StrokeStyle ID2D1StrokeStyle;
 typedef struct ID2D1Bitmap ID2D1Bitmap;
 typedef struct ID2D1PathGeometry ID2D1PathGeometry;
 typedef struct ID2D1GeometrySink ID2D1GeometrySink;
@@ -302,7 +305,10 @@ typedef struct TintaID2D1FactoryVtbl {
     ULONG (STDMETHODCALLTYPE *Release)(ID2D1Factory *);
     TintaComMethod unused_before_path_geometry[7];
     HRESULT (STDMETHODCALLTYPE *CreatePathGeometry)(ID2D1Factory *, ID2D1PathGeometry **);
-    TintaComMethod unused_before_hwnd_target[3];
+    HRESULT (STDMETHODCALLTYPE *CreateStrokeStyle)(
+        ID2D1Factory *, const D2D1_STROKE_STYLE_PROPERTIES *,
+        const FLOAT *, UINT, ID2D1StrokeStyle **);
+    TintaComMethod unused_before_hwnd_target[2];
     HRESULT (STDMETHODCALLTYPE *CreateHwndRenderTarget)(
         ID2D1Factory *, const D2D1_RENDER_TARGET_PROPERTIES *,
         const D2D1_HWND_RENDER_TARGET_PROPERTIES *, ID2D1HwndRenderTarget **);
@@ -393,6 +399,16 @@ struct ID2D1SolidColorBrush {
     const TintaID2D1SolidColorBrushVtbl *lpVtbl;
 };
 
+typedef struct TintaID2D1StrokeStyleVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID2D1StrokeStyle *, REFIID, void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(ID2D1StrokeStyle *);
+    ULONG (STDMETHODCALLTYPE *Release)(ID2D1StrokeStyle *);
+} TintaID2D1StrokeStyleVtbl;
+
+struct ID2D1StrokeStyle {
+    const TintaID2D1StrokeStyleVtbl *lpVtbl;
+};
+
 typedef struct TintaID2D1BitmapVtbl {
     HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID2D1Bitmap *, REFIID, void **);
     ULONG (STDMETHODCALLTYPE *AddRef)(ID2D1Bitmap *);
@@ -424,7 +440,8 @@ typedef struct TintaID2D1GeometrySinkVtbl {
     void (STDMETHODCALLTYPE *BeginFigure)(ID2D1GeometrySink *, D2D1_POINT_2F,
                                           D2D1_FIGURE_BEGIN);
     void (STDMETHODCALLTYPE *AddLines)(ID2D1GeometrySink *, const D2D1_POINT_2F *, UINT);
-    TintaComMethod add_beziers;
+    void (STDMETHODCALLTYPE *AddBeziers)(ID2D1GeometrySink *,
+                                         const D2D1_BEZIER_SEGMENT *, UINT);
     void (STDMETHODCALLTYPE *EndFigure)(ID2D1GeometrySink *, D2D1_FIGURE_END);
     HRESULT (STDMETHODCALLTYPE *Close)(ID2D1GeometrySink *);
 } TintaID2D1GeometrySinkVtbl;

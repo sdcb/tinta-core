@@ -2,9 +2,11 @@
 
 #include "app.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cwchar>
+#include <initializer_list>
 #include <iostream>
 
 namespace {
@@ -43,6 +45,77 @@ TintaDrawRect *find_outline(TintaApp &app, TintaDrawShape shape) {
         if (rect->outline && rect->shape == shape) return rect;
     }
     return nullptr;
+}
+
+bool segment_crosses_run(const TintaDrawLine &line, const TintaTextRun &run) {
+    float left = run.x + 1.0f;
+    float right = run.x + run.width - 1.0f;
+    float top = run.y + 1.0f;
+    float bottom = run.y + run.height - 1.0f;
+    float x0 = static_cast<float>(line.a.x);
+    float y0 = static_cast<float>(line.a.y);
+    float dx = static_cast<float>(line.b.x - line.a.x);
+    float dy = static_cast<float>(line.b.y - line.a.y);
+    float t0 = 0.0f;
+    float t1 = 1.0f;
+    auto clip = [&](float p, float q) {
+        if (std::fabs(p) < 0.0001f) return q >= 0.0f;
+        float value = q / p;
+        if (p < 0.0f) {
+            if (value > t1) return false;
+            t0 = t0 > value ? t0 : value;
+        } else {
+            if (value < t0) return false;
+            t1 = t1 < value ? t1 : value;
+        }
+        return true;
+    };
+    return right > left && bottom > top &&
+           clip(-dx, x0 - left) && clip(dx, right - x0) &&
+           clip(-dy, y0 - top) && clip(dy, bottom - y0) &&
+           t0 <= t1;
+}
+
+bool connector_avoids_runs(TintaApp &app,
+                           std::initializer_list<TintaTextRun *> runs) {
+    for (size_t i = 0; i < app.lines.len; i++) {
+        auto *line = TINTA_VEC_PTR(TintaDrawLine, app.lines, i);
+        if (line->color != app.theme->quote) continue;
+        for (auto *run : runs) {
+            if (run && segment_crosses_run(*line, *run)) return false;
+        }
+    }
+    for (size_t i = 0; i < app.paths.len; i++) {
+        auto *path = TINTA_VEC_PTR(TintaDrawPath, app.paths, i);
+        if (path->color != app.theme->quote || path->point_count < 4 ||
+            path->point_offset + path->point_count > app.path_points.len)
+            continue;
+        auto *points = static_cast<D2D1_POINT_2F *>(app.path_points.data) +
+                       path->point_offset;
+        for (size_t segment = 0; segment + 3 < path->point_count;
+             segment += 3) {
+            for (int sample = 0; sample <= 32; sample++) {
+                float t = static_cast<float>(sample) / 32.0f;
+                float u = 1.0f - t;
+                float x = u*u*u*points[segment].x +
+                    3*u*u*t*points[segment+1].x +
+                    3*u*t*t*points[segment+2].x +
+                    t*t*t*points[segment+3].x;
+                float y = u*u*u*points[segment].y +
+                    3*u*u*t*points[segment+1].y +
+                    3*u*t*t*points[segment+2].y +
+                    t*t*t*points[segment+3].y;
+                for (auto *run : runs) {
+                    if (run && x > run->x + 1 &&
+                        x < run->x + run->width - 1 &&
+                        y > run->y + 1 &&
+                        y < run->y + run->height - 1)
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 #endif
 
@@ -207,7 +280,7 @@ void test_mermaid_layout(TintaApp &app) {
         "flowchart LR\n"
         "A[Rect] --> B{Feature}\n"
         "B --> C{{Hex}}\n"
-        "C --> D((Circle))\n"
+        "C -.-> D((Circle))\n"
         "```\n";
     check(load(app, source), "Mermaid geometry document lays out");
     if (!app.layout_complete) return;
@@ -229,6 +302,21 @@ void test_mermaid_layout(TintaApp &app) {
     check(circle && std::abs((circle->rect.right - circle->rect.left) -
                              (circle->rect.bottom - circle->rect.top)) <= 1,
           "circle remains square");
+    check(app.paths.len == 3,
+          "Mermaid edges are stored as Direct2D cubic paths");
+    if (app.paths.len == 3) {
+        bool found_dashed = false;
+        for (size_t i = 0; i < app.paths.len; i++) {
+            auto *path = TINTA_VEC_PTR(TintaDrawPath, app.paths, i);
+            check(path->point_count == 4 && path->horizontal_region == 0,
+                  "ordinary Mermaid edges use one clipped cubic segment");
+            found_dashed = found_dashed || path->dashed;
+        }
+        check(found_dashed, "dashed Mermaid edges retain their stroke style");
+    }
+    tinta_render(&app);
+    check(app.render_target != nullptr,
+          "Direct2D renders solid and dashed Mermaid cubic paths");
 
     if (feature && diamond) {
         FLOAT first_x = 0;
@@ -370,8 +458,11 @@ void test_mermaid_subgraph_layout(TintaApp &app) {
                   (inner->rect.left + inner->rect.right) * 0.5f) < 2.0f,
               "inner subgraph title is centered");
     }
-    check(a && b && c && a->y + a->height < b->y && b->x > c->x,
-          "nested local TB and RL directions survive rendering");
+    check(a && b && c && a->y + a->height < b->y &&
+              b->y + b->height < c->y,
+          "member external links make nested group inherit parent TB direction");
+    check(connector_avoids_runs(app, {a, b, c}),
+          "Subgraph connector routing avoids unrelated node labels");
     if (pipeline) {
         size_t position = SIZE_MAX;
         tinta_hit_test(&app, pipeline->x + 1, pipeline->y + 1,

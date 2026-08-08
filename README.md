@@ -108,7 +108,10 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   outlines while retaining block-local horizontal scrolling.
 - Mermaid flowcharts support nested Subgraphs, explicit IDs and titles,
   group endpoints, per-group directions, and `style`/`classDef` styling.
-  Groups use recursive layout so nested members remain inside their containers.
+  A group keeps its local direction until one of its member nodes connects
+  outside; in that case it inherits the parent direction, matching Mermaid.
+  Compound layout keeps nested members inside their containers and emits
+  shape-clipped Direct2D spline routes instead of multi-bend exterior lanes.
 - Wide code and Mermaid blocks scroll horizontally inside the block instead
   of widening the document. Blocks keep a 240-DIP minimum width in extremely
   narrow hosts; their internal bars support dragging, horizontal wheel input,

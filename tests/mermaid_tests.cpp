@@ -83,8 +83,11 @@ void testSpecialCases() {
         auto layout = tinta_mermaid_layout(&cyclic.diagram,
             sizes.data(), sizes.size(), nullptr, 0, 1.0f, 20.0f, 40.0f);
         check(layout.node_count == 2, "cyclic layout nodes");
-        check(layout.nodes[0].top == 0.0f && layout.nodes[0].bottom < layout.nodes[1].top,
+        check(layout.nodes[0].bottom < layout.nodes[1].top,
               "cyclic ranks do not overlap");
+        check(layout.edge_count == cyclic.diagram.edge_count &&
+                  layout.point_count >= cyclic.diagram.edge_count * 4,
+              "cyclic layout returns edge routes");
         tinta_mermaid_layout_destroy(&layout);
     }
     tinta_mermaid_parse_result_destroy(&cyclic);
@@ -186,8 +189,13 @@ classDef grouped fill:#223344,color:#ffffff
                   "nested group stays inside parent padding");
             check(layout.nodes[ai].bottom < inner_box.top,
                   "outer TB direction places A above inner group");
-            check(layout.nodes[bi].left > layout.nodes[ci].left,
-                  "inner RL direction remains independent");
+            check(layout.nodes[bi].bottom < layout.nodes[ci].top,
+                  "inner group with member external links inherits parent direction");
+            check(layout.edge_count == result.diagram.edge_count,
+                  "Subgraph layout returns a route for every edge");
+            for (size_t edge = 0; edge < layout.edge_count; edge++)
+                check(layout.edges[edge].point_count == 4,
+                      "ordinary Subgraph edges use one cubic segment");
         }
         tinta_mermaid_layout_destroy(&layout);
     }
@@ -228,6 +236,107 @@ classDef grouped fill:#223344,color:#ffffff
         limited_source, std::strlen(limited_source), 1, 10);
     check(!limited.success, "subgraphs count toward Mermaid node limit");
     tinta_mermaid_parse_result_destroy(&limited);
+
+    auto isolated = parse(
+        "flowchart TB\nsubgraph group [Independent]\n"
+        "direction RL\nA --> B\nend\noutside --> group\n");
+    check(isolated.success, "isolated local-direction Subgraph parses");
+    if (isolated.success) {
+        std::vector<TintaMermaidSize> node_sizes(
+            isolated.diagram.node_count, {100.0f, 52.0f});
+        std::vector<TintaMermaidSize> title_sizes(
+            isolated.diagram.subgraph_count, {100.0f, 20.0f});
+        auto layout = tinta_mermaid_layout(&isolated.diagram,
+            node_sizes.data(), node_sizes.size(), title_sizes.data(),
+            title_sizes.size(), 1.0f, 32.0f, 78.0f);
+        const auto *a = tinta_mermaid_find_node(&isolated.diagram, "A");
+        const auto *b = tinta_mermaid_find_node(&isolated.diagram, "B");
+        size_t ai = static_cast<size_t>(a - isolated.diagram.nodes);
+        size_t bi = static_cast<size_t>(b - isolated.diagram.nodes);
+        check(layout.nodes[ai].left > layout.nodes[bi].right,
+              "container-only external edge preserves local RL direction");
+        tinta_mermaid_layout_destroy(&layout);
+    }
+    tinta_mermaid_parse_result_destroy(&isolated);
+
+    auto pipeline = parse(R"(flowchart LR
+A[Markdown source] --> pipeline --> F[Win32 control]
+subgraph pipeline [Tinta Core pipeline]
+  direction TB
+  B{Feature} --> renderers
+  subgraph renderers [Renderers]
+    direction RL
+    C{{Code and table}}
+    D((Remote image))
+    E[Mermaid renderer]
+  end
+  B --> C
+  B --> D
+  B --> E
+end
+C --> F
+D --> F
+E --> F
+)" );
+    check(pipeline.success, "official-compatible pipeline fixture parses");
+    if (pipeline.success) {
+        std::vector<TintaMermaidSize> node_sizes(
+            pipeline.diagram.node_count, {120.0f, 52.0f});
+        std::vector<TintaMermaidSize> title_sizes(
+            pipeline.diagram.subgraph_count, {140.0f, 20.0f});
+        auto layout = tinta_mermaid_layout(&pipeline.diagram,
+            node_sizes.data(), node_sizes.size(), title_sizes.data(),
+            title_sizes.size(), 1.0f, 32.0f, 78.0f);
+        auto node_index = [&](const char *id) {
+            return static_cast<size_t>(
+                tinta_mermaid_find_node(&pipeline.diagram, id) -
+                pipeline.diagram.nodes);
+        };
+        const auto *pipeline_group =
+            tinta_mermaid_find_subgraph(&pipeline.diagram, "pipeline");
+        const auto *renderer_group =
+            tinta_mermaid_find_subgraph(&pipeline.diagram, "renderers");
+        size_t pipeline_index = static_cast<size_t>(
+            pipeline_group - pipeline.diagram.subgraphs);
+        size_t renderer_index = static_cast<size_t>(
+            renderer_group - pipeline.diagram.subgraphs);
+        size_t a = node_index("A"), b = node_index("B"), c = node_index("C");
+        size_t d = node_index("D"), e = node_index("E"), f = node_index("F");
+        check(layout.nodes[a].right < layout.subgraphs[pipeline_index].left &&
+                  layout.subgraphs[pipeline_index].right < layout.nodes[f].left,
+              "pipeline group participates in the root LR flow");
+        check(layout.nodes[b].right < layout.subgraphs[renderer_index].left,
+              "external pipeline links place Feature left of Renderers");
+        check(layout.nodes[c].top < layout.nodes[d].top &&
+                  layout.nodes[d].top < layout.nodes[e].top,
+              "renderer nodes share one inherited LR rank vertically");
+        check(layout.edge_count == pipeline.diagram.edge_count,
+              "pipeline fixture emits all cubic edge routes");
+        for (size_t edge = 0; edge < layout.edge_count; edge++)
+            check(layout.edges[edge].point_count == 4,
+                  "pipeline fixture avoids multi-bend edge routes");
+        tinta_mermaid_layout_destroy(&layout);
+    }
+    tinta_mermaid_parse_result_destroy(&pipeline);
+
+    std::string large = "flowchart LR\n";
+    for (int i = 0; i < 600; i++)
+        large += "N" + std::to_string(i) + " --> N" +
+                 std::to_string(i + 1) + "\n";
+    auto large_graph = tinta_mermaid_parse(large.c_str(), large.size());
+    check(large_graph.success, "large Mermaid route fixture parses");
+    if (large_graph.success) {
+        std::vector<TintaMermaidSize> sizes(
+            large_graph.diagram.node_count, {24.0f, 18.0f});
+        auto layout = tinta_mermaid_layout(&large_graph.diagram,
+            sizes.data(), sizes.size(), nullptr, 0,
+            1.0f, 8.0f, 16.0f);
+        check(layout.edge_count == large_graph.diagram.edge_count &&
+                  layout.point_count == layout.edge_count * 4,
+              "large graphs keep a bounded four-point route per edge");
+        tinta_mermaid_layout_destroy(&layout);
+    }
+    tinta_mermaid_parse_result_destroy(&large_graph);
 
     std::string deep = "flowchart TB\n";
     for (int i = 0; i < 65; i++)

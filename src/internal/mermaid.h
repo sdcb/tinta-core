@@ -108,6 +108,18 @@ typedef struct TintaMermaidRect {
     float bottom;
 } TintaMermaidRect;
 
+typedef struct TintaMermaidPoint {
+    float x;
+    float y;
+} TintaMermaidPoint;
+
+typedef struct TintaMermaidEdgeRoute {
+    size_t point_offset;
+    size_t point_count;
+    float label_x;
+    float label_y;
+} TintaMermaidEdgeRoute;
+
 typedef struct TintaMermaidLayout {
     TintaMermaidRect *nodes;
     size_t node_count;
@@ -115,6 +127,10 @@ typedef struct TintaMermaidLayout {
     size_t subgraph_count;
     size_t *ranks;
     size_t rank_count;
+    TintaMermaidEdgeRoute *edges;
+    size_t edge_count;
+    TintaMermaidPoint *points;
+    size_t point_count;
     float width;
     float height;
 } TintaMermaidLayout;

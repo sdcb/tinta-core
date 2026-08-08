@@ -665,6 +665,8 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->text_runs, sizeof(TintaTextRun));
     tinta_vec_init(&app->rects, sizeof(TintaDrawRect));
     tinta_vec_init(&app->lines, sizeof(TintaDrawLine));
+    tinta_vec_init(&app->paths, sizeof(TintaDrawPath));
+    tinta_vec_init(&app->path_points, sizeof(D2D1_POINT_2F));
     tinta_vec_init(&app->bitmaps, sizeof(TintaDrawBitmap));
     tinta_vec_init(&app->code_blocks, sizeof(TintaCodeBlock));
     tinta_vec_init(&app->mermaid_blocks, sizeof(TintaMermaidBlock));
@@ -735,6 +737,8 @@ void tinta_app_destroy(TintaApp *app) {
     tinta_vec_destroy(&app->text_runs);
     tinta_vec_destroy(&app->rects);
     tinta_vec_destroy(&app->lines);
+    tinta_vec_destroy(&app->paths);
+    tinta_vec_destroy(&app->path_points);
     tinta_vec_destroy(&app->bitmaps);
     tinta_vec_destroy(&app->code_blocks);
     tinta_vec_destroy(&app->mermaid_blocks);
@@ -744,6 +748,10 @@ void tinta_app_destroy(TintaApp *app) {
     tinta_vec_destroy(&app->headings);
     tinta_vec_destroy(&app->scroll_anchors);
     tinta_vec_destroy(&app->hit_entries);
+    if (app->dashed_stroke) {
+        app->dashed_stroke->lpVtbl->Release(app->dashed_stroke);
+        app->dashed_stroke = NULL;
+    }
     for (i = 0; i < 6; i++) release_text_format(&app->heading_formats[i]);
     release_text_format(&app->body_format);
     release_text_format(&app->bold_format);

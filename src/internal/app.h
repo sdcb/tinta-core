@@ -93,6 +93,7 @@ typedef struct TintaDrawRect {
     bool outline;
     float stroke;
     TintaDrawShape shape;
+    unsigned char layer;
     size_t horizontal_region;
 } TintaDrawRect;
 
@@ -103,8 +104,20 @@ typedef struct TintaDrawLine {
     float stroke;
     float opacity;
     bool dashed;
+    unsigned char layer;
     size_t horizontal_region;
 } TintaDrawLine;
+
+typedef struct TintaDrawPath {
+    size_t point_offset;
+    size_t point_count;
+    uint32_t color;
+    float stroke;
+    float opacity;
+    bool dashed;
+    unsigned char layer;
+    size_t horizontal_region;
+} TintaDrawPath;
 
 typedef struct TintaDrawBitmap {
     size_t resource_index;
@@ -258,6 +271,7 @@ struct TintaApp {
     ID2D1HwndRenderTarget *render_target;
     ID2D1HwndRenderTarget *device_context;
     ID2D1SolidColorBrush *brush;
+    ID2D1StrokeStyle *dashed_stroke;
     IDWriteFactory *dwrite_factory;
     IDWriteFontFallback *font_fallback;
     IWICImagingFactory *wic_factory;
@@ -286,6 +300,8 @@ struct TintaApp {
     TintaVec text_runs;
     TintaVec rects;
     TintaVec lines;
+    TintaVec paths;
+    TintaVec path_points;
     TintaVec bitmaps;
     TintaVec code_blocks;
     TintaVec mermaid_blocks;
