@@ -248,8 +248,12 @@ struct TintaApp {
     IDWriteTextFormat *body_format;
     IDWriteTextFormat *bold_format;
     IDWriteTextFormat *italic_format;
+    IDWriteTextFormat *bold_italic_format;
     IDWriteTextFormat *small_format;
     IDWriteTextFormat *code_format;
+    IDWriteTextFormat *code_bold_format;
+    IDWriteTextFormat *code_italic_format;
+    IDWriteTextFormat *code_bold_italic_format;
     IDWriteTextFormat *heading_formats[6];
     IDWriteTextFormat *ui_format;
     IDWriteTextFormat *chrome_format;

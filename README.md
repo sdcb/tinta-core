@@ -96,6 +96,12 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - Code and successfully rendered Mermaid blocks always provide a source
   Copy/Copied button in their persistent headers. Mermaid headers are labeled
   `Mermaid`; parsed failures fall back to the normal code-block header.
+- Nested inline styles are merged instead of replacing one another. Inline
+  code inside bold, italic, bold-italic, or links keeps the corresponding face
+  and interaction, and punctuation after a code pill has no synthetic space.
+- Mermaid node labels are centered with shape-aware padding. Diamonds,
+  hexagons, circles, and rectangles reserve dimensions appropriate to their
+  outlines while retaining block-local horizontal scrolling.
 - Wide code and Mermaid blocks scroll horizontally inside the block instead
   of widening the document. Blocks keep a 240-DIP minimum width in extremely
   narrow hosts; their internal bars support dragging, horizontal wheel input,

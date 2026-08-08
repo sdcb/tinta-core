@@ -30,6 +30,9 @@ typedef struct InlineStyle {
     bool strikethrough;
     bool highlight;
     int script;
+    bool bold;
+    bool italic;
+    bool fixed_size;
 } InlineStyle;
 
 #if TINTA_ENABLE_MERMAID
@@ -43,6 +46,24 @@ static float maxf(float a, float b) { return a > b ? a : b; }
 static float minf(float a, float b) { return a < b ? a : b; }
 static float scale(const TintaApp *app, float value) { return value * app->dpi_scale * app->zoom; }
 static float ui_scale(const TintaApp *app, float value) { return value * app->dpi_scale; }
+
+static IDWriteTextFormat *inline_emphasis_format(
+        TintaApp *app, IDWriteTextFormat *base, bool bold, bool italic) {
+    if (bold && italic)
+        return app->bold_italic_format ? app->bold_italic_format : app->bold_format;
+    if (bold) return app->bold_format ? app->bold_format : base;
+    if (italic) return app->italic_format ? app->italic_format : base;
+    return base;
+}
+
+static IDWriteTextFormat *inline_code_format(
+        TintaApp *app, bool bold, bool italic) {
+    if (bold && italic && app->code_bold_italic_format)
+        return app->code_bold_italic_format;
+    if (bold && app->code_bold_format) return app->code_bold_format;
+    if (italic && app->code_italic_format) return app->code_italic_format;
+    return app->code_format;
+}
 static float code_header_height(const TintaApp *app) { return scale(app, 32); }
 static float viewport_x(const TintaApp *app) { (void)app; return 0; }
 static float viewport_width(const TintaApp *app) {
@@ -663,6 +684,7 @@ static bool append_run(TintaApp *app, const wchar_t *text, size_t length,
     return append_run_ex(app, text, length, format, color, x, y, url, true, created);
 }
 
+#if TINTA_ENABLE_MERMAID
 static bool append_run_width(TintaApp *app, const wchar_t *text, size_t length,
                              IDWriteTextFormat *format, uint32_t color,
                              float x, float y, float max_width,
@@ -670,6 +692,23 @@ static bool append_run_width(TintaApp *app, const wchar_t *text, size_t length,
     return append_run_sized_ex(app, text, length, format, color, x, y,
                                max_width, true, NULL, true, created);
 }
+
+static bool append_centered_run_width(
+        TintaApp *app, const wchar_t *text, size_t length,
+        IDWriteTextFormat *format, uint32_t color,
+        float x, float y, float max_width, TintaTextRun **created) {
+    TintaTextRun *run = NULL;
+    if (!append_run_width(app, text, length, format, color,
+                          x, y, max_width, &run))
+        return false;
+    run->layout->lpVtbl->SetTextAlignment(
+        run->layout, TINTA_DWRITE_TEXT_ALIGNMENT_CENTER);
+    run->width = max_width;
+    track_horizontal_extent(app, x, x + max_width);
+    if (created) *created = run;
+    return true;
+}
+#endif
 
 static bool add_rect(TintaApp *app, float left, float top, float right, float bottom,
                      uint32_t color, float radius, bool outline, float stroke) {
@@ -893,8 +932,18 @@ static bool layout_image(TintaApp *app, const TintaElement *element,
 static bool layout_inline(TintaApp *app, const TintaElement *element, InlineState *state,
                           InlineStyle style) {
     size_t i;
-    if (element->type == TINTA_ELEMENT_STRONG) style.format = app->bold_format;
-    if (element->type == TINTA_ELEMENT_EMPHASIS) style.format = app->italic_format;
+    if (element->type == TINTA_ELEMENT_STRONG) {
+        style.bold = true;
+        if (!style.fixed_size)
+            style.format = inline_emphasis_format(
+                app, style.format, style.bold, style.italic);
+    }
+    if (element->type == TINTA_ELEMENT_EMPHASIS) {
+        style.italic = true;
+        if (!style.fixed_size)
+            style.format = inline_emphasis_format(
+                app, style.format, style.bold, style.italic);
+    }
     if (element->type == TINTA_ELEMENT_LINK) {
         style.color = app->theme->link;
         style.url = element->url;
@@ -905,10 +954,12 @@ static bool layout_inline(TintaApp *app, const TintaElement *element, InlineStat
     if (element->type == TINTA_ELEMENT_SUPERSCRIPT) {
         style.format = app->small_format;
         style.script = -1;
+        style.fixed_size = true;
     }
     if (element->type == TINTA_ELEMENT_SUBSCRIPT) {
         style.format = app->small_format;
         style.script = 1;
+        style.fixed_size = true;
     }
     if (element->type == TINTA_ELEMENT_RUBY) {
         TintaStr8 base8 = {0}, annotation8 = {0};
@@ -969,16 +1020,17 @@ ruby_done:
     if (element->type == TINTA_ELEMENT_CODE) {
         TintaStr8 utf8 = {0};
         TintaStr16 wide = {0};
+        IDWriteTextFormat *format = inline_code_format(
+            app, style.bold, style.italic);
         SIZE code_size;
-        SIZE space_size;
         float vertical_offset;
+        TintaTextRun *code_run = NULL;
         bool result;
         if (!flatten(element, &utf8) ||
             !tinta_utf8_to_utf16(utf8.data, utf8.len, &wide)) {
             tinta_str8_destroy(&utf8); tinta_str16_destroy(&wide); return false;
         }
-        code_size = measure(app, app->code_format, wide.data, wide.len);
-        space_size = measure(app, style.format, L" ", 1);
+        code_size = measure(app, format, wide.data, wide.len);
         if (state->x + code_size.cx > state->right && state->x > state->left) {
             state->x = state->left;
             state->y += state->line_height;
@@ -989,11 +1041,16 @@ ruby_done:
                  state->y + state->base_line_height,
                  app->theme->code_background, scale(app, 2), false, 0);
         vertical_offset = (state->base_line_height -
-                           app->code_format->lpVtbl->GetFontSize(app->code_format) * 1.2f) * 0.5f;
-        result = append_run(app, wide.data, wide.len, app->code_format,
-                            app->theme->code, state->x,
-                            state->y + maxf(0, vertical_offset), style.url, NULL);
-        if (result) state->x += code_size.cx + space_size.cx;
+                           format->lpVtbl->GetFontSize(format) * 1.2f) * 0.5f;
+        result = append_run(app, wide.data, wide.len, format,
+                            style.url && style.url[0] ? style.color : app->theme->code,
+                            state->x, state->y + maxf(0, vertical_offset),
+                            style.url, &code_run);
+        if (result) {
+            code_run->underline = style.underline;
+            code_run->strikethrough = style.strikethrough;
+            state->x += code_size.cx + scale(app, 4);
+        }
         tinta_str8_destroy(&utf8); tinta_str16_destroy(&wide);
         return result;
     }
@@ -1030,7 +1087,10 @@ static bool layout_paragraph(TintaApp *app, const TintaElement *element,
                              float *y, float left, float right) {
     float line_height = format_line_height(app->body_format);
     InlineState state = {left, right, left, *y, line_height, line_height};
-    InlineStyle style = {app->body_format, app->theme->text, NULL, false, false, false, 0};
+    InlineStyle style = {
+        .format = app->body_format,
+        .color = app->theme->text
+    };
     size_t i;
     for (i = 0; i < element->child_count; i++)
         if (!layout_inline(app, element->children[i], &state, style)) return false;
@@ -1101,8 +1161,10 @@ static bool layout_heading(TintaApp *app, const TintaElement *element,
         state.left = state.x = left; state.right = right; state.y = *y;
         state.line_height = line_height; state.base_line_height = line_height;
         {
-            InlineStyle style = {app->heading_formats[level - 1], app->theme->heading,
-                                 NULL, false, false, false, 0};
+            InlineStyle style = {
+                .format = app->heading_formats[level - 1],
+                .color = app->theme->heading
+            };
             ok = add_wrapped(app, &state, wide.data, wide.len, &style);
         }
         *y = state.y + state.line_height;
@@ -1314,8 +1376,10 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
                                       line_height, line_height};
                 for (inline_index = 0; inline_index < content->child_count;
                      inline_index++) {
-                    InlineStyle style = {app->body_format, app->theme->text,
-                                         NULL, false, false, false, 0};
+                    InlineStyle style = {
+                        .format = app->body_format,
+                        .color = app->theme->text
+                    };
                     if (!layout_inline(app, content->children[inline_index],
                                        &state, style)) return false;
                 }
@@ -1335,8 +1399,10 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
                        content->type == TINTA_ELEMENT_SUPERSCRIPT ||
                        content->type == TINTA_ELEMENT_SUBSCRIPT ||
                        content->type == TINTA_ELEMENT_STRIKETHROUGH) {
-                InlineStyle style = {app->body_format, app->theme->text,
-                                     NULL, false, false, false, 0};
+                InlineStyle style = {
+                    .format = app->body_format,
+                    .color = app->theme->text
+                };
                 if (!inline_active) {
                     state = (InlineState){item_left, right, item_left, *y,
                                           line_height, line_height};
@@ -1445,8 +1511,11 @@ static bool layout_table(TintaApp *app, const TintaElement *element,
             size_t child;
             for(child=0;child<row->children[c]->child_count;child++)
                 {
-                    InlineStyle style = {r?app->body_format:app->bold_format,
-                                         app->theme->text,NULL,false,false,false,0};
+                    InlineStyle style = {
+                        .format = r ? app->body_format : app->bold_format,
+                        .color = app->theme->text,
+                        .bold = r == 0
+                    };
                     if(!layout_inline(app,row->children[c]->children[child],&state,
                                       style)) {
                         ok = false;
@@ -1618,27 +1687,57 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
     if (!sizes) goto failed;
     for (i = 0; i < parsed.diagram.node_count; i++) {
         TintaStr16 wide = {0};
-        SIZE natural;
         SIZE wrapped;
-        float label_width;
-        tinta_utf8_to_utf16(parsed.diagram.nodes[i].label, strlen(parsed.diagram.nodes[i].label), &wide);
-        natural = measure(app, app->body_format, wide.data, wide.len);
-        label_width = minf(maxf((float)natural.cx, scale(app, 60)),
-                           scale(app, 240));
+        float label_width = scale(app, 280);
+        if (!tinta_utf8_to_utf16(parsed.diagram.nodes[i].label,
+                                 strlen(parsed.diagram.nodes[i].label), &wide)) {
+            tinta_str16_destroy(&wide);
+            goto failed;
+        }
         wrapped = measure_wrapped(app, app->body_format, wide.data, wide.len,
                                   label_width);
-        sizes[i].width = maxf(scale(app, 90), label_width + scale(app, 30));
-        sizes[i].height = maxf(scale(app, 48), wrapped.cy + scale(app, 20));
-        if (parsed.diagram.nodes[i].shape == TINTA_MERMAID_CIRCLE ||
-            parsed.diagram.nodes[i].shape == TINTA_MERMAID_DIAMOND) {
+        sizes[i].width = maxf(scale(app, 120), wrapped.cx + scale(app, 36));
+        sizes[i].height = maxf(scale(app, 52), wrapped.cy + scale(app, 24));
+        if (parsed.diagram.nodes[i].shape == TINTA_MERMAID_DIAMOND) {
+            sizes[i].width = maxf(sizes[i].width * 1.28f, scale(app, 150));
+            sizes[i].height = maxf(sizes[i].height * 1.45f, scale(app, 82));
+        } else if (parsed.diagram.nodes[i].shape == TINTA_MERMAID_HEXAGON) {
+            sizes[i].width += scale(app, 40);
+        } else if (parsed.diagram.nodes[i].shape == TINTA_MERMAID_CIRCLE) {
             float side = maxf(sizes[i].width, sizes[i].height);
             sizes[i].width = side;
             sizes[i].height = side;
         }
         tinta_str16_destroy(&wide);
     }
-    graph = tinta_mermaid_layout(&parsed.diagram, sizes, parsed.diagram.node_count,
-                                  scale(app, 28), scale(app, 90));
+    {
+        bool vertical = parsed.diagram.direction == TINTA_MERMAID_TOP_TO_BOTTOM ||
+                        parsed.diagram.direction == TINTA_MERMAID_BOTTOM_TO_TOP;
+        float rank_gap = scale(app, 78);
+        for (i = 0; i < parsed.diagram.edge_count; i++) {
+            const char *edge_label = parsed.diagram.edges[i].label;
+            TintaStr16 wide = {0};
+            SIZE measured;
+            float label_width;
+            float label_height;
+            float extent;
+            if (!edge_label || !edge_label[0]) continue;
+            if (!tinta_utf8_to_utf16(edge_label, strlen(edge_label), &wide)) {
+                tinta_str16_destroy(&wide);
+                goto failed;
+            }
+            measured = measure(app, app->body_format, wide.data, wide.len);
+            label_width = minf(scale(app, 180),
+                               maxf(scale(app, 60), measured.cx + scale(app, 12)));
+            label_height = maxf(scale(app, 28), measured.cy + scale(app, 8));
+            extent = vertical ? label_height : label_width;
+            rank_gap = maxf(rank_gap, extent + scale(app, 20));
+            tinta_str16_destroy(&wide);
+        }
+        graph = tinta_mermaid_layout(&parsed.diagram, sizes,
+                                     parsed.diagram.node_count,
+                                     scale(app, 32), rank_gap);
+    }
     if (graph.node_count != parsed.diagram.node_count) goto failed;
     {
         float block_top = top;
@@ -1848,17 +1947,33 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                                scale(app,stroke_width)))
                     goto failed;
             }
-            tinta_utf8_to_utf16(node->label, strlen(node->label), &wide);
+            if (!tinta_utf8_to_utf16(node->label, strlen(node->label), &wide)) {
+                tinta_str16_destroy(&wide);
+                goto failed;
+            }
             {
-                float label_width=maxf(1,box.right-box.left-scale(app,20));
-                SIZE label_size=measure_wrapped(app,app->body_format,
-                                                wide.data,wide.len,label_width);
+                float inset_x = scale(app, 18);
+                float inset_y = scale(app, 12);
+                float label_width;
+                float label_height;
+                SIZE label_size;
                 TintaTextRun *label_run = NULL;
-                if (!append_run_width(app, wide.data, wide.len,
-                                      app->body_format, text,
-                                      box.left+scale(app,10),
-                                      (box.top+box.bottom-label_size.cy)*.5f,
-                                      label_width,&label_run)) {
+                if (node->shape == TINTA_MERMAID_DIAMOND) {
+                    inset_x = (box.right - box.left) * 0.18f;
+                    inset_y = (box.bottom - box.top) * 0.18f;
+                } else if (node->shape == TINTA_MERMAID_HEXAGON) {
+                    inset_x = (box.right - box.left) * 0.18f;
+                }
+                label_width = maxf(1, box.right - box.left - inset_x * 2);
+                label_height = maxf(1, box.bottom - box.top - inset_y * 2);
+                label_size = measure_wrapped(app, app->body_format,
+                                             wide.data, wide.len, label_width);
+                if (!append_centered_run_width(
+                        app, wide.data, wide.len, app->body_format, text,
+                        box.left + inset_x,
+                        box.top + inset_y +
+                            maxf(0, (label_height - label_size.cy) * 0.5f),
+                        label_width, &label_run)) {
                     tinta_str16_destroy(&wide);
                     goto failed;
                 }

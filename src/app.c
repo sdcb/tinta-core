@@ -476,8 +476,12 @@ bool tinta_app_update_formats(TintaApp *app) {
     IDWriteTextFormat *body = NULL;
     IDWriteTextFormat *bold = NULL;
     IDWriteTextFormat *italic = NULL;
+    IDWriteTextFormat *bold_italic = NULL;
     IDWriteTextFormat *small_text = NULL;
     IDWriteTextFormat *code = NULL;
+    IDWriteTextFormat *code_bold = NULL;
+    IDWriteTextFormat *code_italic = NULL;
+    IDWriteTextFormat *code_bold_italic = NULL;
     IDWriteTextFormat *ui = NULL;
     IDWriteTextFormat *chrome = NULL;
     IDWriteTextFormat *headings[6] = {0};
@@ -490,19 +494,32 @@ bool tinta_app_update_formats(TintaApp *app) {
     italic = create_format(app, app->theme->font_family, 16,
                            TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                            TINTA_DWRITE_FONT_STYLE_ITALIC);
+    bold_italic = create_format(app, app->theme->font_family, 16,
+                                TINTA_DWRITE_FONT_WEIGHT_BOLD,
+                                TINTA_DWRITE_FONT_STYLE_ITALIC);
     small_text = create_format(app, app->theme->font_family, 12,
                                TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                                TINTA_DWRITE_FONT_STYLE_NORMAL);
     code = create_format(app, app->theme->code_font_family, 14,
                          TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                          TINTA_DWRITE_FONT_STYLE_NORMAL);
+    code_bold = create_format(app, app->theme->code_font_family, 14,
+                              TINTA_DWRITE_FONT_WEIGHT_BOLD,
+                              TINTA_DWRITE_FONT_STYLE_NORMAL);
+    code_italic = create_format(app, app->theme->code_font_family, 14,
+                                TINTA_DWRITE_FONT_WEIGHT_NORMAL,
+                                TINTA_DWRITE_FONT_STYLE_ITALIC);
+    code_bold_italic = create_format(app, app->theme->code_font_family, 14,
+                                     TINTA_DWRITE_FONT_WEIGHT_BOLD,
+                                     TINTA_DWRITE_FONT_STYLE_ITALIC);
     ui = create_format(app, app->theme->font_family, 14,
                        TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                        TINTA_DWRITE_FONT_STYLE_NORMAL);
     chrome = create_scaled_format(app, app->theme->font_family, 12,
                                   TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                                   TINTA_DWRITE_FONT_STYLE_NORMAL, 1.0f);
-    if (!body || !bold || !italic || !small_text || !code || !ui || !chrome)
+    if (!body || !bold || !italic || !bold_italic || !small_text || !code ||
+        !code_bold || !code_italic || !code_bold_italic || !ui || !chrome)
         goto failed;
     for (i = 0; i < 6; i++)
         if (!(headings[i] = create_format(app, app->theme->font_family,
@@ -513,16 +530,24 @@ bool tinta_app_update_formats(TintaApp *app) {
     release_text_format(&app->body_format);
     release_text_format(&app->bold_format);
     release_text_format(&app->italic_format);
+    release_text_format(&app->bold_italic_format);
     release_text_format(&app->small_format);
     release_text_format(&app->code_format);
+    release_text_format(&app->code_bold_format);
+    release_text_format(&app->code_italic_format);
+    release_text_format(&app->code_bold_italic_format);
     release_text_format(&app->ui_format);
     release_text_format(&app->chrome_format);
     for (i = 0; i < 6; i++) release_text_format(&app->heading_formats[i]);
     app->body_format = body;
     app->bold_format = bold;
     app->italic_format = italic;
+    app->bold_italic_format = bold_italic;
     app->small_format = small_text;
     app->code_format = code;
+    app->code_bold_format = code_bold;
+    app->code_italic_format = code_italic;
+    app->code_bold_italic_format = code_bold_italic;
     app->ui_format = ui;
     app->chrome_format = chrome;
     for (i = 0; i < 6; i++) app->heading_formats[i] = headings[i];
@@ -532,8 +557,12 @@ failed:
     release_text_format(&body);
     release_text_format(&bold);
     release_text_format(&italic);
+    release_text_format(&bold_italic);
     release_text_format(&small_text);
     release_text_format(&code);
+    release_text_format(&code_bold);
+    release_text_format(&code_italic);
+    release_text_format(&code_bold_italic);
     release_text_format(&ui);
     release_text_format(&chrome);
     for (i = 0; i < 6; i++) release_text_format(&headings[i]);
@@ -716,8 +745,12 @@ void tinta_app_destroy(TintaApp *app) {
     release_text_format(&app->body_format);
     release_text_format(&app->bold_format);
     release_text_format(&app->italic_format);
+    release_text_format(&app->bold_italic_format);
     release_text_format(&app->small_format);
     release_text_format(&app->code_format);
+    release_text_format(&app->code_bold_format);
+    release_text_format(&app->code_italic_format);
+    release_text_format(&app->code_bold_italic_format);
     release_text_format(&app->ui_format);
     release_text_format(&app->chrome_format);
     tinta_app_discard_device(app);

@@ -146,6 +146,13 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             add_test(NAME mermaid_parser COMMAND mermaid_tests)
         endif()
 
+        add_executable(layout_tests tests/layout_tests.cpp)
+        target_include_directories(layout_tests PRIVATE src/internal)
+        target_link_libraries(layout_tests PRIVATE Tinta::Core)
+        target_compile_definitions(layout_tests PRIVATE
+            TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>)
+        add_test(NAME renderer_layout COMMAND layout_tests)
+
         add_executable(document_tests tests/document_tests.cpp)
         target_include_directories(document_tests PRIVATE src/internal)
         target_link_libraries(document_tests PRIVATE tinta_test_support)

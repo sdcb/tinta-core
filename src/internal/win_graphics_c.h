@@ -188,7 +188,10 @@ typedef struct TintaIDWriteTextFormatVtbl {
     HRESULT (STDMETHODCALLTYPE *SetTextAlignment)(IDWriteTextFormat *, TintaDWriteTextAlignment);
     HRESULT (STDMETHODCALLTYPE *SetParagraphAlignment)(IDWriteTextFormat *, TintaDWriteParagraphAlignment);
     HRESULT (STDMETHODCALLTYPE *SetWordWrapping)(IDWriteTextFormat *, TintaDWriteWordWrapping);
-    TintaComMethod unused_before_font_size[19];
+    TintaComMethod unused_before_font_weight[16];
+    TintaDWriteFontWeight (STDMETHODCALLTYPE *GetFontWeight)(IDWriteTextFormat *);
+    TintaDWriteFontStyle (STDMETHODCALLTYPE *GetFontStyle)(IDWriteTextFormat *);
+    TintaComMethod GetFontStretch;
     FLOAT (STDMETHODCALLTYPE *GetFontSize)(IDWriteTextFormat *);
 } TintaIDWriteTextFormatVtbl;
 
@@ -203,7 +206,10 @@ typedef struct TintaIDWriteTextLayoutVtbl {
     HRESULT (STDMETHODCALLTYPE *SetTextAlignment)(IDWriteTextLayout *, TintaDWriteTextAlignment);
     HRESULT (STDMETHODCALLTYPE *SetParagraphAlignment)(IDWriteTextLayout *, TintaDWriteParagraphAlignment);
     HRESULT (STDMETHODCALLTYPE *SetWordWrapping)(IDWriteTextLayout *, TintaDWriteWordWrapping);
-    TintaComMethod unused_format_before_font_size[19];
+    TintaComMethod unused_format_before_font_weight[16];
+    TintaDWriteFontWeight (STDMETHODCALLTYPE *GetFontWeight)(IDWriteTextLayout *);
+    TintaDWriteFontStyle (STDMETHODCALLTYPE *GetFontStyle)(IDWriteTextLayout *);
+    TintaComMethod GetFontStretch;
     FLOAT (STDMETHODCALLTYPE *GetFontSize)(IDWriteTextLayout *);
     TintaComMethod unused_format_tail[2];
     TintaComMethod unused_layout_before_metrics[32];
