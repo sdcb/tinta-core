@@ -693,9 +693,11 @@ static void control_activate_find(TintaControl *control, size_t index) {
             float maximum_x = fmaxf(0, control->view.content_width - control->view.width);
             control->view.scroll_y = clamp_float(
                 run->y - control->view.height * 0.45f, 0, maximum_y);
-            control->view.scroll_x = clamp_float(
-                run->x + run->width * 0.5f - control->view.width * 0.5f,
-                0, maximum_x);
+            if (!tinta_horizontal_region_scroll_run_into_view(
+                    &control->view, run))
+                control->view.scroll_x = clamp_float(
+                    run->x + run->width * 0.5f -
+                    control->view.width * 0.5f, 0, maximum_x);
             break;
         }
     }
@@ -763,6 +765,10 @@ static void control_clear_find(TintaControl *control) {
 
 static bool control_pressed(void) {
     return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+}
+
+static bool shift_pressed(void) {
+    return (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 }
 
 static void control_copy_selection(TintaControl *control) {
@@ -1562,6 +1568,16 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     (control->options.flags & TINTA_OPTION_MOUSE_ZOOM)) {
                     control_set_zoom(control, control->view.zoom +
                         (delta > 0 ? 0.1f : -0.1f));
+                } else if (shift_pressed()) {
+                    POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    ScreenToClient(hwnd, &point);
+                    if (!tinta_horizontal_region_scroll_at(
+                            &control->view, point.x, point.y, -delta / 3.0f)) {
+                        control->view.scroll_x = fmaxf(
+                            0, control->view.scroll_x - delta / 3.0f);
+                        InvalidateRect(hwnd, NULL, FALSE);
+                        notify_code(control, TMN_SCROLLCHANGED);
+                    }
                 } else {
                     tinta_scroll(&control->view, -delta / 3.0f);
                     notify_code(control, TMN_SCROLLCHANGED);
@@ -1570,10 +1586,16 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
             return 0;
         case WM_MOUSEHWHEEL:
             if (control) {
-                control->view.scroll_x = fmaxf(0, control->view.scroll_x +
-                    GET_WHEEL_DELTA_WPARAM(wparam) / 3.0f);
-                InvalidateRect(hwnd, NULL, FALSE);
-                notify_code(control, TMN_SCROLLCHANGED);
+                POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+                ScreenToClient(hwnd, &point);
+                if (!tinta_horizontal_region_scroll_at(
+                        &control->view, point.x, point.y, delta / 3.0f)) {
+                    control->view.scroll_x = fmaxf(
+                        0, control->view.scroll_x + delta / 3.0f);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    notify_code(control, TMN_SCROLLCHANGED);
+                }
             }
             return 0;
         case WM_LBUTTONDOWN:

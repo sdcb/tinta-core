@@ -15,6 +15,7 @@ static int stream_update_notifications;
 static int autosize_notifications;
 static int resource_error_notifications;
 static int copy_notifications;
+static int scroll_notifications;
 static bool block_resources = true;
 static bool post_quit_on_destroy;
 static int destroy_quit_code;
@@ -41,6 +42,8 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
             autosize_notifications++;
         if (header && header->code == TMN_COPYCOMPLETED)
             copy_notifications++;
+        if (header && header->code == TMN_SCROLLCHANGED)
+            scroll_notifications++;
         if (header && header->code == TMN_LINKACTIVATE) {
             link_notifications++;
             return TRUE;
@@ -86,6 +89,19 @@ static bool send_control_key(HWND view, WPARAM key) {
     keyboard[VK_CONTROL] |= 0x80;
     if (!SetKeyboardState(keyboard)) return false;
     SendMessageW(view, WM_KEYDOWN, key, 0);
+    SetKeyboardState(original);
+    return true;
+}
+
+static bool send_shift_wheel(HWND view, int delta, POINT screen) {
+    BYTE original[256];
+    BYTE keyboard[256];
+    if (!GetKeyboardState(original)) return false;
+    std::memcpy(keyboard, original, sizeof(keyboard));
+    keyboard[VK_SHIFT] |= 0x80;
+    if (!SetKeyboardState(keyboard)) return false;
+    SendMessageW(view, WM_MOUSEWHEEL, MAKEWPARAM(0, delta),
+                 MAKELPARAM(screen.x, screen.y));
     SetKeyboardState(original);
     return true;
 }
@@ -534,6 +550,92 @@ int main() {
                       reinterpret_cast<LPARAM>(&default_margins))) {
         std::cerr << "page margin restore failed\n";
         return 1;
+    }
+    auto load_and_measure = [&](const wchar_t *markdown,
+                                TintaContentSize *size) {
+        int target = document_ready_notifications + 1;
+        if (!SendMessageW(view, WM_SETTEXT, 0,
+                          reinterpret_cast<LPARAM>(markdown)) ||
+            !pump_until(view, &document_ready_notifications, target, 2000))
+            return false;
+        size->cb_size = sizeof(*size);
+        return SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                            reinterpret_cast<LPARAM>(size)) != FALSE;
+    };
+    TintaContentSize short_code_size{};
+    if (!load_and_measure(L"```text\nshort\n```", &short_code_size)) {
+        std::cerr << "short code layout failed\n";
+        return 1;
+    }
+    std::wstring wide_code = L"```text\n";
+    wide_code.append(320, L'W');
+    wide_code += L" TAIL_TOKEN\n```";
+    TintaContentSize wide_code_size{};
+    if (!load_and_measure(wide_code.c_str(), &wide_code_size) ||
+        wide_code_size.width > 640.5f ||
+        wide_code_size.height < short_code_size.height +
+                                10.0f * dpi_scale) {
+        std::cerr << "wide code did not use an internal scrollbar\n";
+        return 1;
+    }
+    POINT region_point = {
+        320, static_cast<LONG>(74.0f * dpi_scale)
+    };
+    ClientToScreen(view, &region_point);
+    int internal_scroll_target = scroll_notifications;
+    SendMessageW(view, WM_MOUSEHWHEEL, MAKEWPARAM(0, WHEEL_DELTA),
+                 MAKELPARAM(region_point.x, region_point.y));
+    TintaScrollPosition internal_position{};
+    internal_position.cb_size = sizeof(internal_position);
+    if (!SendMessageW(view, TMM_GETSCROLLPOS, 0,
+                      reinterpret_cast<LPARAM>(&internal_position)) ||
+        internal_position.x != 0 ||
+        scroll_notifications != internal_scroll_target) {
+        std::cerr << "code horizontal wheel escaped to document scroll\n";
+        return 1;
+    }
+    if (!send_shift_wheel(view, -WHEEL_DELTA, region_point) ||
+        !SendMessageW(view, TMM_GETSCROLLPOS, 0,
+                      reinterpret_cast<LPARAM>(&internal_position)) ||
+        internal_position.x != 0 ||
+        scroll_notifications != internal_scroll_target) {
+        std::cerr << "code Shift+wheel escaped to document scroll\n";
+        return 1;
+    }
+    SetWindowPos(view, nullptr, 0, 0, 180, 480,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    TintaContentSize narrow_code_size{};
+    if (!load_and_measure(wide_code.c_str(), &narrow_code_size) ||
+        narrow_code_size.width <= 180.0f) {
+        std::cerr << "narrow code did not retain the 240 DIP minimum\n";
+        return 1;
+    }
+    POINT outside_region = {90, 300};
+    ClientToScreen(view, &outside_region);
+    SendMessageW(view, WM_MOUSEHWHEEL, MAKEWPARAM(0, WHEEL_DELTA),
+                 MAKELPARAM(outside_region.x, outside_region.y));
+    internal_position.x = 0;
+    if (!SendMessageW(view, TMM_GETSCROLLPOS, 0,
+                      reinterpret_cast<LPARAM>(&internal_position)) ||
+        internal_position.x <= 0) {
+        std::cerr << "narrow document did not retain outer horizontal scroll\n";
+        return 1;
+    }
+    SetWindowPos(view, nullptr, 0, 0, 640, 480,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    internal_position.x = 0;
+    internal_position.y = 0;
+    SendMessageW(view, TMM_SETSCROLLPOS, 0,
+                 reinterpret_cast<LPARAM>(&internal_position));
+    if (capabilities.flags & TINTA_CAPABILITY_MERMAID) {
+        const wchar_t *wide_mermaid =
+            L"```mermaid\nflowchart LR\nA --> B --> C --> D --> E --> F --> G --> H --> I --> J\n```";
+        TintaContentSize mermaid_size{};
+        if (!load_and_measure(wide_mermaid, &mermaid_size) ||
+            mermaid_size.width > 640.5f) {
+            std::cerr << "wide Mermaid did not use an internal scrollbar\n";
+            return 1;
+        }
     }
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));

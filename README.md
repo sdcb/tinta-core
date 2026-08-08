@@ -93,6 +93,10 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - Code blocks show their Markdown language info verbatim in a non-selectable
   header. Blocks without a language are labeled `Plain text`; the Copy button
   shares the header and briefly changes to `Copied` after a successful copy.
+- Wide code and Mermaid blocks scroll horizontally inside the block instead
+  of widening the document. Blocks keep a 240-DIP minimum width in extremely
+  narrow hosts; their internal bars support dragging, horizontal wheel input,
+  and Shift+wheel.
 - `TINTA_OPTION_DOCUMENT_COPY_BUTTON` adds an opt-in Copy button at the
   document's top-right. It is always visible at the top, scrolls away with the
   document, copies the exact source for the displayed revision, and briefly

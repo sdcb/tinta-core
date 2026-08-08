@@ -49,6 +49,115 @@ static float viewport_width(const TintaApp *app) {
     return (float)app->width;
 }
 
+static TintaHorizontalRegion *horizontal_region(TintaApp *app, size_t index) {
+    if (!app || index == SIZE_MAX || index >= app->horizontal_regions.len)
+        return NULL;
+    return TINTA_VEC_PTR(TintaHorizontalRegion, app->horizontal_regions, index);
+}
+
+static const TintaHorizontalRegion *horizontal_region_const(
+    const TintaApp *app, size_t index) {
+    if (!app || index == SIZE_MAX || index >= app->horizontal_regions.len)
+        return NULL;
+    return TINTA_VEC_PTR(TintaHorizontalRegion, app->horizontal_regions, index);
+}
+
+static float horizontal_region_offset(const TintaHorizontalRegion *region) {
+    return region && region->overflow ?
+        (float)region->viewport.left - region->content_left - region->scroll_x :
+        0;
+}
+
+static void track_horizontal_extent(TintaApp *app, float left, float right) {
+    TintaHorizontalRegion *region = horizontal_region(
+        app, app->active_horizontal_region);
+    if (region) {
+        region->content_left = minf(region->content_left, left);
+        region->content_right = maxf(region->content_right, right);
+    } else {
+        app->content_width = maxf(app->content_width, right);
+    }
+}
+
+static void save_horizontal_region_states(TintaApp *app) {
+    size_t i;
+    if (!app || !app->horizontal_regions.len) return;
+    tinta_vec_clear(&app->horizontal_scroll_states);
+    for (i = 0; i < app->horizontal_regions.len; i++) {
+        const TintaHorizontalRegion *region = TINTA_VEC_PTR(
+            TintaHorizontalRegion, app->horizontal_regions, i);
+        TintaHorizontalScrollState state;
+        state.kind = region->kind;
+        state.source_offset = region->source_offset;
+        state.ordinal = region->ordinal;
+        state.scroll_dip = region->scroll_x /
+            (region->scale_factor > 0 ? region->scale_factor : 1);
+        tinta_vec_push(&app->horizontal_scroll_states, &state);
+    }
+}
+
+void tinta_horizontal_region_clear_states(TintaApp *app) {
+    if (!app) return;
+    tinta_vec_clear(&app->horizontal_scroll_states);
+    tinta_vec_clear(&app->horizontal_regions);
+    app->active_horizontal_region = SIZE_MAX;
+    app->hovered_horizontal_region = -1;
+    app->dragging_horizontal_region = -1;
+}
+
+static size_t begin_horizontal_region(TintaApp *app,
+                                      TintaHorizontalRegionKind kind,
+                                      size_t source_offset, RECT viewport) {
+    TintaHorizontalRegion region;
+    size_t i;
+    float scale_factor = app->dpi_scale * app->zoom;
+    memset(&region, 0, sizeof(region));
+    region.kind = kind;
+    region.source_offset = source_offset;
+    region.viewport = viewport;
+    region.scale_factor = scale_factor > 0 ? scale_factor : 1;
+    region.content_left = FLT_MAX;
+    region.content_right = -FLT_MAX;
+    for (i = 0; i < app->horizontal_regions.len; i++) {
+        const TintaHorizontalRegion *other = TINTA_VEC_PTR(
+            TintaHorizontalRegion, app->horizontal_regions, i);
+        if (other->kind == kind && other->source_offset == source_offset)
+            region.ordinal++;
+    }
+    for (i = 0; i < app->horizontal_scroll_states.len; i++) {
+        const TintaHorizontalScrollState *state = TINTA_VEC_PTR(
+            TintaHorizontalScrollState, app->horizontal_scroll_states, i);
+        if (state->kind == kind && state->source_offset == source_offset &&
+            state->ordinal == region.ordinal) {
+            region.scroll_x = state->scroll_dip * scale_factor;
+            break;
+        }
+    }
+    if (!tinta_vec_push(&app->horizontal_regions, &region)) return SIZE_MAX;
+    app->active_horizontal_region = app->horizontal_regions.len - 1;
+    app->content_width = maxf(app->content_width, (float)viewport.right);
+    return app->active_horizontal_region;
+}
+
+static void finish_horizontal_region(TintaApp *app, size_t index) {
+    TintaHorizontalRegion *region = horizontal_region(app, index);
+    float viewport_size;
+    float content_size;
+    float maximum;
+    app->active_horizontal_region = SIZE_MAX;
+    if (!region) return;
+    if (region->content_left == FLT_MAX) {
+        region->content_left = (float)region->viewport.left;
+        region->content_right = (float)region->viewport.right;
+    }
+    viewport_size = maxf(1, (float)(region->viewport.right -
+                                   region->viewport.left));
+    content_size = maxf(0, region->content_right - region->content_left);
+    region->overflow = content_size > viewport_size + 0.5f;
+    maximum = maxf(0, content_size - viewport_size);
+    region->scroll_x = minf(maxf(region->scroll_x, 0), maximum);
+}
+
 static uint64_t performance_time_us(void) {
     LARGE_INTEGER counter;
     static LONGLONG frequency;
@@ -115,6 +224,59 @@ bool tinta_horizontal_scrollbar_geometry(const TintaApp *app,
     return true;
 }
 
+static bool horizontal_region_scrollbar_geometry(
+    const TintaApp *app, size_t index, TintaScrollbarGeometry *geometry) {
+    const TintaHorizontalRegion *region = horizontal_region_const(app, index);
+    float visible;
+    float content;
+    float track_left;
+    float thumb_length;
+    float travel;
+    if (!geometry || !region || !region->overflow) return false;
+    visible = (float)(region->viewport.right - region->viewport.left);
+    content = region->content_right - region->content_left;
+    if (visible <= 0 || content <= visible) return false;
+    track_left = viewport_x(app) - app->scroll_x + region->viewport.left;
+    thumb_length = maxf(ui_scale(app, 30), visible / content * visible);
+    thumb_length = minf(thumb_length, visible);
+    travel = visible - thumb_length;
+    geometry->maximum_scroll = content - visible;
+    geometry->left = track_left + (geometry->maximum_scroll > 0 ?
+        region->scroll_x / geometry->maximum_scroll * travel : 0);
+    geometry->right = geometry->left + thumb_length;
+    geometry->top = region->viewport.bottom - app->scroll_y;
+    geometry->bottom = geometry->top + ui_scale(app, 14);
+    geometry->track_length = visible;
+    return true;
+}
+
+static int horizontal_region_at(const TintaApp *app, int x, int y,
+                                bool scrollbar_only) {
+    size_t i;
+    float document_x = x - viewport_x(app) + app->scroll_x;
+    float document_y = y + app->scroll_y;
+    for (i = app->horizontal_regions.len; i > 0; i--) {
+        const TintaHorizontalRegion *region = TINTA_VEC_PTR(
+            TintaHorizontalRegion, app->horizontal_regions, i - 1);
+        if (!region->overflow) continue;
+        if (scrollbar_only) {
+            TintaScrollbarGeometry geometry;
+            float track_left = viewport_x(app) - app->scroll_x +
+                               region->viewport.left;
+            if (horizontal_region_scrollbar_geometry(app, i - 1, &geometry) &&
+                x >= track_left && x <= track_left + geometry.track_length &&
+                y >= geometry.top && y <= geometry.bottom)
+                return (int)(i - 1);
+        } else if (document_x >= region->viewport.left &&
+                   document_x <= region->viewport.right &&
+                   document_y >= region->viewport.top &&
+                   document_y <= region->viewport.bottom + ui_scale(app, 14)) {
+            return (int)(i - 1);
+        }
+    }
+    return -1;
+}
+
 static void set_scroll_y(TintaApp *app, float value) {
     float maximum = maxf(0, app->content_height - app->height);
     app->scroll_y = minf(maxf(value, 0), maximum);
@@ -126,6 +288,8 @@ bool tinta_scrollbar_update_hover(TintaApp *app, int x, int y) {
     TintaScrollbarGeometry horizontal;
     bool old_vertical = app->scrollbar_hovered;
     bool old_horizontal = app->h_scrollbar_hovered;
+    int old_region = app->hovered_horizontal_region;
+    app->hovered_horizontal_region = horizontal_region_at(app, x, y, true);
     app->scrollbar_hovered = tinta_vertical_scrollbar_geometry(app, &vertical) &&
         x >= vertical.left && x <= vertical.right &&
         y >= 0 && y <= vertical.track_length;
@@ -133,12 +297,36 @@ bool tinta_scrollbar_update_hover(TintaApp *app, int x, int y) {
         x >= viewport_x(app) && x <= viewport_x(app) + horizontal.track_length &&
         y >= horizontal.top && y <= horizontal.bottom;
     return old_vertical != app->scrollbar_hovered ||
-        old_horizontal != app->h_scrollbar_hovered;
+        old_horizontal != app->h_scrollbar_hovered ||
+        old_region != app->hovered_horizontal_region;
 }
 
 bool tinta_scrollbar_begin_drag(TintaApp *app, int x, int y) {
     TintaScrollbarGeometry geometry;
     tinta_scrollbar_update_hover(app, x, y);
+    if (app->hovered_horizontal_region >= 0 &&
+        horizontal_region_scrollbar_geometry(
+            app, (size_t)app->hovered_horizontal_region, &geometry)) {
+        TintaHorizontalRegion *region = horizontal_region(
+            app, (size_t)app->hovered_horizontal_region);
+        float track_left = viewport_x(app) - app->scroll_x +
+                           region->viewport.left;
+        float thumb_length = geometry.right - geometry.left;
+        float travel = geometry.track_length - thumb_length;
+        float local_x = x - track_left;
+        float thumb_position = geometry.left - track_left;
+        if ((x < geometry.left || x > geometry.right) && travel > 0) {
+            thumb_position = minf(maxf(local_x - thumb_length * 0.5f, 0),
+                                  travel);
+            region->scroll_x = thumb_position / travel *
+                               geometry.maximum_scroll;
+            InvalidateRect(app->hwnd, NULL, FALSE);
+        }
+        app->dragging_horizontal_region = app->hovered_horizontal_region;
+        app->horizontal_region_drag_start_x = (float)x;
+        app->horizontal_region_drag_start_scroll = region->scroll_x;
+        return true;
+    }
     if (app->scrollbar_hovered &&
         tinta_vertical_scrollbar_geometry(app, &geometry)) {
         float thumb_length = geometry.bottom - geometry.top;
@@ -176,6 +364,23 @@ bool tinta_scrollbar_drag(TintaApp *app, int x, int y) {
     TintaScrollbarGeometry geometry;
     app->mouse_x = x;
     app->mouse_y = y;
+    if (app->dragging_horizontal_region >= 0 &&
+        horizontal_region_scrollbar_geometry(
+            app, (size_t)app->dragging_horizontal_region, &geometry)) {
+        TintaHorizontalRegion *region = horizontal_region(
+            app, (size_t)app->dragging_horizontal_region);
+        float travel = geometry.track_length -
+                       (geometry.right - geometry.left);
+        if (region && travel > 0) {
+            region->scroll_x = app->horizontal_region_drag_start_scroll +
+                (x - app->horizontal_region_drag_start_x) / travel *
+                geometry.maximum_scroll;
+            region->scroll_x = minf(maxf(region->scroll_x, 0),
+                                    geometry.maximum_scroll);
+            InvalidateRect(app->hwnd, NULL, FALSE);
+        }
+        return true;
+    }
     if (app->scrollbar_dragging &&
         tinta_vertical_scrollbar_geometry(app, &geometry)) {
         float travel = geometry.track_length - (geometry.bottom - geometry.top);
@@ -199,12 +404,51 @@ bool tinta_scrollbar_drag(TintaApp *app, int x, int y) {
 }
 
 bool tinta_scrollbar_end_drag(TintaApp *app, int x, int y) {
-    bool was_dragging = app->scrollbar_dragging || app->h_scrollbar_dragging;
+    bool was_dragging = app->scrollbar_dragging || app->h_scrollbar_dragging ||
+                        app->dragging_horizontal_region >= 0;
     app->scrollbar_dragging = false;
     app->h_scrollbar_dragging = false;
+    app->dragging_horizontal_region = -1;
     tinta_scrollbar_update_hover(app, x, y);
     if (was_dragging) InvalidateRect(app->hwnd, NULL, FALSE);
     return was_dragging;
+}
+
+bool tinta_horizontal_region_scroll_at(TintaApp *app, int x, int y,
+                                       float amount) {
+    int index = horizontal_region_at(app, x, y, false);
+    TintaHorizontalRegion *region;
+    float maximum;
+    if (index < 0) return false;
+    region = horizontal_region(app, (size_t)index);
+    if (!region) return false;
+    maximum = maxf(0, region->content_right - region->content_left -
+        (region->viewport.right - region->viewport.left));
+    region->scroll_x = minf(maxf(region->scroll_x + amount, 0), maximum);
+    InvalidateRect(app->hwnd, NULL, FALSE);
+    return true;
+}
+
+bool tinta_horizontal_region_scroll_run_into_view(TintaApp *app,
+                                                   const TintaTextRun *run) {
+    TintaHorizontalRegion *region;
+    float visible;
+    float maximum;
+    float run_left;
+    float run_right;
+    if (!app || !run) return false;
+    region = horizontal_region(app, run->horizontal_region);
+    if (!region || !region->overflow) return false;
+    visible = (float)(region->viewport.right - region->viewport.left);
+    maximum = maxf(0, region->content_right - region->content_left - visible);
+    run_left = run->x - region->content_left;
+    run_right = run_left + run->width;
+    if (run_left < region->scroll_x)
+        region->scroll_x = run_left;
+    else if (run_right > region->scroll_x + visible)
+        region->scroll_x = run_right - visible;
+    region->scroll_x = minf(maxf(region->scroll_x, 0), maximum);
+    return true;
 }
 
 static float format_line_height(IDWriteTextFormat *format) {
@@ -213,6 +457,7 @@ static float format_line_height(IDWriteTextFormat *format) {
 
 void tinta_layout_clear(TintaApp *app) {
     size_t i;
+    save_horizontal_region_states(app);
     for (i = 0; i < app->text_runs.len; i++) {
         TintaTextRun *run = TINTA_VEC_PTR(TintaTextRun, app->text_runs, i);
         if (run->layout) run->layout->lpVtbl->Release(run->layout);
@@ -234,6 +479,10 @@ void tinta_layout_clear(TintaApp *app) {
     tinta_vec_clear(&app->hit_entries);
     app->hit_index_dirty = true;
     tinta_vec_clear(&app->bitmaps); tinta_vec_clear(&app->code_blocks); tinta_str16_clear(&app->doc_text);
+    tinta_vec_clear(&app->horizontal_regions);
+    app->active_horizontal_region = SIZE_MAX;
+    app->hovered_horizontal_region = -1;
+    app->dragging_horizontal_region = -1;
     app->hovered_code_block = -1;
     app->notice_kind = TINTA_NOTICE_NONE;
     app->notice_code_block = -1;
@@ -376,6 +625,7 @@ static bool append_run_sized_ex(TintaApp *app, const wchar_t *text, size_t lengt
     run.width = metrics.widthIncludingTrailingWhitespace;
     run.height = metrics.height;
     run.doc_start = app->doc_text.len; run.doc_length = append_document ? length : 0;
+    run.horizontal_region = app->active_horizontal_region;
     if ((append_document && !tinta_str16_append(&app->doc_text, text, length)) ||
         !tinta_vec_push(&app->text_runs, &run)) {
         if (append_document) {
@@ -385,7 +635,7 @@ static bool append_run_sized_ex(TintaApp *app, const wchar_t *text, size_t lengt
         run.layout->lpVtbl->Release(run.layout);
         free(run.text); free(run.url); return false;
     }
-    app->content_width = maxf(app->content_width, x + run.width);
+    track_horizontal_extent(app, x, x + run.width);
     app->hit_index_dirty = true;
     if (created) *created = TINTA_VEC_PTR(TintaTextRun, app->text_runs, app->text_runs.len - 1);
     return true;
@@ -420,7 +670,8 @@ static bool add_rect(TintaApp *app, float left, float top, float right, float bo
     item.rect.right = (LONG)right; item.rect.bottom = (LONG)bottom;
     item.color = color; item.opacity = 1.0f; item.radius = radius;
     item.outline = outline; item.stroke = stroke; item.shape = 0;
-    app->content_width = maxf(app->content_width, right);
+    item.horizontal_region = app->active_horizontal_region;
+    track_horizontal_extent(app, left, right);
     return tinta_vec_push(&app->rects, &item) != NULL;
 }
 
@@ -445,7 +696,8 @@ static bool add_shape(TintaApp *app, float left, float top, float right, float b
     item.color=color; item.opacity=opacity;
     item.radius=shape==TINTA_DRAW_SHAPE_STADIUM?(bottom-top)*.5f:scale(app,6);
     item.outline=outline; item.stroke=stroke; item.shape=shape;
-    app->content_width=maxf(app->content_width,right);
+    item.horizontal_region = app->active_horizontal_region;
+    track_horizontal_extent(app, left, right);
     return tinta_vec_push(&app->rects,&item)!=NULL;
 }
 #endif
@@ -455,7 +707,8 @@ static bool add_line(TintaApp *app, float x1, float y1, float x2, float y2,
     TintaDrawLine item;
     item.a.x = (LONG)x1; item.a.y = (LONG)y1; item.b.x = (LONG)x2; item.b.y = (LONG)y2;
     item.color = color; item.stroke = stroke; item.opacity = 1.0f; item.dashed = false;
-    app->content_width=maxf(app->content_width,maxf(x1,x2));
+    item.horizontal_region = app->active_horizontal_region;
+    track_horizontal_extent(app, minf(x1, x2), maxf(x1, x2));
     return tinta_vec_push(&app->lines, &item) != NULL;
 }
 
@@ -467,7 +720,8 @@ static bool add_connector_line(TintaApp *app, float x1, float y1, float x2, floa
     item.b.x = (LONG)x2; item.b.y = (LONG)y2;
     item.color = color; item.stroke = stroke; item.opacity = 1.0f;
     item.dashed = dashed;
-    app->content_width = maxf(app->content_width, maxf(x1, x2));
+    item.horizontal_region = app->active_horizontal_region;
+    track_horizontal_extent(app, minf(x1, x2), maxf(x1, x2));
     return tinta_vec_push(&app->lines, &item) != NULL;
 }
 #endif
@@ -479,7 +733,8 @@ static bool add_line_alpha(TintaApp *app, float x1, float y1, float x2, float y2
     item.a.x = (LONG)x1; item.a.y = (LONG)y1;
     item.b.x = (LONG)x2; item.b.y = (LONG)y2;
     item.color = color; item.stroke = stroke; item.opacity = opacity; item.dashed = false;
-    app->content_width = maxf(app->content_width, maxf(x1, x2));
+    item.horizontal_region = app->active_horizontal_region;
+    track_horizontal_extent(app, minf(x1, x2), maxf(x1, x2));
     return tinta_vec_push(&app->lines, &item) != NULL;
 }
 
@@ -871,14 +1126,16 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
         element->language : "Plain text";
     float top = *y, line_height = scale(app, 20), padding = scale(app, 12);
     float header_height = code_header_height(app);
+    float block_right = left + maxf(right - left, scale(app, 240));
     bool ok = flatten(element, &utf8) &&
               tinta_utf8_to_utf16(utf8.data, utf8.len, &wide) &&
               tinta_utf8_to_utf16(language_utf8, strlen(language_utf8),
                                   &language_label);
     if (ok) {
         size_t line_start=0, line_count=1, rect_index, block_index;
+        size_t region_index;
         size_t display_length = wide.len;
-        float line_y=top+header_height+padding, max_line_width=0;
+        float line_y=top+header_height+padding;
         float block_height;
 #if TINTA_ENABLE_SYNTAX
         int language=tinta_syntax_language(element->language);
@@ -896,17 +1153,18 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
             if (wide.data[scan] == L'\n') line_count++;
         block_height = header_height + line_count * line_height + padding * 2;
         rect_index = app->rects.len;
-        if (!add_rect(app, left, top, right, top + block_height,
+        if (!add_rect(app, left, top, block_right, top + block_height,
                       app->theme->code_background, 0, false, 0)) ok = false;
         {
             TintaCodeBlock command;
             command.rect.left = (LONG)left;
             command.rect.top = (LONG)top;
-            command.rect.right = (LONG)right;
+            command.rect.right = (LONG)block_right;
             command.rect.bottom = (LONG)(top + block_height);
             command.text = tinta_wcsdup_n(wide.data, wide.len);
             command.language = tinta_wcsdup_n(
                 language_label.data, language_label.len);
+            command.horizontal_region = SIZE_MAX;
             block_index = app->code_blocks.len;
             if (!command.text || !command.language ||
                 !tinta_vec_push(&app->code_blocks, &command)) {
@@ -914,6 +1172,20 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
                 free(command.language);
                 ok = false;
             }
+        }
+        {
+            RECT viewport = {
+                (LONG)(left + padding),
+                (LONG)(top + header_height),
+                (LONG)(block_right - padding),
+                (LONG)(top + block_height)
+            };
+            region_index = begin_horizontal_region(
+                app, TINTA_HORIZONTAL_CODE, element->source_offset, viewport);
+            if (region_index == SIZE_MAX) ok = false;
+            else if (block_index < app->code_blocks.len)
+                TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks,
+                              block_index)->horizontal_region = region_index;
         }
         while (ok && line_start <= display_length) {
             size_t line_end = line_start;
@@ -964,7 +1236,6 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
                 x += run->width;
             }
 #endif
-            max_line_width = maxf(max_line_width, x - (left + padding));
             if (!ok) break;
             line_y += line_height;
             if (line_end == display_length) break;
@@ -977,13 +1248,20 @@ static bool layout_code(TintaApp *app, const TintaElement *element,
 #if TINTA_ENABLE_SYNTAX
         tinta_vec_destroy(&tokens);
 #endif
-        if (ok && max_line_width + padding * 2 > right - left) {
-            float expanded_right = left + max_line_width + padding * 2;
+        finish_horizontal_region(app, region_index);
+        if (ok && region_index < app->horizontal_regions.len) {
+            TintaHorizontalRegion *region = TINTA_VEC_PTR(
+                TintaHorizontalRegion, app->horizontal_regions, region_index);
+            if (region->overflow) {
+                float scrollbar_height = ui_scale(app, 14);
+                block_height += scrollbar_height;
+                region->viewport.bottom = (LONG)(top + block_height -
+                                                  scrollbar_height);
+            }
             TintaDrawRect *background = TINTA_VEC_PTR(TintaDrawRect, app->rects, rect_index);
             TintaCodeBlock *command = TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, block_index);
-            background->rect.right = (LONG)expanded_right;
-            command->rect.right = (LONG)expanded_right;
-            app->content_width = maxf(app->content_width, expanded_right);
+            background->rect.bottom = (LONG)(top + block_height);
+            command->rect.bottom = (LONG)(top + block_height);
         }
         if (ok) ok = tinta_str16_append(&app->doc_text, L"\n\n", 2);
         *y = top + block_height + scale(app, 14);
@@ -1308,6 +1586,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
     TintaMermaidParseResult parsed;
     const TintaMermaidParseResult *cached;
     TintaMermaidSize *sizes = NULL; TintaMermaidLayout graph; size_t i; float top = *y;
+    size_t region_index = SIZE_MAX;
     TintaVec label_boxes;
     memset(&graph, 0, sizeof(graph));
     if (!tinta_vec_init(&label_boxes, sizeof(D2D1_RECT_F))) return false;
@@ -1353,7 +1632,13 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                                   scale(app, 28), scale(app, 90));
     if (graph.node_count != parsed.diagram.node_count) goto failed;
     {
-        float offset = left + maxf(0, (right - left - graph.width) * 0.5f);
+        float block_right = left + maxf(right - left, scale(app, 240));
+        RECT viewport = {(LONG)left, (LONG)top, (LONG)block_right, (LONG)top};
+        float offset;
+        region_index = begin_horizontal_region(
+            app, TINTA_HORIZONTAL_MERMAID, element->source_offset, viewport);
+        if (region_index == SIZE_MAX) goto failed;
+        offset = left + maxf(0, (block_right - left - graph.width) * 0.5f);
         float diagram_bottom = top + graph.height;
         size_t exterior_lane = 0;
         for (i = 0; i < parsed.diagram.edge_count; i++) {
@@ -1551,13 +1836,19 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
             }
             tinta_str16_destroy(&wide);
         }
+        {
+            TintaHorizontalRegion *region = horizontal_region(app, region_index);
+            if (region) region->viewport.bottom = (LONG)diagram_bottom;
+        }
+        finish_horizontal_region(app, region_index);
         if (app->focus_mermaid_on_next_layout && graph.node_count) {
             bool *has_incoming = (bool *)calloc(
                 parsed.diagram.node_count, sizeof(*has_incoming));
             size_t root_index = 0;
             if (has_incoming) {
                 float root_center;
-                float maximum_scroll;
+                TintaHorizontalRegion *region = horizontal_region(
+                    app, region_index);
                 for (i = 0; i < parsed.diagram.edge_count; i++) {
                     size_t target = parsed.diagram.edges[i].to;
                     if (target < parsed.diagram.node_count)
@@ -1572,19 +1863,29 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                 root_center = offset +
                     (graph.nodes[root_index].left +
                      graph.nodes[root_index].right) * 0.5f;
-                maximum_scroll = maxf(
-                    0, app->content_width - viewport_width(app));
-                app->scroll_x = minf(maxf(
-                    root_center - viewport_width(app) * 0.5f, 0),
-                    maximum_scroll);
+                if (region) {
+                    float visible = (float)(region->viewport.right -
+                                            region->viewport.left);
+                    float maximum = maxf(0,
+                        region->content_right - region->content_left - visible);
+                    region->scroll_x = minf(maxf(
+                        root_center - region->content_left - visible * 0.5f,
+                        0), maximum);
+                }
                 free(has_incoming);
             }
             app->focus_mermaid_on_next_layout = false;
         }
-        *y = diagram_bottom + scale(app, 24);
+        {
+            const TintaHorizontalRegion *region = horizontal_region_const(
+                app, region_index);
+            *y = diagram_bottom + (region && region->overflow ?
+                 ui_scale(app, 14) : 0) + scale(app, 24);
+        }
     }
     tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return true;
 failed:
+    app->active_horizontal_region = SIZE_MAX;
     tinta_mermaid_layout_destroy(&graph); tinta_str8_destroy(&source); free(sizes); tinta_vec_destroy(&label_boxes); return false;
 }
 #endif
@@ -2068,6 +2369,88 @@ static void draw_rect_item(TintaApp *app, const TintaDrawRect *item,
     }
 }
 
+static void draw_line_item(TintaApp *app, const TintaDrawLine *item,
+                           float vx, float scroll) {
+    D2D1_POINT_2F a = {vx + item->a.x, item->a.y - scroll};
+    D2D1_POINT_2F b = {vx + item->b.x, item->b.y - scroll};
+    if (maxf(a.y, b.y) < 0 || minf(a.y, b.y) > app->height) return;
+    set_brush_alpha(app, item->color, item->opacity);
+    if (item->dashed) {
+        float dx=b.x-a.x,dy=b.y-a.y,length=sqrtf(dx*dx+dy*dy);
+        float dash=ui_scale(app,6),gap=ui_scale(app,4),position=0;
+        if(length>0.001f) {
+            dx/=length;dy/=length;
+            while(position<length) {
+                float end=minf(position+dash,length);
+                D2D1_POINT_2F dash_a={a.x+dx*position,a.y+dy*position};
+                D2D1_POINT_2F dash_b={a.x+dx*end,a.y+dy*end};
+                app->render_target->lpVtbl->DrawLine(
+                    app->render_target,dash_a,dash_b,
+                    (ID2D1Brush *)app->brush,item->stroke,NULL);
+                position+=dash+gap;
+            }
+        }
+    } else {
+        app->render_target->lpVtbl->DrawLine(
+            app->render_target, a, b, (ID2D1Brush *)app->brush,
+            item->stroke, NULL);
+    }
+}
+
+static bool push_horizontal_region_clip(TintaApp *app, size_t index,
+                                        float vx, float scroll) {
+    const TintaHorizontalRegion *region = horizontal_region_const(app, index);
+    D2D1_RECT_F clip;
+    if (!region) return false;
+    clip = (D2D1_RECT_F){vx + region->viewport.left,
+                         region->viewport.top - scroll,
+                         vx + region->viewport.right,
+                         region->viewport.bottom - scroll};
+    if (clip.bottom <= 0 || clip.top >= app->height ||
+        clip.right <= 0 || clip.left >= app->width)
+        return false;
+    app->render_target->lpVtbl->PushAxisAlignedClip(
+        app->render_target, &clip, D2D1_ANTIALIAS_MODE_ALIASED);
+    return true;
+}
+
+static void draw_horizontal_region_scrollbar(TintaApp *app, size_t index) {
+    TintaScrollbarGeometry geometry;
+    D2D1_ROUNDED_RECT thumb;
+    bool hovered;
+    float height;
+    float center;
+    float gray;
+    if (!horizontal_region_scrollbar_geometry(app, index, &geometry)) return;
+    hovered = app->hovered_horizontal_region == (int)index ||
+              app->dragging_horizontal_region == (int)index;
+    height = ui_scale(app, hovered ? 8.0f : 5.0f);
+    center = (geometry.top + geometry.bottom) * 0.5f;
+    thumb = (D2D1_ROUNDED_RECT){{geometry.left, center - height * 0.5f,
+                                 geometry.right, center + height * 0.5f},
+                                height * 0.5f, height * 0.5f};
+    gray = app->theme->dark ? 1.0f : 0.0f;
+    set_brush_gray(app, gray, hovered ? 0.5f : 0.3f);
+    app->render_target->lpVtbl->FillRoundedRectangle(
+        app->render_target, &thumb, (ID2D1Brush *)app->brush);
+}
+
+static void highlight_run_with_region(TintaApp *app, const TintaTextRun *run,
+                                      float vx, float scroll, size_t start,
+                                      size_t end, uint32_t color) {
+    const TintaHorizontalRegion *region = horizontal_region_const(
+        app, run->horizontal_region);
+    if (!region) {
+        highlight_run(app, run, vx, scroll, start, end, color);
+        return;
+    }
+    if (push_horizontal_region_clip(app, run->horizontal_region, vx, scroll)) {
+        highlight_run(app, run, vx + horizontal_region_offset(region), scroll,
+                      start, end, color);
+        app->render_target->lpVtbl->PopAxisAlignedClip(app->render_target);
+    }
+}
+
 static void draw_code_header(TintaApp *app, const TintaCodeBlock *block,
                              float vx, float scroll) {
     float document_left;
@@ -2205,34 +2588,39 @@ void tinta_render(TintaApp *app) {
         app->render_target->lpVtbl->PushAxisAlignedClip(
             app->render_target, &clip, D2D1_ANTIALIAS_MODE_ALIASED);
         for (i = 0; i < app->rects.len; i++) {
-            draw_rect_item(app, TINTA_VEC_PTR(TintaDrawRect, app->rects, i), vx, scroll);
+            TintaDrawRect *item = TINTA_VEC_PTR(TintaDrawRect, app->rects, i);
+            if (item->horizontal_region == SIZE_MAX)
+                draw_rect_item(app, item, vx, scroll);
         }
         for (i = 0; i < app->lines.len; i++) {
-            TintaDrawLine item = TINTA_VEC_AT(TintaDrawLine, app->lines, i);
-            D2D1_POINT_2F a = {vx + item.a.x, item.a.y - scroll};
-            D2D1_POINT_2F b = {vx + item.b.x, item.b.y - scroll};
-            if (maxf(a.y, b.y) < 0 || minf(a.y, b.y) > app->height)
-                continue;
-            set_brush_alpha(app, item.color, item.opacity);
-            if (item.dashed) {
-                float dx=b.x-a.x,dy=b.y-a.y,length=sqrtf(dx*dx+dy*dy);
-                float dash=ui_scale(app,6),gap=ui_scale(app,4),position=0;
-                if(length>0.001f) {
-                    dx/=length;dy/=length;
-                    while(position<length) {
-                        float end=minf(position+dash,length);
-                        D2D1_POINT_2F dash_a={a.x+dx*position,a.y+dy*position};
-                        D2D1_POINT_2F dash_b={a.x+dx*end,a.y+dy*end};
-                        app->render_target->lpVtbl->DrawLine(
-                            app->render_target,dash_a,dash_b,
-                            (ID2D1Brush *)app->brush,item.stroke,NULL);
-                        position+=dash+gap;
-                    }
+            TintaDrawLine *item = TINTA_VEC_PTR(TintaDrawLine, app->lines, i);
+            if (item->horizontal_region == SIZE_MAX)
+                draw_line_item(app, item, vx, scroll);
+        }
+        {
+            size_t region_index;
+            for (region_index = 0;
+                 region_index < app->horizontal_regions.len; region_index++) {
+                const TintaHorizontalRegion *region = horizontal_region_const(
+                    app, region_index);
+                if (!push_horizontal_region_clip(
+                        app, region_index, vx, scroll)) continue;
+                for (i = 0; i < app->rects.len; i++) {
+                    TintaDrawRect *item = TINTA_VEC_PTR(
+                        TintaDrawRect, app->rects, i);
+                    if (item->horizontal_region == region_index)
+                        draw_rect_item(app, item,
+                            vx + horizontal_region_offset(region), scroll);
                 }
-            } else {
-                app->render_target->lpVtbl->DrawLine(
-                    app->render_target, a, b, (ID2D1Brush *)app->brush,
-                    item.stroke, NULL);
+                for (i = 0; i < app->lines.len; i++) {
+                    TintaDrawLine *item = TINTA_VEC_PTR(
+                        TintaDrawLine, app->lines, i);
+                    if (item->horizontal_region == region_index)
+                        draw_line_item(app, item,
+                            vx + horizontal_region_offset(region), scroll);
+                }
+                app->render_target->lpVtbl->PopAxisAlignedClip(
+                    app->render_target);
             }
         }
 #if TINTA_ENABLE_IMAGES
@@ -2279,8 +2667,8 @@ void tinta_render(TintaApp *app) {
                 } else if (run_end <= match.start) {
                     run_index++;
                 } else {
-                    highlight_run(app, run, vx, scroll, match.start,
-                                  match_end, color);
+                    highlight_run_with_region(app, run, vx, scroll,
+                                              match.start, match_end, color);
                     if (run_end < match_end) run_index++;
                     else match_index++;
                 }
@@ -2289,11 +2677,39 @@ void tinta_render(TintaApp *app) {
             size_t start = min(app->selection_anchor, app->selection_focus);
             size_t end = max(app->selection_anchor, app->selection_focus);
             for (i = 0; i < app->text_runs.len; i++)
-                highlight_run(app,
+                highlight_run_with_region(app,
                     TINTA_VEC_PTR(TintaTextRun, app->text_runs, i),
                     vx, scroll, start, end, app->theme->quote);
         }
-        for (i = 0; i < app->text_runs.len; i++) { draw_run(app, TINTA_VEC_PTR(TintaTextRun, app->text_runs, i), vx, scroll); app->draw_calls++; }
+        for (i = 0; i < app->text_runs.len; i++) {
+            TintaTextRun *run = TINTA_VEC_PTR(
+                TintaTextRun, app->text_runs, i);
+            if (run->horizontal_region == SIZE_MAX) {
+                draw_run(app, run, vx, scroll);
+                app->draw_calls++;
+            }
+        }
+        {
+            size_t region_index;
+            for (region_index = 0;
+                 region_index < app->horizontal_regions.len; region_index++) {
+                const TintaHorizontalRegion *region = horizontal_region_const(
+                    app, region_index);
+                if (!push_horizontal_region_clip(
+                        app, region_index, vx, scroll)) continue;
+                for (i = 0; i < app->text_runs.len; i++) {
+                    TintaTextRun *run = TINTA_VEC_PTR(
+                        TintaTextRun, app->text_runs, i);
+                    if (run->horizontal_region == region_index) {
+                        draw_run(app, run,
+                            vx + horizontal_region_offset(region), scroll);
+                        app->draw_calls++;
+                    }
+                }
+                app->render_target->lpVtbl->PopAxisAlignedClip(
+                    app->render_target);
+            }
+        }
         if (app->hovered_code_block >= 0 &&
             (size_t)app->hovered_code_block < app->code_blocks.len) {
             TintaCodeBlock *block = TINTA_VEC_PTR(
@@ -2311,6 +2727,8 @@ void tinta_render(TintaApp *app) {
                 draw_copy_button(app, button, copied, over_button);
         }
         app->render_target->lpVtbl->PopAxisAlignedClip(app->render_target);
+        for (i = 0; i < app->horizontal_regions.len; i++)
+            draw_horizontal_region_scrollbar(app, i);
         if (app->document_copy_button_enabled) {
             RECT document_button = document_button_rect(app);
             D2D1_RECT_F button = {
@@ -2437,9 +2855,17 @@ static size_t hit_bucket_lower_bound(const TintaVec *entries, int bucket) {
     return low;
 }
 
-static bool consider_hit_run(TintaTextRun *run, float x, float y,
+static bool consider_hit_run(TintaApp *app, TintaTextRun *run, float x, float y,
                              size_t *position,
                              const char **url, HitCandidate *candidate) {
+    const TintaHorizontalRegion *region = horizontal_region_const(
+        app, run->horizontal_region);
+    if (region) {
+        if (x < region->viewport.left || x > region->viewport.right ||
+            y < region->viewport.top || y > region->viewport.bottom)
+            return false;
+        x -= horizontal_region_offset(region);
+    }
     float right = run->x + run->width;
     float bottom = run->y + run->height;
     float y_distance = y < run->y ? run->y - y :
@@ -2479,7 +2905,7 @@ static bool scan_hit_bucket(TintaApp *app, int bucket, float x, float y,
             TINTA_VEC_PTR(TintaHitEntry, app->hit_entries, index);
         if (entry->bucket != bucket) break;
         if (entry->run_index < app->text_runs.len &&
-            consider_hit_run(
+            consider_hit_run(app,
                 TINTA_VEC_PTR(TintaTextRun, app->text_runs, entry->run_index),
                 x, y, position, url, candidate))
             return true;
@@ -2529,7 +2955,7 @@ static bool hit_test_linear(TintaApp *app, float x, float y,
                             HitCandidate *candidate) {
     size_t index;
     for (index = 0; index < app->text_runs.len; index++) {
-        if (consider_hit_run(
+        if (consider_hit_run(app,
                 TINTA_VEC_PTR(TintaTextRun, app->text_runs, index),
                 x, y, position, url, candidate))
             return true;
@@ -2555,7 +2981,10 @@ void tinta_hit_test(TintaApp *app, float x, float y, size_t *position,
         exact = hit_test_linear(app, x, y, position, url, &candidate);
     if (!exact && position && candidate.nearest) {
         TintaTextRun *nearest = candidate.nearest;
+        const TintaHorizontalRegion *region = horizontal_region_const(
+            app, nearest->horizontal_region);
         float right = nearest->x + nearest->width;
+        if (region) x -= horizontal_region_offset(region);
         if (x <= nearest->x) {
             *position = nearest->doc_start;
         } else if (x >= right) {

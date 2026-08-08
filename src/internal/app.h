@@ -72,6 +72,7 @@ typedef struct TintaTextRun {
     char *url;
     bool underline;
     bool strikethrough;
+    size_t horizontal_region;
 } TintaTextRun;
 
 typedef enum TintaDrawShape {
@@ -91,6 +92,7 @@ typedef struct TintaDrawRect {
     bool outline;
     float stroke;
     TintaDrawShape shape;
+    size_t horizontal_region;
 } TintaDrawRect;
 
 typedef struct TintaDrawLine {
@@ -100,6 +102,7 @@ typedef struct TintaDrawLine {
     float stroke;
     float opacity;
     bool dashed;
+    size_t horizontal_region;
 } TintaDrawLine;
 
 typedef struct TintaDrawBitmap {
@@ -111,7 +114,32 @@ typedef struct TintaCodeBlock {
     RECT rect;
     wchar_t *text;
     wchar_t *language;
+    size_t horizontal_region;
 } TintaCodeBlock;
+
+typedef enum TintaHorizontalRegionKind {
+    TINTA_HORIZONTAL_CODE,
+    TINTA_HORIZONTAL_MERMAID
+} TintaHorizontalRegionKind;
+
+typedef struct TintaHorizontalRegion {
+    TintaHorizontalRegionKind kind;
+    size_t source_offset;
+    size_t ordinal;
+    RECT viewport;
+    float content_left;
+    float content_right;
+    float scroll_x;
+    float scale_factor;
+    bool overflow;
+} TintaHorizontalRegion;
+
+typedef struct TintaHorizontalScrollState {
+    TintaHorizontalRegionKind kind;
+    size_t source_offset;
+    size_t ordinal;
+    float scroll_dip;
+} TintaHorizontalScrollState;
 
 typedef struct TintaHeading {
     wchar_t *text;
@@ -234,6 +262,9 @@ struct TintaApp {
     TintaVec lines;
     TintaVec bitmaps;
     TintaVec code_blocks;
+    TintaVec horizontal_regions;
+    TintaVec horizontal_scroll_states;
+    size_t active_horizontal_region;
     TintaVec headings;
     TintaVec scroll_anchors;
     bool scroll_anchor_pending;
@@ -282,6 +313,10 @@ struct TintaApp {
     bool h_scrollbar_dragging;
     float h_scrollbar_drag_start_x;
     float h_scrollbar_drag_start_scroll;
+    int hovered_horizontal_region;
+    int dragging_horizontal_region;
+    float horizontal_region_drag_start_x;
+    float horizontal_region_drag_start_scroll;
 
     size_t parse_time_us;
     size_t ast_node_count;
@@ -341,6 +376,11 @@ bool tinta_scrollbar_update_hover(TintaApp *app, int x, int y);
 bool tinta_scrollbar_begin_drag(TintaApp *app, int x, int y);
 bool tinta_scrollbar_drag(TintaApp *app, int x, int y);
 bool tinta_scrollbar_end_drag(TintaApp *app, int x, int y);
+bool tinta_horizontal_region_scroll_at(TintaApp *app, int x, int y,
+                                       float amount);
+bool tinta_horizontal_region_scroll_run_into_view(TintaApp *app,
+                                                   const TintaTextRun *run);
+void tinta_horizontal_region_clear_states(TintaApp *app);
 void tinta_hit_test(TintaApp *app, float x, float y, size_t *position, const char **url);
 bool tinta_text_at(TintaApp *app, float x, float y, const char **url);
 bool tinta_copy_selection(TintaApp *app);

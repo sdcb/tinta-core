@@ -6,6 +6,8 @@
   the content and copies the displayed revision's original Markdown source.
 - Added runtime-configurable left, top, right, and bottom page margins through
   `TMM_SETPAGEMARGINS` and `TMM_GETPAGEMARGINS`.
+- Moved wide code and Mermaid content into block-local horizontal scrolling,
+  while retaining a 240-DIP minimum block width for very narrow hosts.
 
 ## 1.0.0
 
