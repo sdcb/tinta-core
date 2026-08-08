@@ -134,6 +134,41 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
     endif()
 
     if(BUILD_TESTING)
+        set(TINTA_LAYOUT_TEST_LIBRARY Tinta::Core)
+        if(BUILD_SHARED_LIBS)
+            # layout_tests exercises internal renderer/app entry points which
+            # are intentionally not exported by the public DLL. Shared builds
+            # therefore use a static copy with the same feature set.
+            add_library(tinta_layout_test_support STATIC ${TINTA_CORE_SOURCES})
+            target_include_directories(tinta_layout_test_support BEFORE PRIVATE
+                src/internal vendor/md4c/src include)
+            target_compile_definitions(tinta_layout_test_support PRIVATE
+                UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
+                TINTA_ENABLE_UIA=$<BOOL:${TINTA_ENABLE_UIA}>
+                TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
+                TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
+                TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
+                TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
+            target_link_libraries(tinta_layout_test_support PRIVATE
+                d2d1 dwrite advapi32 shell32 shlwapi)
+            if(TINTA_ENABLE_REMOTE_IMAGES OR TINTA_ENABLE_LOCAL_IMAGES)
+                target_link_libraries(tinta_layout_test_support PRIVATE
+                    windowscodecs ole32)
+            endif()
+            if(TINTA_ENABLE_REMOTE_IMAGES)
+                target_link_libraries(tinta_layout_test_support PRIVATE urlmon)
+            endif()
+            if(TINTA_ENABLE_UIA)
+                target_link_libraries(tinta_layout_test_support PRIVATE
+                    oleaut32 uiautomationcore)
+            endif()
+            if(MSVC)
+                target_compile_options(tinta_layout_test_support PRIVATE
+                    /utf-8 /W4 /WX)
+            endif()
+            set(TINTA_LAYOUT_TEST_LIBRARY tinta_layout_test_support)
+        endif()
+
         add_executable(core_tests tests/core_tests.cpp)
         target_include_directories(core_tests PRIVATE src/internal)
         target_link_libraries(core_tests PRIVATE tinta_test_support)
@@ -148,7 +183,7 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
 
         add_executable(layout_tests tests/layout_tests.cpp)
         target_include_directories(layout_tests PRIVATE src/internal)
-        target_link_libraries(layout_tests PRIVATE Tinta::Core)
+        target_link_libraries(layout_tests PRIVATE ${TINTA_LAYOUT_TEST_LIBRARY})
         target_compile_definitions(layout_tests PRIVATE
             TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>)
         add_test(NAME renderer_layout COMMAND layout_tests)
