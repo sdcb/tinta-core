@@ -529,6 +529,13 @@ bool tinta_app_update_formats(TintaApp *app) {
     IDWriteTextFormat *italic = NULL;
     IDWriteTextFormat *bold_italic = NULL;
     IDWriteTextFormat *small_text = NULL;
+    IDWriteTextFormat *small_bold = NULL;
+    IDWriteTextFormat *small_italic = NULL;
+    IDWriteTextFormat *small_bold_italic = NULL;
+    IDWriteTextFormat *small_code = NULL;
+    IDWriteTextFormat *small_code_bold = NULL;
+    IDWriteTextFormat *small_code_italic = NULL;
+    IDWriteTextFormat *small_code_bold_italic = NULL;
     IDWriteTextFormat *code = NULL;
     IDWriteTextFormat *code_bold = NULL;
     IDWriteTextFormat *code_italic = NULL;
@@ -551,6 +558,27 @@ bool tinta_app_update_formats(TintaApp *app) {
     small_text = create_format(app, app->theme->font_family, 12,
                                TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                                TINTA_DWRITE_FONT_STYLE_NORMAL);
+    small_bold = create_format(app, app->theme->font_family, 12,
+                               TINTA_DWRITE_FONT_WEIGHT_BOLD,
+                               TINTA_DWRITE_FONT_STYLE_NORMAL);
+    small_italic = create_format(app, app->theme->font_family, 12,
+                                 TINTA_DWRITE_FONT_WEIGHT_NORMAL,
+                                 TINTA_DWRITE_FONT_STYLE_ITALIC);
+    small_bold_italic = create_format(app, app->theme->font_family, 12,
+                                      TINTA_DWRITE_FONT_WEIGHT_BOLD,
+                                      TINTA_DWRITE_FONT_STYLE_ITALIC);
+    small_code = create_format(app, app->theme->code_font_family, 12,
+                               TINTA_DWRITE_FONT_WEIGHT_NORMAL,
+                               TINTA_DWRITE_FONT_STYLE_NORMAL);
+    small_code_bold = create_format(app, app->theme->code_font_family, 12,
+                                    TINTA_DWRITE_FONT_WEIGHT_BOLD,
+                                    TINTA_DWRITE_FONT_STYLE_NORMAL);
+    small_code_italic = create_format(app, app->theme->code_font_family, 12,
+                                      TINTA_DWRITE_FONT_WEIGHT_NORMAL,
+                                      TINTA_DWRITE_FONT_STYLE_ITALIC);
+    small_code_bold_italic = create_format(
+        app, app->theme->code_font_family, 12,
+        TINTA_DWRITE_FONT_WEIGHT_BOLD, TINTA_DWRITE_FONT_STYLE_ITALIC);
     code = create_format(app, app->theme->code_font_family, 14,
                          TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                          TINTA_DWRITE_FONT_STYLE_NORMAL);
@@ -569,7 +597,9 @@ bool tinta_app_update_formats(TintaApp *app) {
     chrome = create_scaled_format(app, app->theme->font_family, 12,
                                   TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                                   TINTA_DWRITE_FONT_STYLE_NORMAL, 1.0f);
-    if (!body || !bold || !italic || !bold_italic || !small_text || !code ||
+    if (!body || !bold || !italic || !bold_italic || !small_text ||
+        !small_bold || !small_italic || !small_bold_italic || !small_code ||
+        !small_code_bold || !small_code_italic || !small_code_bold_italic || !code ||
         !code_bold || !code_italic || !code_bold_italic || !ui || !chrome)
         goto failed;
     for (i = 0; i < 6; i++)
@@ -583,6 +613,13 @@ bool tinta_app_update_formats(TintaApp *app) {
     release_text_format(&app->italic_format);
     release_text_format(&app->bold_italic_format);
     release_text_format(&app->small_format);
+    release_text_format(&app->small_bold_format);
+    release_text_format(&app->small_italic_format);
+    release_text_format(&app->small_bold_italic_format);
+    release_text_format(&app->small_code_format);
+    release_text_format(&app->small_code_bold_format);
+    release_text_format(&app->small_code_italic_format);
+    release_text_format(&app->small_code_bold_italic_format);
     release_text_format(&app->code_format);
     release_text_format(&app->code_bold_format);
     release_text_format(&app->code_italic_format);
@@ -595,6 +632,13 @@ bool tinta_app_update_formats(TintaApp *app) {
     app->italic_format = italic;
     app->bold_italic_format = bold_italic;
     app->small_format = small_text;
+    app->small_bold_format = small_bold;
+    app->small_italic_format = small_italic;
+    app->small_bold_italic_format = small_bold_italic;
+    app->small_code_format = small_code;
+    app->small_code_bold_format = small_code_bold;
+    app->small_code_italic_format = small_code_italic;
+    app->small_code_bold_italic_format = small_code_bold_italic;
     app->code_format = code;
     app->code_bold_format = code_bold;
     app->code_italic_format = code_italic;
@@ -610,6 +654,13 @@ failed:
     release_text_format(&italic);
     release_text_format(&bold_italic);
     release_text_format(&small_text);
+    release_text_format(&small_bold);
+    release_text_format(&small_italic);
+    release_text_format(&small_bold_italic);
+    release_text_format(&small_code);
+    release_text_format(&small_code_bold);
+    release_text_format(&small_code_italic);
+    release_text_format(&small_code_bold_italic);
     release_text_format(&code);
     release_text_format(&code_bold);
     release_text_format(&code_italic);
@@ -738,6 +789,7 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->code_blocks, sizeof(TintaCodeBlock));
     tinta_vec_init(&app->mermaid_blocks, sizeof(TintaMermaidBlock));
     tinta_vec_init(&app->svg_blocks, sizeof(TintaSvgBlock));
+    tinta_vec_init(&app->details_blocks, sizeof(TintaDetailsBlock));
     tinta_vec_init(&app->horizontal_regions, sizeof(TintaHorizontalRegion));
     tinta_vec_init(&app->horizontal_scroll_states,
                    sizeof(TintaHorizontalScrollState));
@@ -812,6 +864,7 @@ void tinta_app_destroy(TintaApp *app) {
     tinta_vec_destroy(&app->code_blocks);
     tinta_vec_destroy(&app->mermaid_blocks);
     tinta_vec_destroy(&app->svg_blocks);
+    tinta_vec_destroy(&app->details_blocks);
     tinta_vec_destroy(&app->horizontal_regions);
     tinta_vec_destroy(&app->horizontal_scroll_states);
     tinta_vec_destroy(&app->block_collapse_states);
@@ -828,6 +881,13 @@ void tinta_app_destroy(TintaApp *app) {
     release_text_format(&app->italic_format);
     release_text_format(&app->bold_italic_format);
     release_text_format(&app->small_format);
+    release_text_format(&app->small_bold_format);
+    release_text_format(&app->small_italic_format);
+    release_text_format(&app->small_bold_italic_format);
+    release_text_format(&app->small_code_format);
+    release_text_format(&app->small_code_bold_format);
+    release_text_format(&app->small_code_italic_format);
+    release_text_format(&app->small_code_bold_italic_format);
     release_text_format(&app->code_format);
     release_text_format(&app->code_bold_format);
     release_text_format(&app->code_italic_format);

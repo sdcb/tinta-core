@@ -34,7 +34,10 @@ typedef enum TintaElementType {
     TINTA_ELEMENT_HIGHLIGHT,
     TINTA_ELEMENT_SUPERSCRIPT,
     TINTA_ELEMENT_SUBSCRIPT,
-    TINTA_ELEMENT_STRIKETHROUGH
+    TINTA_ELEMENT_STRIKETHROUGH,
+    TINTA_ELEMENT_DETAILS,
+    TINTA_ELEMENT_SUMMARY,
+    TINTA_ELEMENT_DETAILS_END
 } TintaElementType;
 
 typedef struct TintaElement TintaElement;
@@ -54,6 +57,8 @@ struct TintaElement {
     int align;
     int col_count;
     int alert_kind;
+    bool open;
+    bool html_unclosed;
     size_t source_offset;
     TintaElement **children;
     size_t child_count;

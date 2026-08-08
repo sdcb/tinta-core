@@ -155,10 +155,20 @@ typedef struct TintaSvgBlock {
     float expansion;
 } TintaSvgBlock;
 
+typedef struct TintaDetailsBlock {
+    RECT summary_rect;
+    RECT body_rect;
+    size_t summary_region;
+    size_t horizontal_region;
+    size_t collapse_state;
+    float expansion;
+} TintaDetailsBlock;
+
 typedef enum TintaHorizontalRegionKind {
     TINTA_HORIZONTAL_CODE,
     TINTA_HORIZONTAL_MERMAID,
-    TINTA_HORIZONTAL_SVG
+    TINTA_HORIZONTAL_SVG,
+    TINTA_HORIZONTAL_DETAILS
 } TintaHorizontalRegionKind;
 
 typedef struct TintaHorizontalRegion {
@@ -171,6 +181,7 @@ typedef struct TintaHorizontalRegion {
     float scroll_x;
     float scale_factor;
     size_t collapse_state;
+    size_t parent_region;
     float expansion;
     bool overflow;
 } TintaHorizontalRegion;
@@ -304,6 +315,13 @@ struct TintaApp {
     IDWriteTextFormat *italic_format;
     IDWriteTextFormat *bold_italic_format;
     IDWriteTextFormat *small_format;
+    IDWriteTextFormat *small_bold_format;
+    IDWriteTextFormat *small_italic_format;
+    IDWriteTextFormat *small_bold_italic_format;
+    IDWriteTextFormat *small_code_format;
+    IDWriteTextFormat *small_code_bold_format;
+    IDWriteTextFormat *small_code_italic_format;
+    IDWriteTextFormat *small_code_bold_italic_format;
     IDWriteTextFormat *code_format;
     IDWriteTextFormat *code_bold_format;
     IDWriteTextFormat *code_italic_format;
@@ -331,6 +349,7 @@ struct TintaApp {
     TintaVec code_blocks;
     TintaVec mermaid_blocks;
     TintaVec svg_blocks;
+    TintaVec details_blocks;
     TintaVec horizontal_regions;
     TintaVec horizontal_scroll_states;
     TintaVec block_collapse_states;

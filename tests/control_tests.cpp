@@ -592,6 +592,37 @@ int main() {
         std::cerr << "default options restore failed\n";
         return 1;
     }
+    const wchar_t *details_markdown =
+        L"<details>\n<summary>Disclosure heading</summary>\n\n"
+        L"Hidden searchable details body.\n\n</details>";
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(details_markdown));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    TintaContentSize collapsed_details_size{};
+    collapsed_details_size.cb_size = sizeof(collapsed_details_size);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&collapsed_details_size))) {
+        std::cerr << "collapsed details size query failed\n";
+        return 1;
+    }
+    TintaFindRequest details_find{};
+    details_find.cb_size = sizeof(details_find);
+    details_find.text = L"searchable details";
+    details_find.text_length = 18;
+    details_find.flags = TINTA_FIND_WRAP;
+    if (!SendMessageW(view, TMM_FIND, 0,
+                      reinterpret_cast<LPARAM>(&details_find))) {
+        std::cerr << "find did not reveal collapsed details content\n";
+        return 1;
+    }
+    TintaContentSize expanded_details_size{};
+    expanded_details_size.cb_size = sizeof(expanded_details_size);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&expanded_details_size)) ||
+        expanded_details_size.height <= collapsed_details_size.height + 1.0f) {
+        std::cerr << "details search result remained collapsed\n";
+        return 1;
+    }
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));
     SendMessageW(view, WM_PAINT, 0, 0);

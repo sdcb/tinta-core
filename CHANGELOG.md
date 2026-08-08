@@ -23,6 +23,8 @@
 - Added triple-click logical-line selection with whole-line drag extension.
 - Added best-effort Direct2D SVG rendering for local, remote, and Data URI
   images, including source Copy and animated standalone-block headers.
+- Added HTML `<sub>`/`<sup>` scripts and GitHub-style animated
+  `<details>`/`<summary>` containers around ordinary Markdown blocks.
 
 - Upstream `tinta` changes have been reviewed through commit `ac521d6`.
 

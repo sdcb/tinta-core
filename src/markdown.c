@@ -43,6 +43,7 @@ typedef struct HtmlTag {
     TintaStr8 title;
     bool closing;
     bool self_closing;
+    bool open;
 } HtmlTag;
 
 static bool is_space_char(char value) {
@@ -229,6 +230,7 @@ failed:
 }
 
 static bool parse_html_into_elements(const char *html, TintaElement *parent);
+static bool normalize_html_details(TintaElement *parent);
 
 static int leave_block(MD_BLOCKTYPE type, void *detail, void *userdata) {
     ParserContext *context = (ParserContext *)userdata;
@@ -329,6 +331,34 @@ static bool html_tag_eq(const MD_CHAR *text, MD_SIZE size, const char *name,
           normalized[2 + strlen(name)] == '>'));
 }
 
+static bool inline_html_tag(const MD_CHAR *text, MD_SIZE size,
+                            const char *name, bool *closing,
+                            bool *self_closing) {
+    size_t i = 1;
+    size_t start;
+    size_t name_length = strlen(name);
+    if (!text || size < 3 || text[0] != '<' || text[size - 1] != '>')
+        return false;
+    while (i + 1 < size && is_space_char(text[i])) i++;
+    *closing = i + 1 < size && text[i] == '/';
+    if (*closing) {
+        i++;
+        while (i + 1 < size && is_space_char(text[i])) i++;
+    }
+    start = i;
+    while (i + 1 < size &&
+           (isalnum((unsigned char)text[i]) || text[i] == '-' ||
+            text[i] == ':')) i++;
+    if (i - start != name_length) return false;
+    for (i = 0; i < name_length; i++)
+        if (tolower((unsigned char)text[start + i]) !=
+            tolower((unsigned char)name[i])) return false;
+    i = size - 1;
+    while (i > start && is_space_char(text[i - 1])) i--;
+    *self_closing = i > start && text[i - 1] == '/';
+    return true;
+}
+
 static bool handle_inline_html_container(ParserContext *context,
                                          TintaElementType type,
                                          bool closing) {
@@ -358,24 +388,38 @@ static int text_callback(MD_TEXTTYPE type, const MD_CHAR *text, MD_SIZE size, vo
         case MD_TEXT_HTML:
             if (current && current->type != TINTA_ELEMENT_HTML_BLOCK && is_br_tag(text, size)) {
                 if (!context_flush_text(context) || !context_add_leaf(context, TINTA_ELEMENT_HARD_BREAK)) goto failed;
-            } else if (current && current->type != TINTA_ELEMENT_HTML_BLOCK &&
-                       (html_tag_eq(text,size,"ruby",false) ||
-                        html_tag_eq(text,size,"ruby",true))) {
-                if (!handle_inline_html_container(context,TINTA_ELEMENT_RUBY,
-                        html_tag_eq(text,size,"ruby",true))) goto failed;
-            } else if (current && current->type != TINTA_ELEMENT_HTML_BLOCK &&
-                       (html_tag_eq(text,size,"rt",false) ||
-                        html_tag_eq(text,size,"rt",true))) {
-                if (!handle_inline_html_container(context,TINTA_ELEMENT_RUBY_TEXT,
-                        html_tag_eq(text,size,"rt",true))) goto failed;
-            } else if (current && current->type != TINTA_ELEMENT_HTML_BLOCK &&
-                       html_tag_eq(text,size,"rp",false)) {
-                if (!context_flush_text(context)) goto failed;
-                context->suppress_rp_text = true;
-            } else if (current && current->type != TINTA_ELEMENT_HTML_BLOCK &&
-                       html_tag_eq(text,size,"rp",true)) {
-                tinta_str8_clear(&context->current_text);
-                context->suppress_rp_text = false;
+            } else if (current && current->type != TINTA_ELEMENT_HTML_BLOCK) {
+                bool closing = false;
+                bool self_closing = false;
+                TintaElementType container = TINTA_ELEMENT_DOCUMENT;
+                if (inline_html_tag(text, size, "ruby", &closing, &self_closing))
+                    container = TINTA_ELEMENT_RUBY;
+                else if (inline_html_tag(text, size, "rt", &closing, &self_closing))
+                    container = TINTA_ELEMENT_RUBY_TEXT;
+                else if (inline_html_tag(text, size, "sub", &closing, &self_closing))
+                    container = TINTA_ELEMENT_SUBSCRIPT;
+                else if (inline_html_tag(text, size, "sup", &closing, &self_closing))
+                    container = TINTA_ELEMENT_SUPERSCRIPT;
+                if (container != TINTA_ELEMENT_DOCUMENT) {
+                    if (!handle_inline_html_container(
+                            context, container, closing)) goto failed;
+                    if (self_closing && !closing &&
+                        !handle_inline_html_container(
+                            context, container, true)) goto failed;
+                    break;
+                }
+                if (html_tag_eq(text,size,"rp",false)) {
+                    if (!context_flush_text(context)) goto failed;
+                    context->suppress_rp_text = true;
+                    break;
+                }
+                if (html_tag_eq(text,size,"rp",true)) {
+                    tinta_str8_clear(&context->current_text);
+                    context->suppress_rp_text = false;
+                    break;
+                }
+                if (!tinta_str8_append(&context->current_text, text, size))
+                    goto failed;
             } else if (!tinta_str8_append(&context->current_text, text, size)) goto failed;
             break;
         case MD_TEXT_NORMAL:
@@ -612,6 +656,7 @@ TintaParseResult tinta_markdown_parse(const char *markdown, size_t length,
             SIZE_MAX : (size_t)elapsed;
     }
     if (status || context.failed || !context_flush_text(&context) ||
+        !normalize_html_details(context.root) ||
         !split_extensions(context.root)) goto failed;
     detect_alerts(context.root);
     result.root = context.root;
@@ -665,7 +710,8 @@ const char *tinta_element_type_name(TintaElementType type) {
     static const char *names[] = {"Document", "Paragraph", "Heading", "CodeBlock", "MermaidDiagram",
         "BlockQuote", "List", "ListItem", "HorizontalRule", "Table", "TableRow", "TableCell",
         "HtmlBlock", "Text", "Code", "Emphasis", "Strong", "Link", "Image", "SoftBreak",
-        "HardBreak", "Ruby", "RubyText", "Highlight", "Superscript", "Subscript", "Strikethrough"};
+        "HardBreak", "Ruby", "RubyText", "Highlight", "Superscript", "Subscript", "Strikethrough",
+        "Details", "Summary", "DetailsEnd"};
     return (unsigned)type < sizeof(names) / sizeof(names[0]) ? names[type] : "Unknown";
 }
 
@@ -699,6 +745,47 @@ static bool extract_attribute(const char *tag, size_t length, const char *attrib
     return true;
 }
 
+static bool has_attribute(const char *tag, size_t length,
+                          const char *attribute) {
+    size_t attribute_length = strlen(attribute);
+    size_t i = 1;
+    size_t j;
+    if (i < length && tag[i] == '/') i++;
+    while (i < length && is_space_char(tag[i])) i++;
+    while (i < length && !is_space_char(tag[i]) &&
+           tag[i] != '/' && tag[i] != '>') i++;
+    while (i < length) {
+        size_t start;
+        while (i < length && is_space_char(tag[i])) i++;
+        if (i >= length || tag[i] == '/' || tag[i] == '>') break;
+        start = i;
+        while (i < length &&
+               (isalnum((unsigned char)tag[i]) || tag[i] == '-' ||
+                tag[i] == '_' || tag[i] == ':')) i++;
+        if (i == start) { i++; continue; }
+        if (i - start == attribute_length) {
+            for (j = 0; j < attribute_length; j++)
+                if (tolower((unsigned char)tag[start + j]) !=
+                    tolower((unsigned char)attribute[j])) break;
+            if (j == attribute_length) return true;
+        }
+        while (i < length && is_space_char(tag[i])) i++;
+        if (i < length && tag[i] == '=') {
+            i++;
+            while (i < length && is_space_char(tag[i])) i++;
+            if (i < length && (tag[i] == '\'' || tag[i] == '"')) {
+                char quote = tag[i++];
+                while (i < length && tag[i] != quote) i++;
+                if (i < length) i++;
+            } else {
+                while (i < length && !is_space_char(tag[i]) &&
+                       tag[i] != '>') i++;
+            }
+        }
+    }
+    return false;
+}
+
 static bool parse_html_tag(const char *text, size_t length, HtmlTag *tag) {
     size_t start = 1, end, i;
     if (length > 1 && text[1] == '/') { tag->closing = true; start = 2; }
@@ -707,6 +794,7 @@ static bool parse_html_tag(const char *text, size_t length, HtmlTag *tag) {
     if (!tinta_str8_assign(&tag->name, text + start, end - start)) return false;
     for (i = 0; i < tag->name.len; i++) tag->name.data[i] = (char)tolower((unsigned char)tag->name.data[i]);
     tag->self_closing = length >= 2 && text[length - 2] == '/';
+    tag->open = has_attribute(text, length, "open");
     return extract_attribute(text, length, "href", &tag->href) &&
            extract_attribute(text, length, "title", &tag->title);
 }
@@ -727,6 +815,10 @@ static TintaElementType html_element_type(const char *name, int *heading_level) 
     if (!strcmp(name, "blockquote")) return TINTA_ELEMENT_BLOCK_QUOTE;
     if (!strcmp(name, "ruby")) return TINTA_ELEMENT_RUBY;
     if (!strcmp(name, "rt")) return TINTA_ELEMENT_RUBY_TEXT;
+    if (!strcmp(name, "sub")) return TINTA_ELEMENT_SUBSCRIPT;
+    if (!strcmp(name, "sup")) return TINTA_ELEMENT_SUPERSCRIPT;
+    if (!strcmp(name, "details")) return TINTA_ELEMENT_DETAILS;
+    if (!strcmp(name, "summary")) return TINTA_ELEMENT_SUMMARY;
     return TINTA_ELEMENT_DOCUMENT;
 }
 
@@ -786,6 +878,12 @@ static bool parse_html_into_elements(const char *html, TintaElement *parent) {
                     TintaElement *current = TINTA_VEC_AT(TintaElement *, stack, stack.len - 1);
                     if (!element) { html_tag_destroy(&tag); goto failed; }
                     element->level = heading_level;
+                    element->source_offset = parent->source_offset == SIZE_MAX ?
+                        SIZE_MAX : parent->source_offset + tag_start;
+                    if (type == TINTA_ELEMENT_DETAILS) {
+                        element->open = tag.open;
+                        element->html_unclosed = !tag.self_closing;
+                    }
                     if (type == TINTA_ELEMENT_LIST) {
                         element->ordered = strcmp(tag.name.data, "ol") == 0;
                         element->tight = true;
@@ -800,7 +898,35 @@ static bool parse_html_into_elements(const char *html, TintaElement *parent) {
                         if (!element->parent) tinta_element_destroy(element);
                         html_tag_destroy(&tag); goto failed;
                     }
-                } else if (stack.len > 1) stack.len--;
+                } else {
+                    size_t match = stack.len;
+                    while (match > 1) {
+                        TintaElement *candidate = TINTA_VEC_AT(
+                            TintaElement *, stack, match - 1);
+                        if (candidate->type == type) break;
+                        match--;
+                    }
+                    if (match > 1) {
+                        TintaElement *matched = TINTA_VEC_AT(
+                            TintaElement *, stack, match - 1);
+                        if (type == TINTA_ELEMENT_DETAILS)
+                            matched->html_unclosed = false;
+                        stack.len = match - 1;
+                    } else if (type == TINTA_ELEMENT_DETAILS) {
+                        TintaElement *marker = tinta_element_create(
+                            TINTA_ELEMENT_DETAILS_END);
+                        TintaElement *current = TINTA_VEC_AT(
+                            TintaElement *, stack, stack.len - 1);
+                        if (!marker) { html_tag_destroy(&tag); goto failed; }
+                        marker->source_offset = parent->source_offset == SIZE_MAX ?
+                            SIZE_MAX : parent->source_offset + tag_start;
+                        if (!tinta_element_add_child(current, marker)) {
+                            tinta_element_destroy(marker);
+                            html_tag_destroy(&tag);
+                            goto failed;
+                        }
+                    }
+                }
             }
         }
         html_tag_destroy(&tag);
@@ -810,4 +936,158 @@ static bool parse_html_into_elements(const char *html, TintaElement *parent) {
     tinta_vec_destroy(&stack); tinta_str8_destroy(&buffer); return true;
 failed:
     tinta_vec_destroy(&stack); tinta_str8_destroy(&buffer); return false;
+}
+
+static bool flatten_html_blocks(TintaElement *parent) {
+    TintaVec children;
+    size_t i;
+    tinta_vec_init(&children, sizeof(TintaElement *));
+    for (i = 0; i < parent->child_count; i++) {
+        TintaElement *child = parent->children[i];
+        if (child->type == TINTA_ELEMENT_HTML_BLOCK) {
+            size_t j;
+            for (j = 0; j < child->child_count; j++) {
+                TintaElement *nested = child->children[j];
+                nested->parent = parent;
+                if (!tinta_vec_push(&children, &nested)) goto failed;
+            }
+            child->child_count = 0;
+            tinta_element_destroy(child);
+        } else {
+            child->parent = parent;
+            if (!tinta_vec_push(&children, &child)) goto failed;
+        }
+    }
+    free(parent->children);
+    parent->children = (TintaElement **)children.data;
+    parent->child_count = children.len;
+    parent->child_capacity = children.cap;
+    return true;
+failed:
+    tinta_vec_destroy(&children);
+    return false;
+}
+
+static bool push_open_details_chain(TintaVec *stack, TintaElement *details) {
+    TintaElement *current = details;
+    while (current && current->type == TINTA_ELEMENT_DETAILS &&
+           current->html_unclosed) {
+        size_t i;
+        TintaElement *nested = NULL;
+        if (!tinta_vec_push(stack, &current)) return false;
+        for (i = current->child_count; i > 0; i--) {
+            TintaElement *candidate = current->children[i - 1];
+            if (candidate->type == TINTA_ELEMENT_DETAILS &&
+                candidate->html_unclosed) {
+                nested = candidate;
+                break;
+            }
+        }
+        current = nested;
+    }
+    return true;
+}
+
+static bool fold_details_siblings(TintaElement *parent) {
+    TintaVec children;
+    TintaVec stack;
+    size_t i;
+    tinta_vec_init(&children, sizeof(TintaElement *));
+    tinta_vec_init(&stack, sizeof(TintaElement *));
+    for (i = 0; i < parent->child_count; i++) {
+        TintaElement *child = parent->children[i];
+        if (child->type == TINTA_ELEMENT_DETAILS_END) {
+            if (stack.len) {
+                TintaElement *details = TINTA_VEC_AT(
+                    TintaElement *, stack, stack.len - 1);
+                details->html_unclosed = false;
+                stack.len--;
+            }
+            tinta_element_destroy(child);
+            continue;
+        }
+        if (stack.len) {
+            TintaElement *details = TINTA_VEC_AT(
+                TintaElement *, stack, stack.len - 1);
+            if (!tinta_element_add_child(details, child)) goto failed;
+        } else {
+            child->parent = parent;
+            if (!tinta_vec_push(&children, &child)) goto failed;
+        }
+        if (child->type == TINTA_ELEMENT_DETAILS &&
+            !push_open_details_chain(&stack, child)) goto failed;
+    }
+    free(parent->children);
+    parent->children = (TintaElement **)children.data;
+    parent->child_count = children.len;
+    parent->child_capacity = children.cap;
+    tinta_vec_destroy(&stack);
+    return true;
+failed:
+    tinta_vec_destroy(&children);
+    tinta_vec_destroy(&stack);
+    return false;
+}
+
+static bool insert_default_summary(TintaElement *details) {
+    TintaElement *summary = tinta_element_create(TINTA_ELEMENT_SUMMARY);
+    TintaElement *text = make_text("Details", 7);
+    TintaElement **children;
+    size_t capacity;
+    if (!summary || !text || !tinta_element_add_child(summary, text)) {
+        if (text && !text->parent) tinta_element_destroy(text);
+        tinta_element_destroy(summary);
+        return false;
+    }
+    summary->source_offset = details->source_offset;
+    capacity = details->child_capacity > details->child_count ?
+        details->child_capacity : details->child_count + 1;
+    children = (TintaElement **)realloc(
+        details->children, capacity * sizeof(*children));
+    if (!children) {
+        tinta_element_destroy(summary);
+        return false;
+    }
+    details->children = children;
+    details->child_capacity = capacity;
+    memmove(details->children + 1, details->children,
+            details->child_count * sizeof(*details->children));
+    details->children[0] = summary;
+    summary->parent = details;
+    details->child_count++;
+    return true;
+}
+
+static bool prepare_details_summary(TintaElement *details) {
+    size_t i;
+    size_t first = SIZE_MAX;
+    for (i = 0; i < details->child_count; i++) {
+        if (details->children[i]->type != TINTA_ELEMENT_SUMMARY) continue;
+        if (first == SIZE_MAX) first = i;
+        else details->children[i]->type = TINTA_ELEMENT_PARAGRAPH;
+    }
+    if (first == SIZE_MAX) return insert_default_summary(details);
+    if (first) {
+        TintaElement *summary = details->children[first];
+        memmove(details->children + 1, details->children,
+                first * sizeof(*details->children));
+        details->children[0] = summary;
+    }
+    return true;
+}
+
+static bool normalize_html_details(TintaElement *parent) {
+    size_t i;
+    if (!flatten_html_blocks(parent) || !fold_details_siblings(parent))
+        return false;
+    if (parent->type == TINTA_ELEMENT_DETAILS &&
+        !prepare_details_summary(parent)) return false;
+    for (i = 0; i < parent->child_count; i++) {
+        TintaElement *child = parent->children[i];
+        if (child->type == TINTA_ELEMENT_SUMMARY &&
+            parent->type != TINTA_ELEMENT_DETAILS)
+            child->type = TINTA_ELEMENT_PARAGRAPH;
+        if (!normalize_html_details(child)) return false;
+    }
+    return true;
 }

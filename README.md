@@ -107,6 +107,12 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - Nested inline styles are merged instead of replacing one another. Inline
   code inside bold, italic, bold-italic, or links keeps the corresponding face
   and interaction, and punctuation after a code pill has no synthetic space.
+- Inline and block HTML `<sub>`/`<sup>` map to native script text while
+  preserving nested emphasis, links, code, selection, search, and copy.
+- GitHub-style `<details>`/`<summary>` can wrap Markdown blocks, including
+  nested Details, Code, Mermaid, images, and SVG. Summary rows toggle with an
+  animated chevron; `open` controls the initial state, and search or UIA
+  access reveals hidden ancestor Details.
 - Mermaid node labels are centered with shape-aware padding. Diamonds,
   hexagons, circles, and rectangles reserve dimensions appropriate to their
   outlines while retaining block-local horizontal scrolling.

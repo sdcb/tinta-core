@@ -132,7 +132,10 @@ void test_inline_styles(TintaApp &app) {
         "*italic `code`*\n\n"
         "***both `code`***\n\n"
         "[link `code`](https://example.com)\n\n"
-        "**x^2^** and **bold ~~gone~~ ==mark==**\n";
+        "**x^2^** and **bold ~~gone~~ ==mark==**\n\n"
+        "**<sub>bold-sub</sub>** *<sup>italic-sup</sup>* "
+        "***<sub>`both-code`</sub>*** "
+        "[<sup>linked-sup</sup>](https://example.com/script)\n";
     check(load(app, source), "nested inline style document lays out");
     if (!app.layout_complete) return;
 
@@ -145,6 +148,10 @@ void test_inline_styles(TintaApp &app) {
     auto *superscript = find_run(app, L"2");
     auto *gone = find_run(app, L"gone");
     auto *mark = find_run(app, L"mark");
+    auto *bold_sub = find_run(app, L"bold-sub");
+    auto *italic_sup = find_run(app, L"italic-sup");
+    auto *both_script_code = find_run(app, L"both-code");
+    auto *linked_sup = find_run(app, L"linked-sup");
 
     check(bold_code && bold_code->layout &&
               bold_code->layout->lpVtbl->GetFontWeight(bold_code->layout) ==
@@ -186,6 +193,30 @@ void test_inline_styles(TintaApp &app) {
               mark->layout->lpVtbl->GetFontWeight(mark->layout) ==
                   TINTA_DWRITE_FONT_WEIGHT_BOLD,
           "nested highlight keeps the inherited emphasis");
+    check(bold_sub && bold_sub->layout &&
+              bold_sub->layout->lpVtbl->GetFontWeight(bold_sub->layout) ==
+                  TINTA_DWRITE_FONT_WEIGHT_BOLD &&
+              std::fabs(bold_sub->layout->lpVtbl->GetFontSize(bold_sub->layout) -
+                        app.small_format->lpVtbl->GetFontSize(app.small_format)) < 0.01f,
+          "HTML sub preserves inherited bold at script size");
+    check(italic_sup && italic_sup->layout &&
+              italic_sup->layout->lpVtbl->GetFontStyle(italic_sup->layout) ==
+                  TINTA_DWRITE_FONT_STYLE_ITALIC,
+          "HTML sup preserves inherited italic");
+    check(both_script_code && both_script_code->layout &&
+              both_script_code->layout->lpVtbl->GetFontWeight(
+                  both_script_code->layout) == TINTA_DWRITE_FONT_WEIGHT_BOLD &&
+              both_script_code->layout->lpVtbl->GetFontStyle(
+                  both_script_code->layout) == TINTA_DWRITE_FONT_STYLE_ITALIC &&
+              std::fabs(both_script_code->layout->lpVtbl->GetFontSize(
+                            both_script_code->layout) -
+                        app.small_format->lpVtbl->GetFontSize(app.small_format)) < 0.01f,
+          "inline code in HTML sub keeps script size and combined emphasis");
+    check(linked_sup && linked_sup->url &&
+              std::strcmp(linked_sup->url,
+                          "https://example.com/script") == 0 &&
+              linked_sup->underline && linked_sup->color == app.theme->link,
+          "HTML sup preserves enclosing link semantics");
 }
 
 #if TINTA_ENABLE_SVG
@@ -370,6 +401,123 @@ void test_block_collapse(TintaApp &app) {
               TINTA_VEC_AT(TintaBlockCollapseState,
                            app.block_collapse_states, 0).progress > 0.999f,
           "new documents reset collapse state to expanded");
+}
+
+void test_html_details(TintaApp &app) {
+    const char *source =
+        "<details>\n"
+        "<summary>Outer <a href='https://example.com'>link</a> H<sub>2</sub>O</summary>\n\n"
+        "Hidden paragraph.\n\n"
+        "```cpp\n"
+        "const char *hidden_code = \"details\";\n"
+        "```\n\n"
+        "<details open>\n"
+        "<summary>Inner</summary>\n\n"
+        "Nested visible body.\n\n"
+        "</details>\n\n"
+        "</details>\n";
+    check(load(app, source), "HTML details document lays out");
+    check(app.details_blocks.len == 2,
+          "nested details create two disclosure blocks");
+    auto *outer_text = find_run_containing(app, L"Outer");
+    auto *link = find_run(app, L"link");
+    auto *subscript = find_run(app, L"2");
+    auto *hidden = find_run_containing(app, L"Hidden paragraph");
+    auto *hidden_code = find_run_containing(app, L"hidden_code");
+    auto *nested_body = find_run_containing(app, L"Nested visible body");
+    TintaDetailsBlock *outer = nullptr;
+    for (size_t i = 0; i < app.details_blocks.len; i++) {
+        auto *candidate = TINTA_VEC_PTR(
+            TintaDetailsBlock, app.details_blocks, i);
+        if (outer_text && outer_text->y >= candidate->summary_rect.top &&
+            outer_text->y < candidate->summary_rect.bottom) {
+            outer = candidate;
+            break;
+        }
+    }
+    check(outer && outer->expansion < 0.001f,
+          "details without open starts collapsed");
+    check(outer_text && tinta_run_is_visually_exposed(&app, outer_text),
+          "summary remains visible while collapsed");
+    check(hidden && !tinta_run_is_visually_exposed(&app, hidden) &&
+              hidden_code && !tinta_run_is_visually_exposed(&app, hidden_code) &&
+              nested_body && !tinta_run_is_visually_exposed(&app, nested_body),
+          "collapsed details hides all nested content");
+    check(subscript && subscript->layout &&
+              std::fabs(subscript->layout->lpVtbl->GetFontSize(
+                            subscript->layout) -
+                        app.small_format->lpVtbl->GetFontSize(app.small_format)) < 0.01f,
+          "HTML sub uses the existing script format");
+    if (link)
+        check(!tinta_toggle_collapsible_at(
+                  &app, (int)(link->x + 2), (int)(link->y + 2), false),
+              "summary links take priority over disclosure toggling");
+    if (!outer) return;
+    const int summary_x = outer->summary_rect.left + 8;
+    const int summary_y = (outer->summary_rect.top +
+                           outer->summary_rect.bottom) / 2;
+    check(tinta_toggle_collapsible_at(
+              &app, summary_x, summary_y, true),
+          "summary starts the disclosure animation");
+    const ULONGLONG start = app.block_animation_tick;
+    check(tinta_block_animation_tick(&app, start + 90) &&
+              tinta_layout_document(&app),
+          "details animation advances at its midpoint");
+    outer_text = find_run_containing(app, L"Outer");
+    outer = nullptr;
+    for (size_t i = 0; i < app.details_blocks.len; i++) {
+        auto *candidate = TINTA_VEC_PTR(
+            TintaDetailsBlock, app.details_blocks, i);
+        if (outer_text && outer_text->y >= candidate->summary_rect.top &&
+            outer_text->y < candidate->summary_rect.bottom) outer = candidate;
+    }
+    check(outer && outer->expansion > 0.05f && outer->expansion < 0.95f,
+          "details has a partial animated body height");
+    check(tinta_block_animation_tick(&app, start + 180) &&
+              tinta_block_animation_tick(&app, start + 270) &&
+              tinta_block_animation_tick(&app, start + 360) &&
+              tinta_layout_document(&app),
+          "details animation completes");
+    hidden = find_run_containing(app, L"Hidden paragraph");
+    hidden_code = find_run_containing(app, L"hidden_code");
+    nested_body = find_run_containing(app, L"Nested visible body");
+    check(hidden && tinta_run_is_visually_exposed(&app, hidden) &&
+              hidden_code && tinta_run_is_visually_exposed(&app, hidden_code) &&
+              nested_body && tinta_run_is_visually_exposed(&app, nested_body),
+          "expanded outer details reveals nested Markdown and code");
+    if (hidden_code && hidden_code->horizontal_region < app.horizontal_regions.len) {
+        auto *code_region = TINTA_VEC_PTR(
+            TintaHorizontalRegion, app.horizontal_regions,
+            hidden_code->horizontal_region);
+        check(code_region->kind == TINTA_HORIZONTAL_CODE &&
+                  code_region->parent_region != SIZE_MAX &&
+                  TINTA_VEC_AT(TintaHorizontalRegion, app.horizontal_regions,
+                               code_region->parent_region).kind ==
+                      TINTA_HORIZONTAL_DETAILS,
+              "code region retains its outer details clip parent");
+    }
+    outer_text = find_run_containing(app, L"Outer");
+    outer = nullptr;
+    for (size_t i = 0; i < app.details_blocks.len; i++) {
+        auto *candidate = TINTA_VEC_PTR(
+            TintaDetailsBlock, app.details_blocks, i);
+        if (outer_text && outer_text->y >= candidate->summary_rect.top &&
+            outer_text->y < candidate->summary_rect.bottom) outer = candidate;
+    }
+    if (outer) {
+        check(tinta_toggle_collapsible_at(
+                  &app, outer->summary_rect.left + 8,
+                  (outer->summary_rect.top + outer->summary_rect.bottom) / 2,
+                  false) && tinta_layout_document(&app),
+              "expanded details collapses immediately when animations are off");
+        nested_body = find_run_containing(app, L"Nested visible body");
+        check(nested_body && tinta_expand_run_block(&app, nested_body) &&
+                  tinta_layout_document(&app),
+              "logical access expands all hidden details ancestors");
+        nested_body = find_run_containing(app, L"Nested visible body");
+        check(nested_body && tinta_run_is_visually_exposed(&app, nested_body),
+              "ancestor expansion restores nested body geometry");
+    }
 }
 
 #if TINTA_ENABLE_MERMAID
@@ -635,6 +783,7 @@ int main() {
 
     test_inline_styles(app);
     test_block_collapse(app);
+    test_html_details(app);
 #if TINTA_ENABLE_SVG
     test_svg_layout(app);
 #endif
