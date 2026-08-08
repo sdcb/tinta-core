@@ -49,7 +49,8 @@ static const char DEFAULT_MARKDOWN[] =
     "}\n"
     "```\n\n"
     "The code block should expose the **Copy** button. Click it to see the "
-    "button change to **Copied**.\n\n"
+    "button change to **Copied**, or click elsewhere in the header to "
+    "collapse and expand it.\n\n"
     "## Remote image\n\n"
     "This image is fetched asynchronously from the network when remote images "
     "are enabled:\n\n"
@@ -65,6 +66,7 @@ static const char DEFAULT_MARKDOWN[] =
     "    D --> F\n"
     "    E --> F\n"
     "```\n\n"
+    "Mermaid uses the same animated header collapse and source Copy behavior.\n\n"
     "Scroll through the document, use the table of contents, and open another "
     "Markdown file with **Open** when you want to try your own content.";
 

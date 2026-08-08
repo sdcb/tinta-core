@@ -10,6 +10,8 @@
   while retaining a 240-DIP minimum block width for very narrow hosts.
 - Made source Copy/Copied controls a permanent part of the Code and Mermaid
   headers, without runtime option flags.
+- Added animated header-driven collapse and expansion for Code and Mermaid
+  blocks, with search and UIA access automatically revealing hidden content.
 - Centered Mermaid node labels and synchronized shape-aware diamond, hexagon,
   circle, and rectangle sizing with the upstream renderer.
 - Preserved combined nested inline styles, including emphasized and linked

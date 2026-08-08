@@ -81,6 +81,19 @@ static bool pump_until(HWND view, int *value, int target, DWORD timeout_ms) {
     return *value >= target;
 }
 
+static void pump_for(HWND view, DWORD duration_ms) {
+    ULONGLONG deadline = GetTickCount64() + duration_ms;
+    while (GetTickCount64() < deadline) {
+        MSG message;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        SendMessageW(view, WM_PAINT, 0, 0);
+        Sleep(1);
+    }
+}
+
 static bool send_control_key(HWND view, WPARAM key) {
     BYTE original[256];
     BYTE keyboard[256];
@@ -257,6 +270,42 @@ int main() {
         copied_text != L"copy me\n" ||
         copy_notifications != copy_target) {
         std::cerr << "code copy button did not copy on first hover\n";
+        return 1;
+    }
+    TintaContentSize expanded_code_size{};
+    expanded_code_size.cb_size = sizeof(expanded_code_size);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&expanded_code_size))) {
+        std::cerr << "expanded code size query failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(code_hover_x, copy_y));
+    pump_for(view, 240);
+    TintaContentSize collapsed_code_size{};
+    collapsed_code_size.cb_size = sizeof(collapsed_code_size);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&collapsed_code_size)) ||
+        collapsed_code_size.height >= expanded_code_size.height) {
+        std::cerr << "code header did not collapse with animated layout\n";
+        return 1;
+    }
+    TintaFindRequest hidden_find{};
+    hidden_find.cb_size = sizeof(hidden_find);
+    hidden_find.text = L"copy me";
+    hidden_find.text_length = 7;
+    hidden_find.flags = TINTA_FIND_WRAP;
+    if (!SendMessageW(view, TMM_FIND, 0,
+                      reinterpret_cast<LPARAM>(&hidden_find))) {
+        std::cerr << "find did not expand collapsed code content\n";
+        return 1;
+    }
+    TintaContentSize found_code_size{};
+    found_code_size.cb_size = sizeof(found_code_size);
+    if (!SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                      reinterpret_cast<LPARAM>(&found_code_size)) ||
+        found_code_size.height < expanded_code_size.height - 0.5f) {
+        std::cerr << "search result remained collapsed\n";
         return 1;
     }
     TintaOptions no_copy_options{};

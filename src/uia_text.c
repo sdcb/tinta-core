@@ -91,10 +91,11 @@ static HRESULT STDMETHODCALLTYPE text_get_visible_ranges(ITextProvider *self,
     bool found = false;
     HRESULT hr = tinta_uia_root_available(root, &app);
     if (FAILED(hr)) return hr;
-    end = app->doc_text.len;
+    end = 0;
     for (i = 0; i < app->text_runs.len; i++) {
         TintaTextRun *run = TINTA_VEC_PTR(TintaTextRun, app->text_runs, i);
-        if (run->y + run->height >= app->scroll_y &&
+        if (tinta_run_is_visually_exposed(app, run) &&
+            run->y + run->height >= app->scroll_y &&
             run->y <= app->scroll_y + app->height) {
             if (!found) start = run->doc_start;
             end = run->doc_start + run->doc_length;
@@ -430,17 +431,30 @@ static HRESULT STDMETHODCALLTYPE range_get_rectangles(ITextRangeProvider *self,
     RECT rect;
     LONG index;
     double values[4];
+    bool exposed = false;
+    size_t i;
     HRESULT hr;
     if (!result) return E_POINTER;
     *result = NULL;
     hr = range_valid(range, &app);
     if (FAILED(hr)) return hr;
-    array = SafeArrayCreateVector(VT_R8, 0, range->start == range->end ? 0 : 4);
+    if (range->start != range->end) {
+        for (i = 0; i < app->text_runs.len; i++) {
+            TintaTextRun *run = TINTA_VEC_PTR(TintaTextRun, app->text_runs, i);
+            if (range->start < run->doc_start + run->doc_length &&
+                range->end > run->doc_start &&
+                tinta_run_is_visually_exposed(app, run)) {
+                exposed = true;
+                break;
+            }
+        }
+    }
+    array = SafeArrayCreateVector(VT_R8, 0, exposed ? 4 : 0);
     if (!array) {
         tinta_uia_root_done(range->root);
         return E_OUTOFMEMORY;
     }
-    if (range->start != range->end) {
+    if (exposed) {
         GetWindowRect(app->hwnd, &rect);
         values[0] = rect.left;
         values[1] = rect.top;
@@ -623,13 +637,27 @@ static HRESULT STDMETHODCALLTYPE range_scroll_into_view(ITextRangeProvider *self
     size_t i;
     HRESULT hr = range_valid(range, &app);
     if (FAILED(hr)) return hr;
+restart:
     for (i = 0; i < app->text_runs.len; i++) {
         TintaTextRun *run = TINTA_VEC_PTR(TintaTextRun, app->text_runs, i);
         if (range->start <= run->doc_start + run->doc_length &&
             range->end >= run->doc_start) {
+            if (tinta_expand_run_block(app, run)) {
+                KillTimer(app->hwnd, TINTA_TIMER_BLOCK_ANIMATION);
+                if (!tinta_layout_document(app)) {
+                    tinta_uia_root_done(range->root);
+                    return E_FAIL;
+                }
+                goto restart;
+            }
             float target = align_top ? run->y : run->y - app->height + run->height;
             app->scroll_y = max(0.0f, min(target,
                 max(0.0f, app->content_height - app->height)));
+            if (!tinta_horizontal_region_scroll_run_into_view(app, run)) {
+                app->scroll_x = max(0.0f, min(
+                    run->x + run->width * 0.5f - app->width * 0.5f,
+                    max(0.0f, app->content_width - app->width)));
+            }
             InvalidateRect(app->hwnd, NULL, FALSE);
             break;
         }

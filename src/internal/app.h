@@ -20,6 +20,7 @@ extern "C" {
 
 #define TINTA_TIMER_NOTIFICATION 3
 #define TINTA_TIMER_STREAM 6
+#define TINTA_TIMER_BLOCK_ANIMATION 7
 #define TINTA_WM_LAYOUT_CHUNK (WM_APP + 1)
 #define TINTA_WM_IMAGE_READY (WM_APP + 2)
 #define TINTA_WM_UIA_INVOKE (WM_APP + 3)
@@ -115,12 +116,16 @@ typedef struct TintaCodeBlock {
     wchar_t *text;
     wchar_t *language;
     size_t horizontal_region;
+    size_t collapse_state;
+    float expansion;
 } TintaCodeBlock;
 
 typedef struct TintaMermaidBlock {
     RECT rect;
     wchar_t *text;
     size_t horizontal_region;
+    size_t collapse_state;
+    float expansion;
 } TintaMermaidBlock;
 
 typedef enum TintaHorizontalRegionKind {
@@ -137,6 +142,8 @@ typedef struct TintaHorizontalRegion {
     float content_right;
     float scroll_x;
     float scale_factor;
+    size_t collapse_state;
+    float expansion;
     bool overflow;
 } TintaHorizontalRegion;
 
@@ -146,6 +153,15 @@ typedef struct TintaHorizontalScrollState {
     size_t ordinal;
     float scroll_dip;
 } TintaHorizontalScrollState;
+
+typedef struct TintaBlockCollapseState {
+    TintaHorizontalRegionKind kind;
+    size_t source_offset;
+    size_t ordinal;
+    float progress;
+    float target;
+    bool animating;
+} TintaBlockCollapseState;
 
 typedef struct TintaHeading {
     wchar_t *text;
@@ -275,7 +291,9 @@ struct TintaApp {
     TintaVec mermaid_blocks;
     TintaVec horizontal_regions;
     TintaVec horizontal_scroll_states;
+    TintaVec block_collapse_states;
     size_t active_horizontal_region;
+    ULONGLONG block_animation_tick;
     TintaVec headings;
     TintaVec scroll_anchors;
     bool scroll_anchor_pending;
@@ -394,6 +412,13 @@ bool tinta_horizontal_region_scroll_at(TintaApp *app, int x, int y,
 bool tinta_horizontal_region_scroll_run_into_view(TintaApp *app,
                                                    const TintaTextRun *run);
 void tinta_horizontal_region_clear_states(TintaApp *app);
+bool tinta_collapsible_header_at(const TintaApp *app, int x, int y);
+bool tinta_toggle_collapsible_at(TintaApp *app, int x, int y, bool animate);
+bool tinta_block_animation_tick(TintaApp *app, ULONGLONG now);
+bool tinta_block_animation_active(const TintaApp *app);
+bool tinta_expand_run_block(TintaApp *app, const TintaTextRun *run);
+bool tinta_run_is_visually_exposed(const TintaApp *app,
+                                   const TintaTextRun *run);
 void tinta_hit_test(TintaApp *app, float x, float y, size_t *position, const char **url);
 bool tinta_text_at(TintaApp *app, float x, float y, const char **url);
 bool tinta_copy_selection(TintaApp *app);

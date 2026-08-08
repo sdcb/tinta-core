@@ -96,6 +96,10 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - Code and successfully rendered Mermaid blocks always provide a source
   Copy/Copied button in their persistent headers. Mermaid headers are labeled
   `Mermaid`; parsed failures fall back to the normal code-block header.
+- Code and Mermaid headers also include a chevron and toggle an animated
+  collapse when clicked outside Copy. Collapsed blocks retain their source,
+  selection text, search matches, and block-local horizontal position; search
+  or UIA scrolling immediately expands hidden matches.
 - Nested inline styles are merged instead of replacing one another. Inline
   code inside bold, italic, bold-italic, or links keeps the corresponding face
   and interaction, and punctuation after a code pill has no synthetic space.

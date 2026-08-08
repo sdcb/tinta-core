@@ -72,6 +72,7 @@ struct TintaUiaRoot {
 
 typedef struct TintaSemanticItem {
     bool link;
+    bool visually_exposed;
     const wchar_t *name;
     const char *url;
     size_t start;

@@ -688,6 +688,14 @@ static void control_activate_find(TintaControl *control, size_t index) {
                                           run_index);
         if (match.start < run->doc_start + run->doc_length &&
             match.start + match.length > run->doc_start) {
+            if (tinta_expand_run_block(&control->view, run)) {
+                if (!tinta_block_animation_active(&control->view))
+                    KillTimer(control->view.hwnd,
+                              TINTA_TIMER_BLOCK_ANIMATION);
+                if (tinta_layout_document(&control->view))
+                    control_activate_find(control, index);
+                return;
+            }
             float maximum_y = fmaxf(0, control->view.content_height - control->view.height);
             float maximum_x = fmaxf(0, control->view.content_width - control->view.width);
             control->view.scroll_y = clamp_float(
@@ -768,6 +776,14 @@ static bool control_pressed(void) {
 
 static bool shift_pressed(void) {
     return (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+}
+
+static bool client_animations_enabled(void) {
+    BOOL enabled = TRUE;
+    if (!SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0))
+        return true;
+    return enabled != FALSE;
 }
 
 static void control_copy_selection(TintaControl *control) {
@@ -1460,6 +1476,7 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
 static void control_destroy_state(TintaControl *control) {
     if (!control) return;
     KillTimer(control->view.hwnd, TINTA_TIMER_STREAM);
+    KillTimer(control->view.hwnd, TINTA_TIMER_BLOCK_ANIMATION);
     tinta_stream_async_close(control->stream_async);
     control->stream_async = NULL;
     tinta_str8_destroy(&control->stream_buffer);
@@ -1621,6 +1638,14 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                         else
                             notify_error(control, E_FAIL, L"copy-code",
                                 L"The code block could not be copied to the clipboard.");
+                    } else if (tinta_toggle_collapsible_at(
+                            &control->view, x, y,
+                            client_animations_enabled())) {
+                        handled = true;
+                        if (tinta_block_animation_active(&control->view))
+                            SetTimer(hwnd, TINTA_TIMER_BLOCK_ANIMATION,
+                                     16, NULL);
+                        InvalidateRect(hwnd, NULL, FALSE);
                     }
                     if (!handled) control_begin_selection(control, x, y);
                 }
@@ -1641,6 +1666,9 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 bool old_over_mermaid_button = tinta_mermaid_button_at(
                     &control->view,
                     control->view.mouse_x, control->view.mouse_y);
+                bool old_over_collapsible_header =
+                    tinta_collapsible_header_at(&control->view,
+                        control->view.mouse_x, control->view.mouse_y);
                 control->view.mouse_x = x;
                 control->view.mouse_y = y;
                 if (!control->view.tracking_mouse) {
@@ -1666,6 +1694,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     bool over_copy_button;
                     bool over_document_button;
                     bool over_mermaid_button;
+                    bool over_collapsible_header;
                     bool text = tinta_text_at(&control->view, (float)x, (float)y,
                                               &url);
                     hover_changed = tinta_scrollbar_update_hover(
@@ -1684,17 +1713,21 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     over_mermaid_button =
                         control->view.hovered_mermaid_block >= 0 &&
                         tinta_mermaid_button_at(&control->view, x, y);
+                    over_collapsible_header = tinta_collapsible_header_at(
+                        &control->view, x, y);
                     if (hover_changed || old_code_block !=
                         control->view.hovered_code_block ||
                         old_mermaid_block !=
                         control->view.hovered_mermaid_block ||
                         old_over_copy_button != over_copy_button ||
                         old_over_document_button != over_document_button ||
-                        old_over_mermaid_button != over_mermaid_button)
+                        old_over_mermaid_button != over_mermaid_button ||
+                        old_over_collapsible_header !=
+                            over_collapsible_header)
                         InvalidateRect(hwnd, NULL, FALSE);
                     SetCursor(LoadCursorW(NULL,
                         over_document_button || over_mermaid_button ||
-                        over_copy_button ||
+                        over_copy_button || over_collapsible_header ||
                         (url && url[0]) ? IDC_HAND :
                         text ? IDC_IBEAM : IDC_ARROW));
                 }
@@ -1831,6 +1864,14 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 control->view.notice_code_block = -1;
                 control->view.notice_mermaid_block = -1;
                 InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (control && wparam == TINTA_TIMER_BLOCK_ANIMATION) {
+                if (tinta_block_animation_tick(
+                        &control->view, GetTickCount64()))
+                    InvalidateRect(hwnd, NULL, FALSE);
+                if (!tinta_block_animation_active(&control->view))
+                    KillTimer(hwnd, TINTA_TIMER_BLOCK_ANIMATION);
                 return 0;
             }
             break;

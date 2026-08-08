@@ -671,6 +671,8 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->horizontal_regions, sizeof(TintaHorizontalRegion));
     tinta_vec_init(&app->horizontal_scroll_states,
                    sizeof(TintaHorizontalScrollState));
+    tinta_vec_init(&app->block_collapse_states,
+                   sizeof(TintaBlockCollapseState));
     tinta_vec_init(&app->headings, sizeof(TintaHeading));
     tinta_vec_init(&app->scroll_anchors, sizeof(TintaScrollAnchor));
     tinta_vec_init(&app->hit_entries, sizeof(TintaHitEntry));
@@ -738,6 +740,7 @@ void tinta_app_destroy(TintaApp *app) {
     tinta_vec_destroy(&app->mermaid_blocks);
     tinta_vec_destroy(&app->horizontal_regions);
     tinta_vec_destroy(&app->horizontal_scroll_states);
+    tinta_vec_destroy(&app->block_collapse_states);
     tinta_vec_destroy(&app->headings);
     tinta_vec_destroy(&app->scroll_anchors);
     tinta_vec_destroy(&app->hit_entries);

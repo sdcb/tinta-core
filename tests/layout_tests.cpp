@@ -28,6 +28,14 @@ TintaTextRun *find_run(TintaApp &app, const wchar_t *text, size_t occurrence = 0
     return nullptr;
 }
 
+TintaTextRun *find_run_containing(TintaApp &app, const wchar_t *text) {
+    for (size_t i = 0; i < app.text_runs.len; i++) {
+        auto *run = TINTA_VEC_PTR(TintaTextRun, app.text_runs, i);
+        if (run->text && std::wcsstr(run->text, text)) return run;
+    }
+    return nullptr;
+}
+
 #if TINTA_ENABLE_MERMAID
 TintaDrawRect *find_outline(TintaApp &app, TintaDrawShape shape) {
     for (size_t i = 0; i < app.rects.len; i++) {
@@ -106,6 +114,92 @@ void test_inline_styles(TintaApp &app) {
           "nested highlight keeps the inherited emphasis");
 }
 
+void test_block_collapse(TintaApp &app) {
+    const char *source =
+        "Before\n\n"
+        "```cpp\n"
+        "const char *hidden_body = \"wide wide wide wide wide wide\";\n"
+        "```\n\n"
+        "After\n";
+    check(load(app, source), "collapsible code document lays out");
+    if (!app.layout_complete || app.code_blocks.len != 1) return;
+
+    auto *block = TINTA_VEC_PTR(TintaCodeBlock, app.code_blocks, 0);
+    auto *body = find_run_containing(app, L"hidden_body");
+    const float expanded_height = app.content_height;
+    const size_t document_length = app.doc_text.len;
+    const int header_x = block->rect.left + 40;
+    const int header_y = block->rect.top + 16;
+    check(block->expansion > 0.999f,
+          "code blocks are expanded by default");
+    check(body && tinta_run_is_visually_exposed(&app, body),
+          "expanded code body is visually exposed");
+
+    if (app.horizontal_regions.len == 1) {
+        auto *region = TINTA_VEC_PTR(
+            TintaHorizontalRegion, app.horizontal_regions, 0);
+        region->scroll_x = 17.0f;
+    }
+    check(tinta_toggle_collapsible_at(&app, header_x, header_y, false) &&
+              tinta_layout_document(&app),
+          "code header immediately collapses its block");
+    block = TINTA_VEC_PTR(TintaCodeBlock, app.code_blocks, 0);
+    body = find_run_containing(app, L"hidden_body");
+    check(block->rect.bottom - block->rect.top == 32,
+          "collapsed block keeps only its 32 DIP header");
+    check(app.content_height < expanded_height,
+          "collapsed block moves following content upward");
+    check(app.doc_text.len == document_length && body,
+          "collapsed content remains in the logical document");
+    check(body && !tinta_run_is_visually_exposed(&app, body),
+          "collapsed body has no visible boundary");
+    if (app.horizontal_regions.len == 1) {
+        auto *region = TINTA_VEC_PTR(
+            TintaHorizontalRegion, app.horizontal_regions, 0);
+        check(std::fabs(region->scroll_x - 17.0f) < 0.01f,
+              "collapse preserves block-local horizontal scroll");
+        check(region->expansion < 0.001f,
+              "collapsed region hides its body and scrollbar");
+    }
+
+    check(tinta_toggle_collapsible_at(&app, header_x, header_y, true),
+          "collapsed block starts an expansion animation");
+    const ULONGLONG expand_start = app.block_animation_tick;
+    check(tinta_block_animation_tick(&app, expand_start + 90) &&
+              tinta_layout_document(&app),
+          "block animation advances at its midpoint");
+    block = TINTA_VEC_PTR(TintaCodeBlock, app.code_blocks, 0);
+    check(block->expansion > 0.05f && block->expansion < 0.95f,
+          "mid-animation block has a partial visible height");
+
+    check(tinta_toggle_collapsible_at(
+              &app, block->rect.left + 40, block->rect.top + 16, true),
+          "block animation reverses from its current progress");
+    const ULONGLONG reverse_start = app.block_animation_tick;
+    check(tinta_block_animation_tick(&app, reverse_start + 180) &&
+              tinta_layout_document(&app),
+          "reversed block animation completes smoothly");
+    block = TINTA_VEC_PTR(TintaCodeBlock, app.code_blocks, 0);
+    check(block->expansion < 0.001f &&
+              !tinta_block_animation_active(&app),
+          "reversed animation ends collapsed");
+
+    body = find_run_containing(app, L"hidden_body");
+    check(body && tinta_expand_run_block(&app, body) &&
+              tinta_layout_document(&app),
+          "logical access immediately expands a hidden run");
+    block = TINTA_VEC_PTR(TintaCodeBlock, app.code_blocks, 0);
+    check(block->expansion > 0.999f,
+          "immediate logical expansion restores the full body");
+
+    check(load(app, "```cpp\nreplacement\n```\n"),
+          "replacement document lays out after collapse testing");
+    check(app.block_collapse_states.len == 1 &&
+              TINTA_VEC_AT(TintaBlockCollapseState,
+                           app.block_collapse_states, 0).progress > 0.999f,
+          "new documents reset collapse state to expanded");
+}
+
 #if TINTA_ENABLE_MERMAID
 void test_mermaid_layout(TintaApp &app) {
     const char *source =
@@ -166,6 +260,15 @@ void test_mermaid_layout(TintaApp &app) {
     if (feature && app.horizontal_regions.len == 1) {
         auto *region = TINTA_VEC_PTR(
             TintaHorizontalRegion, app.horizontal_regions, 0);
+        LONG first_outline_top = LONG_MAX;
+        for (size_t i = 0; i < app.rects.len; i++) {
+            auto *rect = TINTA_VEC_PTR(TintaDrawRect, app.rects, i);
+            if (rect->outline && rect->horizontal_region == 0 &&
+                rect->rect.top < first_outline_top)
+                first_outline_top = rect->rect.top;
+        }
+        check(first_outline_top >= region->viewport.top + 1,
+              "Mermaid diagram leaves one physical pixel below its header");
         check(region->overflow, "wide Mermaid overflows inside its block");
         float before = region->scroll_x;
         check(tinta_horizontal_region_scroll_at(
@@ -189,6 +292,25 @@ void test_mermaid_layout(TintaApp &app) {
                       position <= feature->doc_start + feature->doc_length,
                   "Mermaid hit testing follows block-local scrolling");
         }
+    }
+    if (app.mermaid_blocks.len == 1) {
+        auto *block = TINTA_VEC_PTR(TintaMermaidBlock, app.mermaid_blocks, 0);
+        const int header_x = block->rect.left + 40;
+        const int header_y = block->rect.top + 16;
+        check(tinta_toggle_collapsible_at(&app, header_x, header_y, false) &&
+                  tinta_layout_document(&app),
+              "Mermaid header collapses its rendered diagram");
+        block = TINTA_VEC_PTR(TintaMermaidBlock, app.mermaid_blocks, 0);
+        feature = find_run(app, L"Feature");
+        check(block->rect.bottom - block->rect.top == 32 && feature &&
+                  !tinta_run_is_visually_exposed(&app, feature),
+              "collapsed Mermaid keeps only its header and hides labels");
+        check(feature && tinta_expand_run_block(&app, feature) &&
+                  tinta_layout_document(&app),
+              "Mermaid hidden content can expand immediately");
+        block = TINTA_VEC_PTR(TintaMermaidBlock, app.mermaid_blocks, 0);
+        check(block->expansion > 0.999f,
+              "expanded Mermaid restores its diagram");
     }
 }
 #endif
@@ -235,6 +357,7 @@ int main() {
     }
 
     test_inline_styles(app);
+    test_block_collapse(app);
 #if TINTA_ENABLE_MERMAID
     test_mermaid_layout(app);
 #endif

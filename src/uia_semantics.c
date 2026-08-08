@@ -62,6 +62,7 @@ bool tinta_uia_semantic_item(TintaUiaRoot *root, size_t index,
         item->right = (float)app->width;
         item->top = heading->y - app->scroll_y;
         item->bottom = item->top + 36.0f * app->dpi_scale;
+        item->visually_exposed = true;
         return true;
     }
     index -= heading_count;
@@ -78,6 +79,7 @@ bool tinta_uia_semantic_item(TintaUiaRoot *root, size_t index,
             item->right = item->left + run->width;
             item->top = run->y - app->scroll_y;
             item->bottom = item->top + run->height;
+            item->visually_exposed = tinta_run_is_visually_exposed(app, run);
             return true;
         }
         index--;
@@ -262,7 +264,8 @@ static HRESULT STDMETHODCALLTYPE child_get_property(
         V_BOOL(result) = VARIANT_FALSE;
     } else if (property == UIA_IsOffscreenPropertyId) {
         V_VT(result) = VT_BOOL;
-        V_BOOL(result) = item.bottom < 0 || item.top > app->height ?
+        V_BOOL(result) = !item.visually_exposed ||
+                         item.bottom < 0 || item.top > app->height ?
                          VARIANT_TRUE : VARIANT_FALSE;
     }
     tinta_uia_root_done(child->root);
@@ -348,10 +351,14 @@ static HRESULT STDMETHODCALLTYPE child_bounding_rectangle(
         return UIA_E_ELEMENTNOTAVAILABLE;
     }
     ClientToScreen(app->hwnd, &origin);
-    result->left = origin.x + item.left;
-    result->top = origin.y + item.top;
-    result->width = item.right - item.left;
-    result->height = item.bottom - item.top;
+    if (item.visually_exposed) {
+        result->left = origin.x + item.left;
+        result->top = origin.y + item.top;
+        result->width = item.right - item.left;
+        result->height = item.bottom - item.top;
+    } else {
+        memset(result, 0, sizeof(*result));
+    }
     tinta_uia_root_done(child->root);
     return S_OK;
 }
