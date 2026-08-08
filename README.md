@@ -22,7 +22,7 @@ ctest --test-dir build --output-on-failure
 Set `BUILD_SHARED_LIBS=ON` to build `tinta_core.dll`; the default is a static
 library. md4c is vendored, so configuring the project requires no downloads.
 
-Optional viewer features can be removed at compile time. All five options are
+Optional viewer features can be removed at compile time. All six options are
 enabled by default:
 
 ```bat
@@ -31,7 +31,8 @@ cmake -S . -B build-mini -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DTINTA_ENABLE_MERMAID=OFF ^
   -DTINTA_ENABLE_SYNTAX=OFF ^
   -DTINTA_ENABLE_REMOTE_IMAGES=OFF ^
-  -DTINTA_ENABLE_LOCAL_IMAGES=OFF
+  -DTINTA_ENABLE_LOCAL_IMAGES=OFF ^
+  -DTINTA_ENABLE_SVG=OFF
 cmake --build build-mini --target tinta_minimal
 ```
 
@@ -132,13 +133,23 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   bounded process cache so later controls do not download/decode it again.
   Image failures send `TMN_RESOURCEERROR`; image reflow sends
   `TMN_CONTENTUPDATED`.
+- SVG images support local files, HTTP(S) resources, and Base64 or
+  percent-encoded `data:image/svg+xml` URIs. Standalone SVG paragraphs use a
+  persistent `SVG` header with source Copy and animated collapse; inline SVG
+  follows ordinary image behavior. Rendering uses the Direct2D SVG subset
+  when `ID2D1DeviceContext5` is available and otherwise reports one resource
+  error and falls back to a clickable alt-text or URI link. Intrinsic
+  `width`/`height` and `viewBox` determine the natural size (default 300×150
+  DIP); DTD and entity declarations are rejected.
 - The default limits are 64 MiB of Markdown, one million AST nodes, an AST
   depth of 256, 10,000 Mermaid nodes, 20,000 Mermaid edges, 64 MiB per remote
   image, 64 million decoded pixels per image, 512 image resources and four
   concurrent downloads.
 - `TMM_GETVERSION`, `TMM_GETCAPABILITIES`, and `TMM_GETSTATS` let hosts inspect
   the loaded build and current document without relying on compile-time
-  assumptions.
+  assumptions. `TINTA_CAPABILITY_SVG` reports that SVG support was compiled
+  in; rendering can still fall back when the current Windows version does not
+  expose `ID2D1DeviceContext5`.
 
 `Tinta.MarkdownView` exposes the UI Automation Document, Text and Scroll
 patterns. Headings and links appear as semantic children, and links implement

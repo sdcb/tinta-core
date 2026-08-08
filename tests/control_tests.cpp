@@ -196,6 +196,17 @@ int main() {
         std::cerr << "version/capability query failed\n";
         return 1;
     }
+#if TINTA_ENABLE_SVG
+    if (!(capabilities.flags & TINTA_CAPABILITY_SVG)) {
+        std::cerr << "SVG capability missing\n";
+        return 1;
+    }
+#else
+    if (capabilities.flags & TINTA_CAPABILITY_SVG) {
+        std::cerr << "trimmed SVG capability was reported\n";
+        return 1;
+    }
+#endif
     float zoom = 0.0f;
     float requested_zoom = 1.4f;
     if (!SendMessageW(view, TMM_GETZOOM, 0,
@@ -234,6 +245,65 @@ int main() {
     }
     ShowWindow(parent, SW_SHOWNOACTIVATE);
     UpdateWindow(parent);
+#if TINTA_ENABLE_SVG
+    {
+        const wchar_t *svg_xml =
+            L"<svg width='120' height='60' viewBox='0 0 120 60'>"
+            L"<rect width='120' height='60' fill='#0ea5e9'/></svg>";
+        const wchar_t *svg_markdown =
+            L"![Vector](data:image/svg+xml,%3Csvg%20width%3D%27120%27%20height%3D%2760%27%20viewBox%3D%270%200%20120%2060%27%3E%3Crect%20width%3D%27120%27%20height%3D%2760%27%20fill%3D%27%230ea5e9%27/%3E%3C/svg%3E)";
+        int errors_before = resource_error_notifications;
+        int copies_before = copy_notifications;
+        SendMessageW(view, WM_SETTEXT, 0,
+                     reinterpret_cast<LPARAM>(svg_markdown));
+        SendMessageW(view, WM_PAINT, 0, 0);
+        TintaContentSize svg_size{};
+        TintaStats svg_stats{};
+        svg_size.cb_size = sizeof(svg_size);
+        svg_stats.cb_size = sizeof(svg_stats);
+        if (resource_error_notifications != errors_before ||
+            !SendMessageW(view, TMM_GETCONTENTSIZE, 0,
+                          reinterpret_cast<LPARAM>(&svg_size)) ||
+            !SendMessageW(view, TMM_GETSTATS, 0,
+                          reinterpret_cast<LPARAM>(&svg_stats)) ||
+            svg_stats.image_resources != 1 ||
+            svg_size.width <= 0 || svg_size.height <= 60) {
+            std::cerr << "SVG document render failed\n";
+            return 1;
+        }
+        SendMessageW(view, WM_DPICHANGED_AFTERPARENT, 0, 0);
+        SendMessageW(view, WM_PAINT, 0, 0);
+        if (resource_error_notifications != errors_before) {
+            std::cerr << "SVG device-loss rebuild failed\n";
+            return 1;
+        }
+        RECT svg_client{};
+        float svg_dpi = GetDpiForWindow(view) / 96.0f;
+        GetClientRect(view, &svg_client);
+        int svg_copy_x = svg_client.right -
+            static_cast<int>((40.0f + 8.0f + 39.0f) * svg_dpi);
+        int svg_copy_y = static_cast<int>((20.0f + 16.0f) * svg_dpi);
+        SendMessageW(view, WM_MOUSEMOVE, 0,
+                     MAKELPARAM(svg_copy_x, svg_copy_y));
+        SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                     MAKELPARAM(svg_copy_x, svg_copy_y));
+        if (!read_clipboard_text(view, &copied_text) ||
+            copied_text != svg_xml || copy_notifications != copies_before + 1) {
+            std::cerr << "SVG source copy failed\n";
+            return 1;
+        }
+        const wchar_t *invalid_svg =
+            L"![Bad](data:image/svg+xml,%3C!DOCTYPE%20svg%3E%3Csvg%3E%3C/svg%3E)";
+        SendMessageW(view, WM_SETTEXT, 0,
+                     reinterpret_cast<LPARAM>(invalid_svg));
+        SendMessageW(view, WM_PAINT, 0, 0);
+        SendMessageW(view, WM_PAINT, 0, 0);
+        if (resource_error_notifications != errors_before + 1) {
+            std::cerr << "invalid SVG error notification was not singular\n";
+            return 1;
+        }
+    }
+#endif
     float dpi_scale = GetDpiForWindow(view) / 96.0f;
     int text_x = static_cast<int>(45.0f * dpi_scale);
     int first_line_y = static_cast<int>(25.0f * dpi_scale);

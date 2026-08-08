@@ -1,9 +1,13 @@
 #include "app.h"
 #include "image_cache.h"
 #include "features.h"
+#if TINTA_ENABLE_SVG
+#include "svg.h"
+#endif
 
 #include <commdlg.h>
 #include <limits.h>
+#include <math.h>
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <stdio.h>
@@ -21,6 +25,7 @@ typedef struct RemoteWork {
     wchar_t *url;
     uint64_t max_pixels;
     uint64_t max_download_bytes;
+    bool expect_svg;
 } RemoteWork;
 
 typedef struct RemoteResult {
@@ -31,6 +36,9 @@ typedef struct RemoteResult {
     UINT height;
     UINT stride;
     UINT buffer_size;
+    float svg_width;
+    float svg_height;
+    bool svg;
     bool success;
 } RemoteResult;
 
@@ -49,6 +57,46 @@ static SRWLOCK g_graphics_lock = SRWLOCK_INIT;
 static ID2D1Factory *g_d2d_factory;
 static IDWriteFactory *g_dwrite_factory;
 static IDWriteFontFallback *g_font_fallback;
+
+#if TINTA_ENABLE_SVG
+static void constrain_svg_size(uint64_t maximum_area, TintaSvgInfo *info) {
+    double area;
+    double ratio;
+    if (!info || !maximum_area) return;
+    area = (double)info->width * info->height;
+    if (area <= maximum_area) return;
+    ratio = sqrt((double)maximum_area / area);
+    info->width = (float)(info->width * ratio);
+    info->height = (float)(info->height * ratio);
+}
+
+static bool read_svg_file(const wchar_t *path, size_t maximum_bytes,
+                          TintaStr8 *source) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    uint64_t length;
+    wchar_t *file_path;
+    size_t file_length;
+    bool result;
+    if (!path || !source) return false;
+    file_length = wcscspn(path, L"?#");
+    file_path = tinta_wcsdup_n(path, file_length);
+    if (!file_path) return false;
+    if (!GetFileAttributesExW(
+            file_path, GetFileExInfoStandard, &attributes)) {
+        free(file_path);
+        return false;
+    }
+    length = ((uint64_t)attributes.nFileSizeHigh << 32) |
+             attributes.nFileSizeLow;
+    if (length > SIZE_MAX || (maximum_bytes && length > maximum_bytes)) {
+        free(file_path);
+        return false;
+    }
+    result = tinta_read_file_bytes(file_path, source);
+    free(file_path);
+    return result;
+}
+#endif
 
 #if TINTA_ENABLE_REMOTE_IMAGES
 static TintaImageAsync *image_async_create(void) {
@@ -242,7 +290,7 @@ static IBindStatusCallbackVtbl bind_status_vtable = {
 };
 #endif
 
-#if TINTA_ENABLE_IMAGES
+#if TINTA_ENABLE_RASTER_IMAGES
 static void release_unknown(IUnknown **value) {
     if (*value) { IUnknown_Release(*value); *value = NULL; }
 }
@@ -259,6 +307,9 @@ void tinta_app_clear_image_resources(TintaApp *app) {
             TintaImageResource, app->image_resources, i);
         free(image->key);
         free(image->resolved_uri);
+        free(image->svg_source);
+        if (image->svg_document)
+            image->svg_document->lpVtbl->Release(image->svg_document);
         if (image->source) IWICBitmapSource_Release(image->source);
         if (image->bitmap) image->bitmap->lpVtbl->Release(image->bitmap);
     }
@@ -604,6 +655,11 @@ bool tinta_app_create_device(TintaApp *app) {
         app->render_target->lpVtbl->QueryInterface(
             app->render_target, &TINTA_IID_ID2D1_DEVICE_CONTEXT,
             (void **)&app->device_context);
+#if TINTA_ENABLE_SVG
+        app->render_target->lpVtbl->QueryInterface(
+            app->render_target, &TINTA_IID_ID2D1_DEVICE_CONTEXT5,
+            (void **)&app->svg_context);
+#endif
         configure_text_rendering(app);
     }
     return true;
@@ -618,11 +674,19 @@ void tinta_app_discard_device(TintaApp *app) {
             item->bitmap->lpVtbl->Release(item->bitmap);
             item->bitmap = NULL;
         }
+        if (item->svg_document) {
+            item->svg_document->lpVtbl->Release(item->svg_document);
+            item->svg_document = NULL;
+        }
     }
     if (app->brush) { app->brush->lpVtbl->Release(app->brush); app->brush = NULL; }
     if (app->device_context) {
         app->device_context->lpVtbl->Release(app->device_context);
         app->device_context = NULL;
+    }
+    if (app->svg_context) {
+        app->svg_context->lpVtbl->Release(app->svg_context);
+        app->svg_context = NULL;
     }
     if (app->render_target) {
         app->render_target->lpVtbl->Release(app->render_target);
@@ -641,7 +705,7 @@ void tinta_draw_text_layout(TintaApp *app, D2D1_POINT_2F origin,
 
 
 bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *settings) {
-#if TINTA_ENABLE_IMAGES
+#if TINTA_ENABLE_RASTER_IMAGES
     HRESULT hr;
 #endif
     memset(app, 0, sizeof(*app));
@@ -654,8 +718,10 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     app->layout_dirty = true;
     app->hovered_code_block = -1;
     app->hovered_mermaid_block = -1;
+    app->hovered_svg_block = -1;
     app->notice_code_block = -1;
     app->notice_mermaid_block = -1;
+    app->notice_svg_block = -1;
     app->active_horizontal_region = SIZE_MAX;
     app->hovered_horizontal_region = -1;
     app->dragging_horizontal_region = -1;
@@ -668,8 +734,10 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->paths, sizeof(TintaDrawPath));
     tinta_vec_init(&app->path_points, sizeof(D2D1_POINT_2F));
     tinta_vec_init(&app->bitmaps, sizeof(TintaDrawBitmap));
+    tinta_vec_init(&app->svgs, sizeof(TintaDrawSvg));
     tinta_vec_init(&app->code_blocks, sizeof(TintaCodeBlock));
     tinta_vec_init(&app->mermaid_blocks, sizeof(TintaMermaidBlock));
+    tinta_vec_init(&app->svg_blocks, sizeof(TintaSvgBlock));
     tinta_vec_init(&app->horizontal_regions, sizeof(TintaHorizontalRegion));
     tinta_vec_init(&app->horizontal_scroll_states,
                    sizeof(TintaHorizontalScrollState));
@@ -692,7 +760,7 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
         return false;
     }
 #endif
-#if TINTA_ENABLE_IMAGES
+#if TINTA_ENABLE_RASTER_IMAGES
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
     app->com_initialized = SUCCEEDED(hr);
@@ -701,7 +769,7 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
         tinta_app_destroy(app);
         return false;
     }
-#if TINTA_ENABLE_IMAGES
+#if TINTA_ENABLE_RASTER_IMAGES
     hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
                           &IID_IWICImagingFactory, (void **)&app->wic_factory);
     if (FAILED(hr)) {
@@ -740,8 +808,10 @@ void tinta_app_destroy(TintaApp *app) {
     tinta_vec_destroy(&app->paths);
     tinta_vec_destroy(&app->path_points);
     tinta_vec_destroy(&app->bitmaps);
+    tinta_vec_destroy(&app->svgs);
     tinta_vec_destroy(&app->code_blocks);
     tinta_vec_destroy(&app->mermaid_blocks);
+    tinta_vec_destroy(&app->svg_blocks);
     tinta_vec_destroy(&app->horizontal_regions);
     tinta_vec_destroy(&app->horizontal_scroll_states);
     tinta_vec_destroy(&app->block_collapse_states);
@@ -765,13 +835,13 @@ void tinta_app_destroy(TintaApp *app) {
     release_text_format(&app->ui_format);
     release_text_format(&app->chrome_format);
     tinta_app_discard_device(app);
-#if TINTA_ENABLE_IMAGES
+#if TINTA_ENABLE_RASTER_IMAGES
     release_unknown((IUnknown **)&app->wic_factory);
 #endif
     if (app->font_fallback) app->font_fallback->lpVtbl->Release(app->font_fallback);
     if (app->dwrite_factory) app->dwrite_factory->lpVtbl->Release(app->dwrite_factory);
     if (app->d2d_factory) app->d2d_factory->lpVtbl->Release(app->d2d_factory);
-#if TINTA_ENABLE_IMAGES
+#if TINTA_ENABLE_RASTER_IMAGES
     if (app->com_initialized) {
         CoUninitialize();
         app->com_initialized = false;
@@ -811,7 +881,33 @@ static unsigned __stdcall remote_worker(void *parameter) {
                         file_info.nFileSizeLow;
         else
             downloaded = false;
+#if TINTA_ENABLE_SVG
         if (downloaded &&
+            (!work->max_download_bytes ||
+             file_size <= work->max_download_bytes)) {
+            TintaStr8 source = {0};
+            TintaSvgInfo info;
+            if (tinta_read_file_bytes(cache, &source) &&
+                tinta_svg_prepare_source(source.data, source.len,
+                    (size_t)work->max_download_bytes, &info) &&
+                source.len <= UINT_MAX) {
+                constrain_svg_size(work->max_pixels, &info);
+                result->pixels = (BYTE *)source.data;
+                result->buffer_size = (UINT)source.len;
+                result->width = (UINT)ceilf(info.width);
+                result->height = (UINT)ceilf(info.height);
+                result->svg_width = info.width;
+                result->svg_height = info.height;
+                result->svg = true;
+                result->success = true;
+                memset(&source, 0, sizeof(source));
+            }
+            tinta_str8_destroy(&source);
+        }
+#endif
+        if (downloaded &&
+            !result->success &&
+            !work->expect_svg &&
             (!work->max_download_bytes ||
              file_size <= work->max_download_bytes) &&
             SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory, NULL,
@@ -872,7 +968,35 @@ static bool decode_local_image(TintaApp *app, TintaImageResource *image) {
     IWICBitmapDecoder *decoder = NULL;
     IWICBitmapFrameDecode *frame = NULL;
     IWICFormatConverter *converter = NULL;
-    HRESULT hr = IWICImagingFactory_CreateDecoderFromFilename(
+    HRESULT hr;
+#if TINTA_ENABLE_SVG
+    if (image->svg) {
+        TintaStr8 svg = {0};
+        TintaSvgInfo info;
+        if (read_svg_file(image->resolved_uri, app->max_document_bytes, &svg) &&
+            tinta_svg_prepare_source(svg.data, svg.len,
+                                     app->max_document_bytes, &info)) {
+            constrain_svg_size(app->max_image_pixels, &info);
+            image->svg_source = svg.data;
+            image->svg_source_length = svg.len;
+            image->svg_width = info.width;
+            image->svg_height = info.height;
+            image->width = (UINT)ceilf(info.width);
+            image->height = (UINT)ceilf(info.height);
+            image->state = 2;
+            memset(&svg, 0, sizeof(svg));
+        } else {
+            image->state = -1;
+            image->svg_error = E_FAIL;
+            if (app->resource_error)
+                app->resource_error(app, false, image->resolved_uri, E_FAIL);
+            image->svg_error_notified = true;
+        }
+        tinta_str8_destroy(&svg);
+        return image->state == 2;
+    }
+#endif
+    hr = IWICImagingFactory_CreateDecoderFromFilename(
         app->wic_factory, image->resolved_uri, NULL, GENERIC_READ,
         WICDecodeMetadataCacheOnLoad, &decoder);
     if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
@@ -895,9 +1019,32 @@ static bool decode_local_image(TintaApp *app, TintaImageResource *image) {
         converter = NULL;
         image->state = 2;
     } else {
+#if TINTA_ENABLE_SVG
+        TintaStr8 svg = {0};
+        TintaSvgInfo info;
+        if (read_svg_file(image->resolved_uri, app->max_document_bytes, &svg) &&
+            tinta_svg_prepare_source(svg.data, svg.len,
+                                     app->max_document_bytes, &info)) {
+            constrain_svg_size(app->max_image_pixels, &info);
+            image->svg = true;
+            image->svg_source = svg.data;
+            image->svg_source_length = svg.len;
+            image->svg_width = info.width;
+            image->svg_height = info.height;
+            image->width = (UINT)ceilf(info.width);
+            image->height = (UINT)ceilf(info.height);
+            image->state = 2;
+            memset(&svg, 0, sizeof(svg));
+        } else
+#endif
+        {
         image->state = -1;
         if (app->resource_error)
             app->resource_error(app, false, image->resolved_uri, hr);
+        }
+#if TINTA_ENABLE_SVG
+        tinta_str8_destroy(&svg);
+#endif
     }
     if (converter) IWICFormatConverter_Release(converter);
     if (frame) IWICBitmapFrameDecode_Release(frame);
@@ -920,7 +1067,8 @@ static bool start_remote_image(TintaApp *app, size_t image_index) {
         UINT width = 0, height = 0, stride = 0, buffer_size = 0;
         BYTE *pixels = NULL;
         IWICBitmap *bitmap = NULL;
-        if (tinta_image_cache_get(image->resolved_uri, &width, &height,
+        if (!image->svg && tinta_image_cache_get(image->resolved_uri,
+                &width, &height,
                 &stride, &buffer_size, &pixels)) {
             if ((!app->max_image_pixels ||
                  (uint64_t)width * height <= app->max_image_pixels) &&
@@ -954,6 +1102,9 @@ static bool start_remote_image(TintaApp *app, size_t image_index) {
         &async->generation, 0, 0);
     work->max_pixels = app->max_image_pixels;
     work->max_download_bytes = app->max_remote_image_bytes;
+#if TINTA_ENABLE_SVG
+    work->expect_svg = image->svg;
+#endif
     work->url = tinta_wcsdup_n(image->resolved_uri,
                                wcslen(image->resolved_uri));
     if (!work->url) {
@@ -1010,8 +1161,49 @@ bool tinta_image_resource_get(TintaApp *app, const char *url,
         }
     }
     if (app->max_image_resources &&
-        app->image_resources.len >= app->max_image_resources)
+        app->image_resources.len >= app->max_image_resources) {
+        *resource_index = SIZE_MAX;
         return true;
+    }
+#if TINTA_ENABLE_SVG
+    if (tinta_svg_data_uri(url)) {
+        TintaStr8 source = {0};
+        TintaSvgInfo info;
+        image.key = tinta_str8_dup(url, strlen(url));
+        image.resolved_uri = tinta_wcsdup_n(L"data:image/svg+xml", 18);
+        image.svg = true;
+        if (tinta_svg_decode_data_uri(url, app->max_document_bytes,
+                                      &source, &info)) {
+            constrain_svg_size(app->max_image_pixels, &info);
+            image.svg_source = source.data;
+            image.svg_source_length = source.len;
+            image.svg_width = info.width;
+            image.svg_height = info.height;
+            image.width = (UINT)ceilf(info.width);
+            image.height = (UINT)ceilf(info.height);
+            image.state = 2;
+            memset(&source, 0, sizeof(source));
+        } else {
+            image.state = -1;
+            image.svg_error = E_INVALIDARG;
+            image.svg_error_notified = true;
+            if (app->resource_error)
+                app->resource_error(app, false, image.resolved_uri,
+                                    E_INVALIDARG);
+        }
+        tinta_str8_destroy(&source);
+        if (!image.key || !image.resolved_uri ||
+            !tinta_vec_push(&app->image_resources, &image)) {
+            free(image.key);
+            free(image.resolved_uri);
+            free(image.svg_source);
+            return false;
+        }
+        *resource_index = app->image_resources.len - 1;
+        *ready = image.state == 2;
+        return true;
+    }
+#endif
     if (app->resolve_image) {
         if (!app->resolve_image(app, url, &resolved, &remote, &blocked))
             return false;
@@ -1024,6 +1216,9 @@ bool tinta_image_resource_get(TintaApp *app, const char *url,
     image.resolved_uri = resolved.data ?
         tinta_wcsdup_n(resolved.data, resolved.len) : NULL;
     image.remote = remote;
+#if TINTA_ENABLE_SVG
+    image.svg = tinta_svg_uri_candidate(url);
+#endif
 #if !TINTA_ENABLE_REMOTE_IMAGES
     if (remote) blocked = true;
 #endif
@@ -1070,6 +1265,20 @@ bool tinta_remote_image_complete(TintaApp *app) {
             TintaImageResource *image = TINTA_VEC_PTR(
                 TintaImageResource, app->image_resources, result->index);
             IWICBitmap *bitmap = NULL;
+#if TINTA_ENABLE_SVG
+            if (result->success && result->svg && result->pixels) {
+                free(image->svg_source);
+                image->svg_source = (char *)result->pixels;
+                image->svg_source_length = result->buffer_size;
+                image->svg_width = result->svg_width;
+                image->svg_height = result->svg_height;
+                image->width = result->width;
+                image->height = result->height;
+                image->svg = true;
+                image->state = 2;
+                result->pixels = NULL;
+            } else
+#endif
             if (result->success && result->pixels &&
                 (!app->max_image_pixels ||
                  (uint64_t)result->width * result->height <=
@@ -1088,6 +1297,8 @@ bool tinta_remote_image_complete(TintaApp *app) {
                 image->state = 2;
             } else {
                 image->state = -1;
+                image->svg_error = E_FAIL;
+                image->svg_error_notified = true;
                 if (app->resource_error)
                     app->resource_error(app, true, image->resolved_uri,
                                         E_FAIL);

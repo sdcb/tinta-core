@@ -51,6 +51,7 @@ jobs:
             $flags += '-DTINTA_ENABLE_SYNTAX=OFF'
             $flags += '-DTINTA_ENABLE_REMOTE_IMAGES=OFF'
             $flags += '-DTINTA_ENABLE_LOCAL_IMAGES=OFF'
+            $flags += '-DTINTA_ENABLE_SVG=OFF'
           }
           cmake -S . -B build -G "Visual Studio 18 2026" -A ${{ matrix.architecture.platform }} `
             -DBUILD_SHARED_LIBS=${{ matrix.shared }} `
@@ -69,20 +70,25 @@ jobs:
           path: package
           if-no-files-found: error
 
-  parser-tools:
+  windows-x64-demo:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DBUILD_TESTING=ON -DTINTA_BUILD_FUZZERS=ON -DTINTA_BUILD_BENCHMARKS=ON
-      - name: Build
-        run: cmake --build build --config Release --parallel
-      - name: Parser smoke
-        shell: pwsh
-        run: |
-          Set-Content -Path sample.md -Value '# fuzz smoke`n`n**text**'
-          ./build/Release/tinta_markdown_fuzzer.exe sample.md
-          ./build/Release/tinta_benchmark.exe
+      - name: Configure static CRT demo
+        run: >-
+          cmake -S . -B demo-build -G "Visual Studio 18 2026" -A x64
+          -DBUILD_SHARED_LIBS=OFF
+          -DBUILD_TESTING=OFF
+          -DTINTA_BUILD_EXAMPLES=ON
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+      - name: Build demo
+        run: cmake --build demo-build --config Release --target tinta_demo --parallel
+      - name: Upload demo
+        uses: actions/upload-artifact@v7
+        with:
+          name: tinta-demo-windows-x64-static-msvcrt
+          path: demo-build/Release/tinta_demo.exe
+          if-no-files-found: error
 
   c-package:
     runs-on: windows-latest

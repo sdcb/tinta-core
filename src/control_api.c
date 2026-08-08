@@ -112,11 +112,13 @@ LRESULT tinta_control_dispatch_api(TintaControl *control, UINT message,
                 if (!view->document_copy_button_enabled &&
                     view->notice_kind == TINTA_NOTICE_COPIED &&
                     view->notice_code_block < 0 &&
-                    view->notice_mermaid_block < 0) {
+                    view->notice_mermaid_block < 0 &&
+                    view->notice_svg_block < 0) {
                     KillTimer(view->hwnd, TINTA_TIMER_NOTIFICATION);
                     view->notice_kind = TINTA_NOTICE_NONE;
                     view->notice_code_block = -1;
                     view->notice_mermaid_block = -1;
+                    view->notice_svg_block = -1;
                 }
                 InvalidateRect(view->hwnd, NULL, FALSE);
             }
@@ -139,6 +141,7 @@ LRESULT tinta_control_dispatch_api(TintaControl *control, UINT message,
                 !limits->max_concurrent_downloads)
                 return FALSE;
             control->limits = *limits;
+            view->max_document_bytes = limits->max_document_bytes;
             view->max_ast_nodes = limits->max_ast_nodes;
             view->max_ast_depth = limits->max_ast_depth;
             view->max_mermaid_nodes = limits->max_mermaid_nodes;
@@ -340,6 +343,9 @@ LRESULT tinta_control_dispatch_api(TintaControl *control, UINT message,
 #endif
 #if TINTA_ENABLE_LOCAL_IMAGES
             flags |= TINTA_CAPABILITY_LOCAL_IMAGES;
+#endif
+#if TINTA_ENABLE_SVG
+            flags |= TINTA_CAPABILITY_SVG;
 #endif
             capabilities->cb_size = sizeof(*capabilities);
             capabilities->flags = flags;

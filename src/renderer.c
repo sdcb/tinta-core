@@ -3,6 +3,10 @@
 #if TINTA_ENABLE_SYNTAX
 #include "syntax.h"
 #endif
+#if TINTA_ENABLE_SVG
+#include "svg.h"
+#include <shlwapi.h>
+#endif
 
 #include <ctype.h>
 #include <commdlg.h>
@@ -623,17 +627,20 @@ void tinta_layout_clear(TintaApp *app) {
     tinta_vec_clear(&app->scroll_anchors);
     tinta_vec_clear(&app->hit_entries);
     app->hit_index_dirty = true;
-    tinta_vec_clear(&app->bitmaps); tinta_vec_clear(&app->code_blocks);
-    tinta_vec_clear(&app->mermaid_blocks); tinta_str16_clear(&app->doc_text);
+    tinta_vec_clear(&app->bitmaps); tinta_vec_clear(&app->svgs);
+    tinta_vec_clear(&app->code_blocks); tinta_vec_clear(&app->mermaid_blocks);
+    tinta_vec_clear(&app->svg_blocks); tinta_str16_clear(&app->doc_text);
     tinta_vec_clear(&app->horizontal_regions);
     app->active_horizontal_region = SIZE_MAX;
     app->hovered_horizontal_region = -1;
     app->dragging_horizontal_region = -1;
     app->hovered_code_block = -1;
     app->hovered_mermaid_block = -1;
+    app->hovered_svg_block = -1;
     app->notice_kind = TINTA_NOTICE_NONE;
     app->notice_code_block = -1;
     app->notice_mermaid_block = -1;
+    app->notice_svg_block = -1;
     if (app->hwnd) KillTimer(app->hwnd, TINTA_TIMER_NOTIFICATION);
 }
 
@@ -1089,6 +1096,10 @@ static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
 
 static bool layout_image(TintaApp *app, const TintaElement *element,
                          float *y, float left, float right);
+#if TINTA_ENABLE_SVG
+static bool layout_svg_block(TintaApp *app, const TintaElement *element,
+                             float *y, float left, float right);
+#endif
 
 static bool layout_inline(TintaApp *app, const TintaElement *element, InlineState *state,
                           InlineStyle style) {
@@ -1246,6 +1257,23 @@ static bool layout_children(TintaApp *app, const TintaElement *element,
 
 static bool layout_paragraph(TintaApp *app, const TintaElement *element,
                              float *y, float left, float right) {
+#if TINTA_ENABLE_SVG
+    if (element->child_count == 1 &&
+        element->children[0]->type == TINTA_ELEMENT_IMAGE) {
+        const TintaElement *image = element->children[0];
+        size_t resource_index = 0;
+        bool ready = false;
+        bool svg = tinta_svg_uri_candidate(image->url);
+        if (!svg && tinta_image_resource_get(
+                app, image->url, &resource_index, &ready) &&
+            resource_index < app->image_resources.len) {
+            const TintaImageResource *resource = TINTA_VEC_PTR(
+                TintaImageResource, app->image_resources, resource_index);
+            svg = resource->svg;
+        }
+        if (svg) return layout_svg_block(app, image, y, left, right);
+    }
+#endif
     float line_height = format_line_height(app->body_format);
     InlineState state = {left, right, left, *y, line_height, line_height};
     InlineStyle style = {
@@ -1804,6 +1832,131 @@ static bool layout_image_placeholder(TintaApp *app, const TintaElement *element,
     return ok;
 }
 
+#if TINTA_ENABLE_SVG
+static bool layout_svg_link(TintaApp *app, const TintaElement *element,
+                            float *y, float left) {
+    TintaStr8 alt8 = {0};
+    TintaStr16 text = {0};
+    TintaTextRun *run = NULL;
+    bool ok = flatten(element, &alt8);
+    if (ok && alt8.len)
+        ok = tinta_utf8_to_utf16(alt8.data, alt8.len, &text);
+    else if (ok && tinta_svg_data_uri(element->url))
+        ok = tinta_str16_assign(&text, L"SVG image", 9);
+    else if (ok && element->url && element->url[0]) {
+        const char *end = element->url + strcspn(element->url, "?#");
+        const char *name = end;
+        while (name > element->url && name[-1] != '/' && name[-1] != '\\')
+            name--;
+        if (name == end) name = element->url;
+        ok = tinta_utf8_to_utf16(name, (size_t)(end - name), &text);
+    } else if (ok) {
+        ok = tinta_str16_assign(&text, L"SVG image", 9);
+    }
+    if (ok) {
+        ok = append_run(app, text.data, text.len, app->italic_format,
+                        app->theme->link, left, *y,
+                        element->url && element->url[0] ? element->url : NULL,
+                        &run);
+        if (run) run->underline = true;
+    }
+    if (ok) *y += (run ? run->height : 0) + scale(app, 12);
+    tinta_str8_destroy(&alt8);
+    tinta_str16_destroy(&text);
+    return ok;
+}
+
+static bool layout_svg_block(TintaApp *app, const TintaElement *element,
+                             float *y, float left, float right) {
+    size_t resource_index = 0;
+    TintaImageResource *resource;
+    TintaSvgBlock block;
+    TintaDrawSvg draw;
+    size_t region_index;
+    size_t rect_index;
+    float top = *y;
+    float header = code_header_height(app);
+    float padding = scale(app, 12);
+    float block_right = right;
+    float natural_width = scale(app, 300);
+    float natural_height = scale(app, 150);
+    float ratio;
+    float render_width;
+    float render_height;
+    float visible_bottom;
+    bool ready = false;
+    if (!tinta_image_resource_get(app, element->url,
+                                  &resource_index, &ready)) return false;
+    if (resource_index >= app->image_resources.len)
+        return layout_svg_link(app, element, y, left);
+    resource = TINTA_VEC_PTR(TintaImageResource,
+                              app->image_resources, resource_index);
+    if (resource->state < 0)
+        return layout_svg_link(app, element, y, left);
+    if (resource->svg_width > 0 && resource->svg_height > 0) {
+        natural_width = scale(app, resource->svg_width);
+        natural_height = scale(app, resource->svg_height);
+    }
+    ratio = minf(1.0f, maxf(1, block_right - left - padding * 2) /
+                              maxf(1, natural_width));
+    render_width = natural_width * ratio;
+    render_height = natural_height * ratio;
+    rect_index = app->rects.len;
+    if (!add_rect(app, left, top, block_right,
+                  top + header + padding * 2 + render_height,
+                  app->theme->code_background, 0, false, 0)) return false;
+    {
+        RECT viewport = {(LONG)left, (LONG)(top + header),
+                         (LONG)block_right,
+                         (LONG)(top + header + padding * 2 + render_height)};
+        region_index = begin_horizontal_region(
+            app, TINTA_HORIZONTAL_SVG, element->source_offset, viewport);
+    }
+    if (region_index == SIZE_MAX) return false;
+    memset(&block, 0, sizeof(block));
+    block.rect.left = (LONG)left;
+    block.rect.top = (LONG)top;
+    block.rect.right = (LONG)block_right;
+    block.rect.bottom = (LONG)(top + header + padding * 2 + render_height);
+    block.resource_index = resource_index;
+    block.horizontal_region = region_index;
+    block.collapse_state = SIZE_MAX;
+    block.expansion = 1.0f;
+    {
+        TintaHorizontalRegion *region = horizontal_region(app, region_index);
+        if (region) {
+            block.collapse_state = region->collapse_state;
+            block.expansion = region->expansion;
+        }
+    }
+    if (!tinta_vec_push(&app->svg_blocks, &block)) return false;
+    if (ready && resource->svg && resource->svg_source) {
+        draw.resource_index = resource_index;
+        draw.horizontal_region = region_index;
+        draw.rect.left = (LONG)(left + (block_right - left - render_width) * 0.5f);
+        draw.rect.top = (LONG)(top + header + padding);
+        draw.rect.right = (LONG)(draw.rect.left + render_width);
+        draw.rect.bottom = (LONG)(draw.rect.top + render_height);
+        if (!tinta_vec_push(&app->svgs, &draw)) return false;
+    }
+    finish_horizontal_region(app, region_index);
+    visible_bottom = top + header +
+        (padding * 2 + render_height) * block.expansion;
+    {
+        TintaHorizontalRegion *region = horizontal_region(app, region_index);
+        TintaDrawRect *background = TINTA_VEC_PTR(
+            TintaDrawRect, app->rects, rect_index);
+        TintaSvgBlock *stored = TINTA_VEC_PTR(
+            TintaSvgBlock, app->svg_blocks, app->svg_blocks.len - 1);
+        if (region) region->viewport.bottom = (LONG)visible_bottom;
+        background->rect.bottom = (LONG)visible_bottom;
+        stored->rect.bottom = (LONG)visible_bottom;
+    }
+    *y = visible_bottom + scale(app, 14);
+    return tinta_str16_append(&app->doc_text, L"\n\n", 2);
+}
+#endif
+
 static bool layout_image(TintaApp *app, const TintaElement *element, float *y, float left, float right) {
 #if TINTA_ENABLE_IMAGES
     size_t resource_index = 0;
@@ -1815,10 +1968,37 @@ static bool layout_image(TintaApp *app, const TintaElement *element, float *y, f
     if (!tinta_image_resource_get(app, element->url,
                                   &resource_index, &ready))
         return false;
-    if (!ready || resource_index >= app->image_resources.len)
+    if (resource_index >= app->image_resources.len) {
+#if TINTA_ENABLE_SVG
+        if (tinta_svg_uri_candidate(element->url))
+            return layout_svg_link(app, element, y, left);
+#endif
         return layout_image_placeholder(app, element, y, left);
+    }
     resource = TINTA_VEC_PTR(
         TintaImageResource, app->image_resources, resource_index);
+#if TINTA_ENABLE_SVG
+    if (resource->state < 0 &&
+        (resource->svg || tinta_svg_uri_candidate(element->url)))
+        return layout_svg_link(app, element, y, left);
+    if (resource->svg && resource->svg_source &&
+        resource->svg_width > 0 && resource->svg_height > 0) {
+        TintaDrawSvg svg;
+        ratio = minf(1, (right - left) /
+                        scale(app, resource->svg_width));
+        svg.resource_index = resource_index;
+        svg.horizontal_region = SIZE_MAX;
+        svg.rect.left = (LONG)left;
+        svg.rect.top = (LONG)*y;
+        svg.rect.right = (LONG)(left + scale(app, resource->svg_width) * ratio);
+        svg.rect.bottom = (LONG)(*y + scale(app, resource->svg_height) * ratio);
+        if (!tinta_vec_push(&app->svgs, &svg)) return false;
+        app->content_width = maxf(app->content_width, (float)svg.rect.right);
+        *y = (float)svg.rect.bottom + scale(app, 16);
+        return true;
+    }
+#endif
+    if (!ready) return layout_image_placeholder(app, element, y, left);
     if (!resource->source || !resource->width || !resource->height)
         return layout_image_placeholder(app, element, y, left);
     ratio = minf(1, (right - left) / resource->width);
@@ -2556,6 +2736,21 @@ static RECT mermaid_button_rect(const TintaApp *app,
     return result;
 }
 
+static RECT svg_button_rect(const TintaApp *app,
+                            const TintaSvgBlock *block) {
+    LONG width = (LONG)ui_scale(app, 78);
+    LONG height = (LONG)ui_scale(app, 28);
+    LONG padding = (LONG)scale(app, 8);
+    LONG header_height = (LONG)code_header_height(app);
+    LONG visible_right = (LONG)(app->scroll_x + viewport_width(app));
+    RECT result;
+    result.right = min(block->rect.right, visible_right) - padding;
+    result.left = result.right - width;
+    result.top = block->rect.top + max(0L, (header_height - height) / 2);
+    result.bottom = result.top + height;
+    return result;
+}
+
 static RECT document_button_rect(const TintaApp *app) {
     LONG width = (LONG)ui_scale(app, 78);
     LONG height = (LONG)ui_scale(app, 28);
@@ -2582,6 +2777,11 @@ static bool point_in_block_header(const TintaApp *app, const RECT *rect,
 bool tinta_collapsible_header_at(const TintaApp *app, int x, int y) {
     size_t i;
     if (!app) return false;
+    for (i = app->svg_blocks.len; i > 0; i--) {
+        const TintaSvgBlock *block = TINTA_VEC_PTR(
+            TintaSvgBlock, app->svg_blocks, i - 1);
+        if (point_in_block_header(app, &block->rect, x, y)) return true;
+    }
     for (i = app->mermaid_blocks.len; i > 0; i--) {
         const TintaMermaidBlock *block = TINTA_VEC_PTR(
             TintaMermaidBlock, app->mermaid_blocks, i - 1);
@@ -2614,6 +2814,12 @@ static bool toggle_collapse_state(TintaApp *app, size_t state_index,
 bool tinta_toggle_collapsible_at(TintaApp *app, int x, int y, bool animate) {
     size_t i;
     if (!app) return false;
+    for (i = app->svg_blocks.len; i > 0; i--) {
+        TintaSvgBlock *block = TINTA_VEC_PTR(
+            TintaSvgBlock, app->svg_blocks, i - 1);
+        if (point_in_block_header(app, &block->rect, x, y))
+            return toggle_collapse_state(app, block->collapse_state, animate);
+    }
     for (i = app->mermaid_blocks.len; i > 0; i--) {
         TintaMermaidBlock *block = TINTA_VEC_PTR(
             TintaMermaidBlock, app->mermaid_blocks, i - 1);
@@ -2677,6 +2883,40 @@ bool tinta_mermaid_button_at(const TintaApp *app, int x, int y) {
     if (index < 0) return false;
     button = mermaid_button_rect(app, TINTA_VEC_PTR(
         TintaMermaidBlock, app->mermaid_blocks, index));
+    return document_x >= button.left && document_x <= button.right &&
+           document_y >= button.top && document_y <= button.bottom;
+}
+
+int tinta_svg_block_at(const TintaApp *app, int x, int y) {
+    size_t i;
+    float document_x = x - viewport_x(app) + app->scroll_x;
+    float document_y = y + app->scroll_y;
+    for (i = 0; i < app->svg_blocks.len; i++) {
+        const TintaSvgBlock *block = TINTA_VEC_PTR(
+            TintaSvgBlock, app->svg_blocks, i);
+        if (document_x >= block->rect.left &&
+            document_x <= block->rect.right &&
+            document_y >= block->rect.top &&
+            document_y <= block->rect.bottom)
+            return (int)i;
+    }
+    return -1;
+}
+
+bool tinta_svg_button_at(const TintaApp *app, int x, int y) {
+    int index = tinta_svg_block_at(app, x, y);
+    float document_x = x - viewport_x(app) + app->scroll_x;
+    float document_y = y + app->scroll_y;
+    RECT button;
+    const TintaSvgBlock *block;
+    const TintaImageResource *resource;
+    if (index < 0) return false;
+    block = TINTA_VEC_PTR(TintaSvgBlock, app->svg_blocks, index);
+    if (block->resource_index >= app->image_resources.len) return false;
+    resource = TINTA_VEC_PTR(
+        TintaImageResource, app->image_resources, block->resource_index);
+    if (!resource->svg_source) return false;
+    button = svg_button_rect(app, block);
     return document_x >= button.left && document_x <= button.right &&
            document_y >= button.top && document_y <= button.bottom;
 }
@@ -3240,6 +3480,134 @@ static void draw_mermaid_header(TintaApp *app,
     }
 }
 
+static void draw_svg_header(TintaApp *app, const TintaSvgBlock *block,
+                            float vx, float scroll) {
+    static const wchar_t label_text[] = L"SVG";
+    float document_left;
+    float document_right;
+    float padding = scale(app, 12);
+    float top = block->rect.top - scroll;
+    float bottom = top + code_header_height(app);
+    RECT button;
+    D2D1_RECT_F background;
+    IDWriteTextLayout *label = NULL;
+    bool hovered;
+    if (bottom < 0 || top > app->height) return;
+    document_left = maxf((float)block->rect.left, app->scroll_x);
+    document_right = minf((float)block->rect.right,
+                          app->scroll_x + viewport_width(app));
+    if (document_right <= document_left) return;
+    background = (D2D1_RECT_F){document_left + vx, top,
+                               document_right + vx, bottom};
+    set_brush_alpha(app, app->theme->quote,
+                    app->theme->dark ? 0.16f : 0.10f);
+    app->render_target->lpVtbl->FillRectangle(
+        app->render_target, &background, (ID2D1Brush *)app->brush);
+    set_brush_alpha(app, app->theme->quote, 0.45f);
+    app->render_target->lpVtbl->DrawLine(
+        app->render_target,
+        (D2D1_POINT_2F){background.left, background.bottom},
+        (D2D1_POINT_2F){background.right, background.bottom},
+        (ID2D1Brush *)app->brush, maxf(1.0f, scale(app, 1)), NULL);
+    hovered = tinta_collapsible_header_at(app, app->mouse_x, app->mouse_y) &&
+              tinta_svg_block_at(app, app->mouse_x, app->mouse_y) >= 0 &&
+              !tinta_svg_button_at(app, app->mouse_x, app->mouse_y);
+    draw_collapse_chevron(app, document_left + vx, top,
+                          block->expansion, hovered);
+    button = svg_button_rect(app, block);
+    if (button.left > document_left + padding + scale(app, 18) &&
+        SUCCEEDED(app->dwrite_factory->lpVtbl->CreateTextLayout(
+            app->dwrite_factory, label_text, 3, app->code_format,
+            button.left - document_left - padding * 2 - scale(app, 18),
+            code_header_height(app), &label))) {
+        D2D1_POINT_2F origin = {
+            document_left + padding + scale(app, 18) + vx, top};
+        apply_font_fallback(app, label);
+        label->lpVtbl->SetWordWrapping(
+            label, TINTA_DWRITE_WORD_WRAPPING_NO_WRAP);
+        label->lpVtbl->SetParagraphAlignment(
+            label, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        set_brush_alpha(app, app->theme->syntax_comment, 0.95f);
+        tinta_draw_text_layout(app, origin, label,
+            (ID2D1Brush *)app->brush,
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        label->lpVtbl->Release(label);
+    }
+}
+
+#if TINTA_ENABLE_SVG
+static bool ensure_svg_document(TintaApp *app, TintaImageResource *resource) {
+    IStream *stream;
+    D2D1_SIZE_F viewport;
+    HRESULT hr;
+    if (resource->svg_document) return true;
+    if (!app->svg_context || !resource->svg_source ||
+        !resource->svg_source_length) {
+        hr = app->svg_context ? E_INVALIDARG : E_NOINTERFACE;
+        goto failed;
+    }
+    if (resource->svg_source_length > UINT_MAX) {
+        hr = E_INVALIDARG;
+        goto failed;
+    }
+    stream = SHCreateMemStream((const BYTE *)resource->svg_source,
+                               (UINT)resource->svg_source_length);
+    if (!stream) {
+        hr = E_OUTOFMEMORY;
+        goto failed;
+    }
+    viewport.width = resource->svg_width;
+    viewport.height = resource->svg_height;
+    hr = app->svg_context->lpVtbl->CreateSvgDocument(
+        app->svg_context, stream, viewport, &resource->svg_document);
+    IStream_Release(stream);
+    if (SUCCEEDED(hr) && resource->svg_document) return true;
+failed:
+    resource->state = -1;
+    resource->svg_error = hr;
+    if (!resource->svg_error_notified && app->resource_error) {
+        app->resource_error(app, resource->remote,
+                            resource->resolved_uri, hr);
+        resource->svg_error_notified = true;
+    }
+    app->layout_dirty = true;
+    InvalidateRect(app->hwnd, NULL, FALSE);
+    return false;
+}
+
+static void draw_svg_item(TintaApp *app, const TintaDrawSvg *item,
+                          float vx, float scroll) {
+    TintaImageResource *resource;
+    D2D1_RECT_F destination;
+    D2D1_MATRIX_3X2_F previous;
+    D2D1_MATRIX_3X2_F transform;
+    float width;
+    float height;
+    if (item->resource_index >= app->image_resources.len) return;
+    resource = TINTA_VEC_PTR(TintaImageResource, app->image_resources,
+                             item->resource_index);
+    if (resource->state != 2 || !resource->svg ||
+        !ensure_svg_document(app, resource)) return;
+    destination = (D2D1_RECT_F){vx + item->rect.left,
+        item->rect.top - scroll, vx + item->rect.right,
+        item->rect.bottom - scroll};
+    if (destination.bottom < 0 || destination.top > app->height) return;
+    width = destination.right - destination.left;
+    height = destination.bottom - destination.top;
+    if (width <= 0 || height <= 0 || resource->svg_width <= 0 ||
+        resource->svg_height <= 0) return;
+    app->render_target->lpVtbl->GetTransform(app->render_target, &previous);
+    transform = (D2D1_MATRIX_3X2_F){
+        width / resource->svg_width, 0, 0,
+        height / resource->svg_height, destination.left, destination.top};
+    app->render_target->lpVtbl->SetTransform(app->render_target, &transform);
+    app->svg_context->lpVtbl->DrawSvgDocument(
+        app->svg_context, resource->svg_document);
+    app->render_target->lpVtbl->SetTransform(app->render_target, &previous);
+    app->draw_calls++;
+}
+#endif
+
 static void draw_copy_button(TintaApp *app, D2D1_RECT_F rect,
                              bool copied, bool hovered) {
     const wchar_t *button_text = copied ? L"Copied" : L"Copy";
@@ -3418,6 +3786,23 @@ void tinta_render(TintaApp *app) {
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
         }
 #endif
+#if TINTA_ENABLE_SVG
+        for (i = 0; i < app->svgs.len; i++) {
+            TintaDrawSvg *item = TINTA_VEC_PTR(TintaDrawSvg, app->svgs, i);
+            const TintaHorizontalRegion *region;
+            if (item->horizontal_region == SIZE_MAX) {
+                draw_svg_item(app, item, vx, scroll);
+                continue;
+            }
+            region = horizontal_region_const(app, item->horizontal_region);
+            if (!region || !push_horizontal_region_clip(
+                    app, item->horizontal_region, vx, scroll)) continue;
+            draw_svg_item(app, item,
+                vx + horizontal_region_offset(region), scroll);
+            app->render_target->lpVtbl->PopAxisAlignedClip(
+                app->render_target);
+        }
+#endif
         for (i = 0; i < app->code_blocks.len; i++)
             draw_code_header(app,
                 TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, i), vx, scroll);
@@ -3425,6 +3810,9 @@ void tinta_render(TintaApp *app) {
             draw_mermaid_header(app,
                 TINTA_VEC_PTR(TintaMermaidBlock, app->mermaid_blocks, i),
                 vx, scroll);
+        for (i = 0; i < app->svg_blocks.len; i++)
+            draw_svg_header(app,
+                TINTA_VEC_PTR(TintaSvgBlock, app->svg_blocks, i), vx, scroll);
         if (app->search_query.len && app->viewer_search_matches.len) {
             size_t match_index = 0;
             size_t run_index = 0;
@@ -3520,6 +3908,26 @@ void tinta_render(TintaApp *app) {
             if (button.bottom > 0 && button.top < app->height)
                 draw_copy_button(app, button, copied, over_button);
         }
+        if (app->hovered_svg_block >= 0 &&
+            (size_t)app->hovered_svg_block < app->svg_blocks.len) {
+            TintaSvgBlock *block = TINTA_VEC_PTR(
+                TintaSvgBlock, app->svg_blocks,
+                (size_t)app->hovered_svg_block);
+            bool copied = app->notice_kind == TINTA_NOTICE_COPIED &&
+                          app->notice_svg_block == app->hovered_svg_block;
+            bool over_button = tinta_svg_button_at(
+                app, app->mouse_x, app->mouse_y);
+            RECT document_button = svg_button_rect(app, block);
+            D2D1_RECT_F button = {(float)document_button.left + vx,
+                                  (float)document_button.top - scroll,
+                                  (float)document_button.right + vx,
+                                  (float)document_button.bottom - scroll};
+            if (block->resource_index < app->image_resources.len &&
+                TINTA_VEC_PTR(TintaImageResource, app->image_resources,
+                              block->resource_index)->svg_source &&
+                button.bottom > 0 && button.top < app->height)
+                draw_copy_button(app, button, copied, over_button);
+        }
         app->render_target->lpVtbl->PopAxisAlignedClip(app->render_target);
         for (i = 0; i < app->horizontal_regions.len; i++)
             draw_horizontal_region_scrollbar(app, i);
@@ -3532,7 +3940,8 @@ void tinta_render(TintaApp *app) {
                 (float)document_button.bottom - scroll};
             bool copied = app->notice_kind == TINTA_NOTICE_COPIED &&
                           app->notice_code_block < 0 &&
-                          app->notice_mermaid_block < 0;
+                          app->notice_mermaid_block < 0 &&
+                          app->notice_svg_block < 0;
             if (document_button.left >= app->scroll_x &&
                 button.bottom > 0 && button.top < app->height)
                 draw_copy_button(app, button, copied,
@@ -3819,14 +4228,16 @@ bool tinta_text_at(TintaApp *app, float x, float y, const char **url) {
 }
 
 static void show_copied_notice(TintaApp *app, int code_block,
-                               int mermaid_block) {
+                               int mermaid_block, int svg_block) {
     app->notice_kind = TINTA_NOTICE_COPIED;
     app->notice_code_block = code_block;
     app->notice_mermaid_block = mermaid_block;
+    app->notice_svg_block = svg_block;
     if (!SetTimer(app->hwnd, TINTA_TIMER_NOTIFICATION, 1000, NULL)) {
         app->notice_kind = TINTA_NOTICE_NONE;
         app->notice_code_block = -1;
         app->notice_mermaid_block = -1;
+        app->notice_svg_block = -1;
     }
     InvalidateRect(app->hwnd, NULL, FALSE);
 }
@@ -3857,7 +4268,7 @@ bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied) {
     block = TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, (size_t)index);
     success = tinta_set_clipboard_text(
         app->hwnd, block->text, wcslen(block->text));
-    if (success) show_copied_notice(app, index, -1);
+    if (success) show_copied_notice(app, index, -1, -1);
     if (copied) *copied = success;
     return true;
 }
@@ -3872,7 +4283,30 @@ bool tinta_copy_mermaid_at(TintaApp *app, int x, int y, bool *copied) {
         TintaMermaidBlock, app->mermaid_blocks, (size_t)index);
     success = tinta_set_clipboard_text(
         app->hwnd, block->text, wcslen(block->text));
-    if (success) show_copied_notice(app, -1, index);
+    if (success) show_copied_notice(app, -1, index, -1);
+    if (copied) *copied = success;
+    return true;
+}
+
+bool tinta_copy_svg_at(TintaApp *app, int x, int y, bool *copied) {
+    int index = tinta_svg_block_at(app, x, y);
+    TintaSvgBlock *block;
+    TintaImageResource *resource;
+    TintaStr16 wide = {0};
+    bool success = false;
+    if (copied) *copied = false;
+    if (index < 0 || !tinta_svg_button_at(app, x, y)) return false;
+    block = TINTA_VEC_PTR(TintaSvgBlock, app->svg_blocks, (size_t)index);
+    if (block->resource_index >= app->image_resources.len) return true;
+    resource = TINTA_VEC_PTR(TintaImageResource, app->image_resources,
+                             block->resource_index);
+    if (resource->svg_source && tinta_utf8_to_utf16(
+            resource->svg_source, resource->svg_source_length, &wide)) {
+        success = tinta_set_clipboard_text(
+            app->hwnd, wide.data ? wide.data : L"", wide.len);
+    }
+    tinta_str16_destroy(&wide);
+    if (success) show_copied_notice(app, -1, -1, index);
     if (copied) *copied = success;
     return true;
 }
@@ -3888,7 +4322,7 @@ bool tinta_copy_document_at(TintaApp *app, int x, int y, bool *copied) {
             app->hwnd, wide.data ? wide.data : L"", wide.len);
     }
     tinta_str16_destroy(&wide);
-    if (success) show_copied_notice(app, -1, -1);
+    if (success) show_copied_notice(app, -1, -1, -1);
     if (copied) *copied = success;
     return true;
 }

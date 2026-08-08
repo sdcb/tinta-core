@@ -8,6 +8,7 @@
 #include <cwchar>
 #include <initializer_list>
 #include <iostream>
+#include <string>
 
 namespace {
 
@@ -186,6 +187,104 @@ void test_inline_styles(TintaApp &app) {
                   TINTA_DWRITE_FONT_WEIGHT_BOLD,
           "nested highlight keeps the inherited emphasis");
 }
+
+#if TINTA_ENABLE_SVG
+void test_svg_layout(TintaApp &app) {
+    const char *source =
+        "![Vector](data:image/svg+xml,%3Csvg%20width%3D%27120%27%20height%3D%2760%27%20viewBox%3D%270%200%20120%2060%27%3E%3Crect%20width%3D%27120%27%20height%3D%2760%27/%3E%3C/svg%3E)";
+    check(load(app, source), "SVG Data URI layout loads");
+    check(app.svg_blocks.len == 1, "standalone SVG receives a block header");
+    check(app.svgs.len == 1, "standalone SVG creates a vector draw item");
+    check(app.image_resources.len == 1, "SVG counts as an image resource");
+    if (app.image_resources.len == 1) {
+        auto *resource = TINTA_VEC_PTR(
+            TintaImageResource, app.image_resources, 0);
+        check(resource->svg && resource->svg_source &&
+                  std::fabs(resource->svg_width - 120.0f) < 0.01f &&
+                  std::fabs(resource->svg_height - 60.0f) < 0.01f,
+              "SVG source and natural size are retained");
+    }
+    if (app.svgs.len == 1) {
+        auto *draw = TINTA_VEC_PTR(TintaDrawSvg, app.svgs, 0);
+        check(draw->rect.right - draw->rect.left == 120 &&
+                  draw->rect.bottom - draw->rect.top == 60,
+              "standalone SVG keeps natural size and does not upscale");
+    }
+    if (app.svg_blocks.len == 1) {
+        auto *block = TINTA_VEC_PTR(TintaSvgBlock, app.svg_blocks, 0);
+        check(tinta_toggle_collapsible_at(
+                  &app, block->rect.left + 24, block->rect.top + 16, false) &&
+                  tinta_layout_document(&app),
+              "SVG block uses animated-block collapse state");
+        block = TINTA_VEC_PTR(TintaSvgBlock, app.svg_blocks, 0);
+        check(block->expansion == 0.0f,
+              "SVG block can collapse to its header");
+    }
+
+    check(load(app,
+          "before ![Vector](data:image/svg+xml,%3Csvg%20width%3D%2720%27%20height%3D%2710%27%3E%3C/svg%3E) after"),
+          "inline SVG layout loads");
+    check(app.svg_blocks.len == 0,
+          "inline SVG keeps ordinary image semantics without a header");
+    check(app.svgs.len == 1, "inline SVG still creates a vector draw item");
+
+    check(load(app,
+          "![Bad](data:image/svg+xml,%3C!DOCTYPE%20svg%3E%3Csvg%3E%3C/svg%3E)"),
+          "invalid SVG falls back during layout");
+    auto *bad_link = find_run(app, L"Bad");
+    check(app.svg_blocks.len == 0 && app.svgs.len == 0 &&
+              bad_link && bad_link->url,
+          "invalid standalone SVG becomes an alt-text link");
+    check(load(app,
+          "![](data:image/svg+xml,%3C!DOCTYPE%20svg%3E%3Csvg%3E%3C/svg%3E)"),
+          "invalid SVG without alt text falls back");
+    check(find_run(app, L"SVG image") != nullptr,
+          "invalid Data URI avoids exposing the full URI");
+
+#if TINTA_ENABLE_LOCAL_IMAGES
+    wchar_t temporary_directory[MAX_PATH]{};
+    wchar_t temporary_file[MAX_PATH]{};
+    const char local_source[] =
+        "<?xml version='1.0'?><svg width='48' height='24'></svg>";
+    if (GetTempPathW(MAX_PATH, temporary_directory) &&
+        swprintf_s(temporary_file, L"%stinta-svg-%lu.svg",
+                   temporary_directory, GetCurrentProcessId()) > 0) {
+        HANDLE file = CreateFileW(temporary_file, GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY,
+                                  nullptr);
+        DWORD written = 0;
+        bool wrote = file != INVALID_HANDLE_VALUE &&
+            WriteFile(file, local_source,
+                      static_cast<DWORD>(sizeof(local_source) - 1),
+                      &written, nullptr) &&
+            written == sizeof(local_source) - 1;
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        TintaStr8 path{};
+        std::wstring uri = temporary_file;
+        uri += L"?theme=dark#icon";
+        size_t resource_index = SIZE_MAX;
+        bool ready = false;
+        bool loaded = wrote && tinta_utf16_to_utf8(
+            uri.c_str(), uri.size(), &path) &&
+            tinta_image_resource_get(&app, path.data, &resource_index,
+                                     &ready);
+        check(loaded && ready && resource_index < app.image_resources.len,
+              "local SVG with query and fragment loads");
+        if (loaded && resource_index < app.image_resources.len) {
+            auto *resource = TINTA_VEC_PTR(
+                TintaImageResource, app.image_resources, resource_index);
+            check(resource->svg && resource->svg_source &&
+                      resource->svg_width == 48 && resource->svg_height == 24,
+                  "local SVG content and dimensions are retained");
+        }
+        tinta_str8_destroy(&path);
+        DeleteFileW(temporary_file);
+    } else {
+        check(false, "temporary local SVG path created");
+    }
+#endif
+}
+#endif
 
 void test_block_collapse(TintaApp &app) {
     const char *source =
@@ -518,6 +617,7 @@ int main() {
                                nullptr, nullptr, app.instance, nullptr);
     app.dpi_scale = 1.0f;
     app.max_ast_nodes = 1000000;
+    app.max_document_bytes = 64u * 1024u * 1024u;
     app.max_ast_depth = 256;
     app.max_mermaid_nodes = 10000;
     app.max_mermaid_edges = 20000;
@@ -535,6 +635,9 @@ int main() {
 
     test_inline_styles(app);
     test_block_collapse(app);
+#if TINTA_ENABLE_SVG
+    test_svg_layout(app);
+#endif
 #if TINTA_ENABLE_MERMAID
     test_mermaid_layout(app);
     test_mermaid_subgraph_layout(app);

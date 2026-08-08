@@ -423,6 +423,15 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                         tinta_control_notify_error(control, E_FAIL,
                             L"copy-mermaid",
                             L"The Mermaid source could not be copied to the clipboard.");
+                } else if (tinta_copy_svg_at(
+                        &control->view, x, y, &copied)) {
+                    handled = true;
+                    if (copied)
+                        tinta_control_notify_code(control, TMN_COPYCOMPLETED);
+                    else
+                        tinta_control_notify_error(control, E_FAIL,
+                            L"copy-svg",
+                            L"The SVG source could not be copied to the clipboard.");
                 } else if (tinta_copy_code_at(
                         &control->view, x, y, &copied)) {
                     handled = true;
@@ -464,6 +473,9 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
             bool old_over_mermaid_button = tinta_mermaid_button_at(
                 &control->view,
                 control->view.mouse_x, control->view.mouse_y);
+            bool old_over_svg_button = tinta_svg_button_at(
+                &control->view,
+                control->view.mouse_x, control->view.mouse_y);
             bool old_over_collapsible_header = tinta_collapsible_header_at(
                 &control->view,
                 control->view.mouse_x, control->view.mouse_y);
@@ -489,10 +501,12 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                 const char *url = NULL;
                 int old_code_block = control->view.hovered_code_block;
                 int old_mermaid_block = control->view.hovered_mermaid_block;
+                int old_svg_block = control->view.hovered_svg_block;
                 bool hover_changed;
                 bool over_copy_button;
                 bool over_document_button;
                 bool over_mermaid_button;
+                bool over_svg_button;
                 bool over_collapsible_header;
                 bool text = tinta_text_at(&control->view,
                                            (float)x, (float)y, &url);
@@ -502,6 +516,8 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                     tinta_code_block_at(&control->view, x, y);
                 control->view.hovered_mermaid_block =
                     tinta_mermaid_block_at(&control->view, x, y);
+                control->view.hovered_svg_block =
+                    tinta_svg_block_at(&control->view, x, y);
                 over_copy_button = control->view.hovered_code_block >= 0 &&
                     tinta_code_button_at(&control->view, x, y);
                 over_document_button =
@@ -511,18 +527,23 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                 over_mermaid_button =
                     control->view.hovered_mermaid_block >= 0 &&
                     tinta_mermaid_button_at(&control->view, x, y);
+                over_svg_button = control->view.hovered_svg_block >= 0 &&
+                    tinta_svg_button_at(&control->view, x, y);
                 over_collapsible_header = tinta_collapsible_header_at(
                     &control->view, x, y);
                 if (hover_changed ||
                     old_code_block != control->view.hovered_code_block ||
                     old_mermaid_block != control->view.hovered_mermaid_block ||
+                    old_svg_block != control->view.hovered_svg_block ||
                     old_over_copy_button != over_copy_button ||
                     old_over_document_button != over_document_button ||
                     old_over_mermaid_button != over_mermaid_button ||
+                    old_over_svg_button != over_svg_button ||
                     old_over_collapsible_header != over_collapsible_header)
                     InvalidateRect(hwnd, NULL, FALSE);
                 SetCursor(LoadCursorW(NULL,
                     over_document_button || over_mermaid_button ||
+                    over_svg_button ||
                     over_copy_button || over_collapsible_header ||
                     (url && url[0]) ? IDC_HAND :
                     text ? IDC_IBEAM : IDC_ARROW));
@@ -565,6 +586,7 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                   TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
                  tinta_document_button_at(&control->view, x, y)) ||
                 tinta_mermaid_button_at(&control->view, x, y) ||
+                tinta_svg_button_at(&control->view, x, y) ||
                 tinta_code_button_at(&control->view, x, y) ||
                 tinta_collapsible_header_at(&control->view, x, y)) {
                 tinta_control_reset_multi_click(control);
@@ -612,6 +634,7 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
             control->view.mouse_y = -1;
             control->view.hovered_code_block = -1;
             control->view.hovered_mermaid_block = -1;
+            control->view.hovered_svg_block = -1;
             tinta_scrollbar_update_hover(&control->view, -1, -1);
             InvalidateRect(hwnd, NULL, FALSE);
             *result = 0;

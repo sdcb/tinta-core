@@ -350,6 +350,14 @@ wchar_t *tinta_control_resolve_link(TintaControl *control, const char *url) {
     wchar_t directory[MAX_PATH * 4];
     wchar_t *result = NULL;
     if (!url || !tinta_utf8_to_utf16(url, strlen(url), &wide)) return NULL;
+#if TINTA_ENABLE_SVG
+    if (!_strnicmp(url, "data:image/svg+xml", 18) &&
+        (url[18] == ';' || url[18] == ',')) {
+        result = tinta_wcsdup_n(wide.data, wide.len);
+        tinta_str16_destroy(&wide);
+        return result;
+    }
+#endif
     if (!control->base_uri.len || PathIsURLW(wide.data) ||
         PathIsRelativeW(wide.data) == FALSE) {
         result = tinta_wcsdup_n(wide.data, wide.len);

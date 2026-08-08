@@ -21,6 +21,7 @@ option(TINTA_ENABLE_MERMAID "Enable Mermaid parsing and rendering" ON)
 option(TINTA_ENABLE_SYNTAX "Enable code-block syntax highlighting" ON)
 option(TINTA_ENABLE_REMOTE_IMAGES "Enable remote image downloads" ON)
 option(TINTA_ENABLE_LOCAL_IMAGES "Enable local image decoding" ON)
+option(TINTA_ENABLE_SVG "Enable Direct2D SVG rendering" ON)
 
 set(TINTA_CORE_SOURCES
     vendor/md4c/src/md4c.c
@@ -45,6 +46,9 @@ if(TINTA_ENABLE_REMOTE_IMAGES)
 endif()
 if(TINTA_ENABLE_SYNTAX)
     list(APPEND TINTA_CORE_SOURCES src/syntax.c)
+endif()
+if(TINTA_ENABLE_SVG)
+    list(APPEND TINTA_CORE_SOURCES src/svg.c)
 endif()
 if(TINTA_ENABLE_UIA)
     list(APPEND TINTA_CORE_SOURCES
@@ -76,7 +80,8 @@ target_compile_definitions(tinta_core PRIVATE UNICODE _UNICODE TINTA_CORE_BUILD
     TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
     TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
     TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
-    TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
+    TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
+    TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
 if(BUILD_SHARED_LIBS)
     target_compile_definitions(tinta_core PUBLIC TINTA_CORE_SHARED)
 endif()
@@ -123,13 +128,17 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
     if(TINTA_ENABLE_SYNTAX)
         list(APPEND TINTA_TEST_SUPPORT_SOURCES src/syntax.c)
     endif()
+    if(TINTA_ENABLE_SVG)
+        list(APPEND TINTA_TEST_SUPPORT_SOURCES src/svg.c)
+    endif()
     add_library(tinta_test_support STATIC ${TINTA_TEST_SUPPORT_SOURCES})
     target_include_directories(tinta_test_support PRIVATE
         src/internal vendor/md4c/src)
     target_compile_definitions(tinta_test_support PRIVATE
         _CRT_SECURE_NO_WARNINGS
         TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
-        TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>)
+        TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
+        TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
     if(MSVC)
         target_compile_options(tinta_test_support PRIVATE /utf-8 /W4)
         set_source_files_properties(vendor/md4c/src/md4c.c PROPERTIES
@@ -151,7 +160,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
                 TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
                 TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
                 TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
-                TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
+                TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
+                TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
             target_link_libraries(tinta_layout_test_support PRIVATE
                 d2d1 dwrite advapi32 shell32 shlwapi)
             if(TINTA_ENABLE_REMOTE_IMAGES OR TINTA_ENABLE_LOCAL_IMAGES)
@@ -177,6 +187,13 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         target_link_libraries(core_tests PRIVATE tinta_test_support)
         add_test(NAME core_containers COMMAND core_tests)
 
+        if(TINTA_ENABLE_SVG)
+            add_executable(svg_tests tests/svg_tests.cpp)
+            target_include_directories(svg_tests PRIVATE src/internal)
+            target_link_libraries(svg_tests PRIVATE tinta_test_support)
+            add_test(NAME svg_sources COMMAND svg_tests)
+        endif()
+
         if(TINTA_ENABLE_MERMAID)
             add_executable(mermaid_tests tests/mermaid_tests.cpp)
             target_include_directories(mermaid_tests PRIVATE src/internal)
@@ -188,7 +205,9 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         target_include_directories(layout_tests PRIVATE src/internal)
         target_link_libraries(layout_tests PRIVATE ${TINTA_LAYOUT_TEST_LIBRARY})
         target_compile_definitions(layout_tests PRIVATE
-            TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>)
+            TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
+            TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
+            TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
         add_test(NAME renderer_layout COMMAND layout_tests)
 
         add_executable(document_tests tests/document_tests.cpp)
@@ -214,7 +233,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         target_compile_definitions(control_tests PRIVATE UNICODE _UNICODE
             TINTA_ENABLE_UIA=$<BOOL:${TINTA_ENABLE_UIA}>
             TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
-            TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
+            TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
+            TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
         add_test(NAME markdown_control COMMAND control_tests)
         if(TINTA_ENABLE_UIA)
             add_executable(uia_tests tests/uia_tests.cpp)

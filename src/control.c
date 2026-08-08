@@ -241,6 +241,7 @@ static bool control_initialize_state(TintaControl *control, HWND hwnd) {
     control->view.document_copy_button_enabled =
         (control->options.flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON) != 0;
     control->limits = tinta_control_default_limits();
+    control->view.max_document_bytes = control->limits.max_document_bytes;
     control->view.max_ast_nodes = control->limits.max_ast_nodes;
     control->view.max_ast_depth = control->limits.max_ast_depth;
     control->view.max_mermaid_nodes = control->limits.max_mermaid_nodes;
@@ -409,6 +410,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 control->view.notice_kind = TINTA_NOTICE_NONE;
                 control->view.notice_code_block = -1;
                 control->view.notice_mermaid_block = -1;
+                control->view.notice_svg_block = -1;
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }

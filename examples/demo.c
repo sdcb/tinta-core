@@ -77,6 +77,10 @@ static const char DEFAULT_MARKDOWN[] =
     "    E --> F\n"
     "```\n\n"
     "Mermaid uses the same animated header collapse and source Copy behavior.\n\n"
+    "## SVG document\n\n"
+    "![Tinta vector demo](data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20width%3D%27560%27%20height%3D%27160%27%20viewBox%3D%270%200%20560%20160%27%3E%3Crect%20x%3D%271%27%20y%3D%271%27%20width%3D%27558%27%20height%3D%27158%27%20rx%3D%2720%27%20fill%3D%27%23142538%27%20stroke%3D%27%2306b6d4%27%20stroke-width%3D%272%27/%3E%3Ccircle%20cx%3D%2790%27%20cy%3D%2780%27%20r%3D%2742%27%20fill%3D%27%230ea5e9%27/%3E%3Cpath%20d%3D%27M75%2080l12%2012%2024-28%27%20fill%3D%27none%27%20stroke%3D%27white%27%20stroke-width%3D%278%27/%3E%3Ctext%20x%3D%27160%27%20y%3D%2792%27%20font-size%3D%2734%27%20font-family%3D%27Segoe%20UI%27%20fill%3D%27white%27%3EDirect2D%20SVG%3C/text%3E%3C/svg%3E)\n\n"
+    "Standalone SVG images use a persistent **SVG** header with source Copy "
+    "and animated collapse. Inline SVG images keep normal image behavior.\n\n"
     "Scroll through the document, use the table of contents, and open another "
     "Markdown file with **Open** when you want to try your own content.";
 

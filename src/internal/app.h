@@ -124,6 +124,12 @@ typedef struct TintaDrawBitmap {
     RECT rect;
 } TintaDrawBitmap;
 
+typedef struct TintaDrawSvg {
+    size_t resource_index;
+    RECT rect;
+    size_t horizontal_region;
+} TintaDrawSvg;
+
 typedef struct TintaCodeBlock {
     RECT rect;
     wchar_t *text;
@@ -141,9 +147,18 @@ typedef struct TintaMermaidBlock {
     float expansion;
 } TintaMermaidBlock;
 
+typedef struct TintaSvgBlock {
+    RECT rect;
+    size_t resource_index;
+    size_t horizontal_region;
+    size_t collapse_state;
+    float expansion;
+} TintaSvgBlock;
+
 typedef enum TintaHorizontalRegionKind {
     TINTA_HORIZONTAL_CODE,
-    TINTA_HORIZONTAL_MERMAID
+    TINTA_HORIZONTAL_MERMAID,
+    TINTA_HORIZONTAL_SVG
 } TintaHorizontalRegionKind;
 
 typedef struct TintaHorizontalRegion {
@@ -192,6 +207,14 @@ typedef struct TintaImageResource {
     ID2D1Bitmap *bitmap;
     UINT width;
     UINT height;
+    char *svg_source;
+    size_t svg_source_length;
+    ID2D1SvgDocument *svg_document;
+    float svg_width;
+    float svg_height;
+    HRESULT svg_error;
+    bool svg;
+    bool svg_error_notified;
     bool remote;
     int state;
 } TintaImageResource;
@@ -270,6 +293,7 @@ struct TintaApp {
     ID2D1Factory *d2d_factory;
     ID2D1HwndRenderTarget *render_target;
     ID2D1HwndRenderTarget *device_context;
+    ID2D1DeviceContext5 *svg_context;
     ID2D1SolidColorBrush *brush;
     ID2D1StrokeStyle *dashed_stroke;
     IDWriteFactory *dwrite_factory;
@@ -303,8 +327,10 @@ struct TintaApp {
     TintaVec paths;
     TintaVec path_points;
     TintaVec bitmaps;
+    TintaVec svgs;
     TintaVec code_blocks;
     TintaVec mermaid_blocks;
+    TintaVec svg_blocks;
     TintaVec horizontal_regions;
     TintaVec horizontal_scroll_states;
     TintaVec block_collapse_states;
@@ -331,6 +357,7 @@ struct TintaApp {
     TintaResourceErrorFn resource_error;
     void *resource_context;
     size_t max_ast_nodes;
+    size_t max_document_bytes;
     size_t max_ast_depth;
     size_t max_mermaid_nodes;
     size_t max_mermaid_edges;
@@ -341,11 +368,13 @@ struct TintaApp {
     void *uia_provider;
     int hovered_code_block;
     int hovered_mermaid_block;
+    int hovered_svg_block;
     bool tracking_mouse;
     bool document_copy_button_enabled;
     TintaNoticeKind notice_kind;
     int notice_code_block;
     int notice_mermaid_block;
+    int notice_svg_block;
 
     bool selecting;
     size_t selection_anchor;
@@ -440,12 +469,15 @@ bool tinta_text_at(TintaApp *app, float x, float y, const char **url);
 bool tinta_copy_selection(TintaApp *app);
 bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_copy_mermaid_at(TintaApp *app, int x, int y, bool *copied);
+bool tinta_copy_svg_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_copy_document_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_document_button_at(const TintaApp *app, int x, int y);
 int tinta_code_block_at(const TintaApp *app, int x, int y);
 bool tinta_code_button_at(const TintaApp *app, int x, int y);
 int tinta_mermaid_block_at(const TintaApp *app, int x, int y);
 bool tinta_mermaid_button_at(const TintaApp *app, int x, int y);
+int tinta_svg_block_at(const TintaApp *app, int x, int y);
+bool tinta_svg_button_at(const TintaApp *app, int x, int y);
 bool tinta_jump_to_internal_link(TintaApp *app, const char *url);
 
 bool tinta_image_resource_get(TintaApp *app, const char *url,

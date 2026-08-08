@@ -21,6 +21,8 @@
 - Preserved combined nested inline styles, including emphasized and linked
   code spans, and removed the synthetic full-space gap after inline code.
 - Added triple-click logical-line selection with whole-line drag extension.
+- Added best-effort Direct2D SVG rendering for local, remote, and Data URI
+  images, including source Copy and animated standalone-block headers.
 
 - Upstream `tinta` changes have been reviewed through commit `ac521d6`.
 

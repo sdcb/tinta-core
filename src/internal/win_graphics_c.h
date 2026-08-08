@@ -10,6 +10,8 @@
 #define ID2D1Bitmap TintaMingwID2D1Bitmap
 #define ID2D1PathGeometry TintaMingwID2D1PathGeometry
 #define ID2D1GeometrySink TintaMingwID2D1GeometrySink
+#define ID2D1DeviceContext5 TintaMingwID2D1DeviceContext5
+#define ID2D1SvgDocument TintaMingwID2D1SvgDocument
 #endif
 
 #define D2D_USE_C_DEFINITIONS
@@ -23,6 +25,8 @@
 #undef ID2D1Bitmap
 #undef ID2D1PathGeometry
 #undef ID2D1GeometrySink
+#undef ID2D1DeviceContext5
+#undef ID2D1SvgDocument
 
 typedef struct ID2D1Factory ID2D1Factory;
 typedef struct ID2D1HwndRenderTarget ID2D1HwndRenderTarget;
@@ -31,6 +35,8 @@ typedef struct ID2D1StrokeStyle ID2D1StrokeStyle;
 typedef struct ID2D1Bitmap ID2D1Bitmap;
 typedef struct ID2D1PathGeometry ID2D1PathGeometry;
 typedef struct ID2D1GeometrySink ID2D1GeometrySink;
+typedef struct ID2D1DeviceContext5 ID2D1DeviceContext5;
+typedef struct ID2D1SvgDocument ID2D1SvgDocument;
 
 /* MinGW's d2d1.h replaces this shared COM macro without restoring it. */
 #undef DECLARE_INTERFACE
@@ -150,6 +156,8 @@ typedef struct IDWriteFontFallback IDWriteFontFallback;
 typedef struct IDWriteFontFallbackBuilder IDWriteFontFallbackBuilder;
 typedef struct IDWriteRenderingParams IDWriteRenderingParams;
 typedef struct IDWriteTextLayout2 IDWriteTextLayout2;
+typedef struct ID2D1DeviceContext5 ID2D1DeviceContext5;
+typedef struct ID2D1SvgDocument ID2D1SvgDocument;
 typedef void (STDMETHODCALLTYPE *TintaComMethod)(void);
 
 typedef struct TintaIUnknownVtbl {
@@ -364,7 +372,12 @@ typedef struct TintaID2D1HwndRenderTargetVtbl {
     void (STDMETHODCALLTYPE *DrawTextLayout)(ID2D1HwndRenderTarget *, D2D1_POINT_2F,
                                              IDWriteTextLayout *, ID2D1Brush *,
                                              D2D1_DRAW_TEXT_OPTIONS);
-    TintaComMethod unused_before_text_antialias[5];
+    TintaComMethod draw_glyph_run;
+    void (STDMETHODCALLTYPE *SetTransform)(ID2D1HwndRenderTarget *,
+                                           const D2D1_MATRIX_3X2_F *);
+    void (STDMETHODCALLTYPE *GetTransform)(ID2D1HwndRenderTarget *,
+                                           D2D1_MATRIX_3X2_F *);
+    TintaComMethod antialias_mode[2];
     void (STDMETHODCALLTYPE *SetTextAntialiasMode)(ID2D1HwndRenderTarget *,
                                                    D2D1_TEXT_ANTIALIAS_MODE);
     TintaComMethod get_text_antialias_mode;
@@ -450,6 +463,33 @@ struct ID2D1GeometrySink {
     const TintaID2D1GeometrySinkVtbl *lpVtbl;
 };
 
+typedef struct TintaID2D1DeviceContext5Vtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID2D1DeviceContext5 *, REFIID,
+                                                void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(ID2D1DeviceContext5 *);
+    ULONG (STDMETHODCALLTYPE *Release)(ID2D1DeviceContext5 *);
+    TintaComMethod inherited_methods[112];
+    HRESULT (STDMETHODCALLTYPE *CreateSvgDocument)(
+        ID2D1DeviceContext5 *, IStream *, D2D1_SIZE_F, ID2D1SvgDocument **);
+    void (STDMETHODCALLTYPE *DrawSvgDocument)(ID2D1DeviceContext5 *,
+                                              ID2D1SvgDocument *);
+} TintaID2D1DeviceContext5Vtbl;
+
+struct ID2D1DeviceContext5 {
+    const TintaID2D1DeviceContext5Vtbl *lpVtbl;
+};
+
+typedef struct TintaID2D1SvgDocumentVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID2D1SvgDocument *, REFIID,
+                                                void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(ID2D1SvgDocument *);
+    ULONG (STDMETHODCALLTYPE *Release)(ID2D1SvgDocument *);
+} TintaID2D1SvgDocumentVtbl;
+
+struct ID2D1SvgDocument {
+    const TintaID2D1SvgDocumentVtbl *lpVtbl;
+};
+
 static const IID TINTA_IID_IDWRITE_FACTORY = {
     0xb859ee5a, 0xd838, 0x4b5b, {0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48}
 };
@@ -464,6 +504,10 @@ static const IID TINTA_IID_IDWRITE_TEXT_LAYOUT2 = {
 
 static const IID TINTA_IID_ID2D1_DEVICE_CONTEXT = {
     0xe8f7fe7a, 0x191c, 0x466d, {0xad, 0x95, 0x97, 0x56, 0x78, 0xbd, 0xa9, 0x98}
+};
+
+static const IID TINTA_IID_ID2D1_DEVICE_CONTEXT5 = {
+    0x7836d248, 0x68cc, 0x4df6, {0xb9, 0xe8, 0xde, 0x99, 0x1b, 0xf6, 0x2e, 0xb7}
 };
 
 #ifdef __cplusplus
