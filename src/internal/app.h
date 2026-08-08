@@ -117,6 +117,12 @@ typedef struct TintaCodeBlock {
     size_t horizontal_region;
 } TintaCodeBlock;
 
+typedef struct TintaMermaidBlock {
+    RECT rect;
+    wchar_t *text;
+    size_t horizontal_region;
+} TintaMermaidBlock;
+
 typedef enum TintaHorizontalRegionKind {
     TINTA_HORIZONTAL_CODE,
     TINTA_HORIZONTAL_MERMAID
@@ -262,6 +268,7 @@ struct TintaApp {
     TintaVec lines;
     TintaVec bitmaps;
     TintaVec code_blocks;
+    TintaVec mermaid_blocks;
     TintaVec horizontal_regions;
     TintaVec horizontal_scroll_states;
     size_t active_horizontal_region;
@@ -295,10 +302,12 @@ struct TintaApp {
     size_t max_concurrent_downloads;
     void *uia_provider;
     int hovered_code_block;
+    int hovered_mermaid_block;
     bool tracking_mouse;
     bool document_copy_button_enabled;
     TintaNoticeKind notice_kind;
     int notice_code_block;
+    int notice_mermaid_block;
 
     bool selecting;
     size_t selection_anchor;
@@ -385,10 +394,13 @@ void tinta_hit_test(TintaApp *app, float x, float y, size_t *position, const cha
 bool tinta_text_at(TintaApp *app, float x, float y, const char **url);
 bool tinta_copy_selection(TintaApp *app);
 bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied);
+bool tinta_copy_mermaid_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_copy_document_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_document_button_at(const TintaApp *app, int x, int y);
 int tinta_code_block_at(const TintaApp *app, int x, int y);
 bool tinta_code_button_at(const TintaApp *app, int x, int y);
+int tinta_mermaid_block_at(const TintaApp *app, int x, int y);
+bool tinta_mermaid_button_at(const TintaApp *app, int x, int y);
 bool tinta_jump_to_internal_link(TintaApp *app, const char *url);
 
 bool tinta_image_resource_get(TintaApp *app, const char *url,

@@ -174,6 +174,8 @@ int main() {
                       reinterpret_cast<LPARAM>(&capabilities)) ||
         !(capabilities.flags & TINTA_CAPABILITY_STREAMING) ||
         !(capabilities.option_flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON) ||
+        !(capabilities.option_flags & TINTA_OPTION_MERMAID_COPY_BUTTON) ||
+        !(compiled_options.flags & TINTA_OPTION_MERMAID_COPY_BUTTON) ||
         (compiled_options.flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON)) {
         std::cerr << "version/capability query failed\n";
         return 1;
@@ -630,10 +632,50 @@ int main() {
     if (capabilities.flags & TINTA_CAPABILITY_MERMAID) {
         const wchar_t *wide_mermaid =
             L"```mermaid\nflowchart LR\nA --> B --> C --> D --> E --> F --> G --> H --> I --> J\n```";
+        const wchar_t *mermaid_source =
+            L"flowchart LR\nA --> B --> C --> D --> E --> F --> G --> H --> I --> J\n";
         TintaContentSize mermaid_size{};
         if (!load_and_measure(wide_mermaid, &mermaid_size) ||
             mermaid_size.width > 640.5f) {
             std::cerr << "wide Mermaid did not use an internal scrollbar\n";
+            return 1;
+        }
+        RECT mermaid_client{};
+        GetClientRect(view, &mermaid_client);
+        int mermaid_copy_x = mermaid_client.right -
+            static_cast<int>(87.0f * dpi_scale);
+        int mermaid_copy_y = static_cast<int>(42.0f * dpi_scale);
+        SendMessageW(view, WM_MOUSEMOVE, 0,
+                     MAKELPARAM(mermaid_copy_x, mermaid_copy_y));
+        int mermaid_copy_target = copy_notifications + 1;
+        SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                     MAKELPARAM(mermaid_copy_x, mermaid_copy_y));
+        if (!read_clipboard_text(view, &copied_text) ||
+            copied_text != mermaid_source ||
+            copy_notifications != mermaid_copy_target) {
+            std::cerr << "Mermaid copy button did not copy source\n";
+            return 1;
+        }
+        TintaOptions mermaid_options{};
+        mermaid_options.cb_size = sizeof(mermaid_options);
+        if (!SendMessageW(view, TMM_GETOPTIONS, 0,
+                          reinterpret_cast<LPARAM>(&mermaid_options))) {
+            std::cerr << "Mermaid copy option query failed\n";
+            return 1;
+        }
+        mermaid_options.flags &= ~TINTA_OPTION_MERMAID_COPY_BUTTON;
+        if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                          reinterpret_cast<LPARAM>(&mermaid_options))) {
+            std::cerr << "Mermaid copy option disable failed\n";
+            return 1;
+        }
+        int disabled_mermaid_target = copy_notifications;
+        SendMessageW(view, WM_MOUSEMOVE, 0,
+                     MAKELPARAM(mermaid_copy_x, mermaid_copy_y));
+        SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                     MAKELPARAM(mermaid_copy_x, mermaid_copy_y));
+        if (copy_notifications != disabled_mermaid_target) {
+            std::cerr << "disabled Mermaid copy button remained active\n";
             return 1;
         }
     }

@@ -473,19 +473,27 @@ void tinta_layout_clear(TintaApp *app) {
         free(block->text);
         free(block->language);
     }
+    for (i = 0; i < app->mermaid_blocks.len; i++) {
+        TintaMermaidBlock *block = TINTA_VEC_PTR(
+            TintaMermaidBlock, app->mermaid_blocks, i);
+        free(block->text);
+    }
     tinta_vec_clear(&app->text_runs); tinta_vec_clear(&app->rects);
     tinta_vec_clear(&app->lines); tinta_vec_clear(&app->headings);
     tinta_vec_clear(&app->scroll_anchors);
     tinta_vec_clear(&app->hit_entries);
     app->hit_index_dirty = true;
-    tinta_vec_clear(&app->bitmaps); tinta_vec_clear(&app->code_blocks); tinta_str16_clear(&app->doc_text);
+    tinta_vec_clear(&app->bitmaps); tinta_vec_clear(&app->code_blocks);
+    tinta_vec_clear(&app->mermaid_blocks); tinta_str16_clear(&app->doc_text);
     tinta_vec_clear(&app->horizontal_regions);
     app->active_horizontal_region = SIZE_MAX;
     app->hovered_horizontal_region = -1;
     app->dragging_horizontal_region = -1;
     app->hovered_code_block = -1;
+    app->hovered_mermaid_block = -1;
     app->notice_kind = TINTA_NOTICE_NONE;
     app->notice_code_block = -1;
+    app->notice_mermaid_block = -1;
     if (app->hwnd) KillTimer(app->hwnd, TINTA_TIMER_NOTIFICATION);
 }
 
@@ -1587,6 +1595,7 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
     const TintaMermaidParseResult *cached;
     TintaMermaidSize *sizes = NULL; TintaMermaidLayout graph; size_t i; float top = *y;
     size_t region_index = SIZE_MAX;
+    size_t mermaid_block_index = SIZE_MAX;
     TintaVec label_boxes;
     memset(&graph, 0, sizeof(graph));
     if (!tinta_vec_init(&label_boxes, sizeof(D2D1_RECT_F))) return false;
@@ -1632,12 +1641,33 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
                                   scale(app, 28), scale(app, 90));
     if (graph.node_count != parsed.diagram.node_count) goto failed;
     {
+        float block_top = top;
         float block_right = left + maxf(right - left, scale(app, 240));
+        top += code_header_height(app);
         RECT viewport = {(LONG)left, (LONG)top, (LONG)block_right, (LONG)top};
         float offset;
         region_index = begin_horizontal_region(
             app, TINTA_HORIZONTAL_MERMAID, element->source_offset, viewport);
         if (region_index == SIZE_MAX) goto failed;
+        {
+            TintaStr16 wide_source = {0};
+            TintaMermaidBlock block;
+            if (!tinta_utf8_to_utf16(source.data, source.len, &wide_source))
+                goto failed;
+            block.rect.left = (LONG)left;
+            block.rect.top = (LONG)block_top;
+            block.rect.right = (LONG)block_right;
+            block.rect.bottom = (LONG)top;
+            block.text = tinta_wcsdup_n(wide_source.data, wide_source.len);
+            block.horizontal_region = region_index;
+            tinta_str16_destroy(&wide_source);
+            if (!block.text ||
+                !tinta_vec_push(&app->mermaid_blocks, &block)) {
+                free(block.text);
+                goto failed;
+            }
+            mermaid_block_index = app->mermaid_blocks.len - 1;
+        }
         offset = left + maxf(0, (block_right - left - graph.width) * 0.5f);
         float diagram_bottom = top + graph.height;
         size_t exterior_lane = 0;
@@ -1879,6 +1909,13 @@ static bool layout_mermaid(TintaApp *app, const TintaElement *element,
         {
             const TintaHorizontalRegion *region = horizontal_region_const(
                 app, region_index);
+            if (mermaid_block_index < app->mermaid_blocks.len) {
+                TintaMermaidBlock *block = TINTA_VEC_PTR(
+                    TintaMermaidBlock, app->mermaid_blocks,
+                    mermaid_block_index);
+                block->rect.bottom = (LONG)(diagram_bottom +
+                    (region && region->overflow ? ui_scale(app, 14) : 0));
+            }
             *y = diagram_bottom + (region && region->overflow ?
                  ui_scale(app, 14) : 0) + scale(app, 24);
         }
@@ -2071,6 +2108,21 @@ static RECT code_button_rect(const TintaApp *app, const TintaCodeBlock *block) {
     return result;
 }
 
+static RECT mermaid_button_rect(const TintaApp *app,
+                                const TintaMermaidBlock *block) {
+    LONG width = (LONG)ui_scale(app, 78);
+    LONG height = (LONG)ui_scale(app, 28);
+    LONG padding = (LONG)scale(app, 8);
+    LONG header_height = (LONG)code_header_height(app);
+    LONG visible_right = (LONG)(app->scroll_x + viewport_width(app));
+    RECT result;
+    result.right = min(block->rect.right, visible_right) - padding;
+    result.left = result.right - width;
+    result.top = block->rect.top + max(0L, (header_height - height) / 2);
+    result.bottom = result.top + height;
+    return result;
+}
+
 static RECT document_button_rect(const TintaApp *app) {
     LONG width = (LONG)ui_scale(app, 78);
     LONG height = (LONG)ui_scale(app, 28);
@@ -2105,6 +2157,34 @@ bool tinta_code_button_at(const TintaApp *app, int x, int y) {
     RECT button;
     if (index < 0) return false;
     button = code_button_rect(app, TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, index));
+    return document_x >= button.left && document_x <= button.right &&
+           document_y >= button.top && document_y <= button.bottom;
+}
+
+int tinta_mermaid_block_at(const TintaApp *app, int x, int y) {
+    size_t i;
+    float document_x = x - viewport_x(app) + app->scroll_x;
+    float document_y = y + app->scroll_y;
+    for (i = 0; i < app->mermaid_blocks.len; i++) {
+        const TintaMermaidBlock *block = TINTA_VEC_PTR(
+            TintaMermaidBlock, app->mermaid_blocks, i);
+        if (document_x >= block->rect.left &&
+            document_x <= block->rect.right &&
+            document_y >= block->rect.top &&
+            document_y <= block->rect.bottom)
+            return (int)i;
+    }
+    return -1;
+}
+
+bool tinta_mermaid_button_at(const TintaApp *app, int x, int y) {
+    int index = tinta_mermaid_block_at(app, x, y);
+    float document_x = x - viewport_x(app) + app->scroll_x;
+    float document_y = y + app->scroll_y;
+    RECT button;
+    if (index < 0) return false;
+    button = mermaid_button_rect(app, TINTA_VEC_PTR(
+        TintaMermaidBlock, app->mermaid_blocks, index));
     return document_x >= button.left && document_x <= button.right &&
            document_y >= button.top && document_y <= button.bottom;
 }
@@ -2498,6 +2578,55 @@ static void draw_code_header(TintaApp *app, const TintaCodeBlock *block,
     }
 }
 
+static void draw_mermaid_header(TintaApp *app,
+                                const TintaMermaidBlock *block,
+                                float vx, float scroll) {
+    static const wchar_t label_text[] = L"Mermaid";
+    float document_left;
+    float document_right;
+    float padding = scale(app, 12);
+    float top = block->rect.top - scroll;
+    float bottom = top + code_header_height(app);
+    RECT button;
+    D2D1_RECT_F background;
+    IDWriteTextLayout *label = NULL;
+    if (bottom < 0 || top > app->height) return;
+    document_left = maxf((float)block->rect.left, app->scroll_x);
+    document_right = minf((float)block->rect.right,
+                          app->scroll_x + viewport_width(app));
+    if (document_right <= document_left) return;
+    background = (D2D1_RECT_F){document_left + vx, top,
+                               document_right + vx, bottom};
+    set_brush_alpha(app, app->theme->quote,
+                    app->theme->dark ? 0.16f : 0.10f);
+    app->render_target->lpVtbl->FillRectangle(
+        app->render_target, &background, (ID2D1Brush *)app->brush);
+    set_brush_alpha(app, app->theme->quote, 0.45f);
+    app->render_target->lpVtbl->DrawLine(
+        app->render_target,
+        (D2D1_POINT_2F){background.left, background.bottom},
+        (D2D1_POINT_2F){background.right, background.bottom},
+        (ID2D1Brush *)app->brush, maxf(1.0f, scale(app, 1)), NULL);
+    button = mermaid_button_rect(app, block);
+    if (button.left > document_left + padding &&
+        SUCCEEDED(app->dwrite_factory->lpVtbl->CreateTextLayout(
+            app->dwrite_factory, label_text, 7, app->code_format,
+            button.left - document_left - padding * 2,
+            code_header_height(app), &label))) {
+        D2D1_POINT_2F origin = {document_left + padding + vx, top};
+        apply_font_fallback(app, label);
+        label->lpVtbl->SetWordWrapping(
+            label, TINTA_DWRITE_WORD_WRAPPING_NO_WRAP);
+        label->lpVtbl->SetParagraphAlignment(
+            label, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        set_brush_alpha(app, app->theme->syntax_comment, 0.95f);
+        tinta_draw_text_layout(app, origin, label,
+            (ID2D1Brush *)app->brush,
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        label->lpVtbl->Release(label);
+    }
+}
+
 static void draw_copy_button(TintaApp *app, D2D1_RECT_F rect,
                              bool copied, bool hovered) {
     const wchar_t *button_text = copied ? L"Copied" : L"Copy";
@@ -2649,6 +2778,10 @@ void tinta_render(TintaApp *app) {
         for (i = 0; i < app->code_blocks.len; i++)
             draw_code_header(app,
                 TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, i), vx, scroll);
+        for (i = 0; i < app->mermaid_blocks.len; i++)
+            draw_mermaid_header(app,
+                TINTA_VEC_PTR(TintaMermaidBlock, app->mermaid_blocks, i),
+                vx, scroll);
         if (app->search_query.len && app->viewer_search_matches.len) {
             size_t match_index = 0;
             size_t run_index = 0;
@@ -2726,6 +2859,24 @@ void tinta_render(TintaApp *app) {
             if (button.bottom > 0 && button.top < app->height)
                 draw_copy_button(app, button, copied, over_button);
         }
+        if (app->hovered_mermaid_block >= 0 &&
+            (size_t)app->hovered_mermaid_block < app->mermaid_blocks.len) {
+            TintaMermaidBlock *block = TINTA_VEC_PTR(
+                TintaMermaidBlock, app->mermaid_blocks,
+                (size_t)app->hovered_mermaid_block);
+            bool copied = app->notice_kind == TINTA_NOTICE_COPIED &&
+                          app->notice_mermaid_block ==
+                          app->hovered_mermaid_block;
+            bool over_button = tinta_mermaid_button_at(
+                app, app->mouse_x, app->mouse_y);
+            RECT document_button = mermaid_button_rect(app, block);
+            D2D1_RECT_F button = {(float)document_button.left + vx,
+                                  (float)document_button.top - scroll,
+                                  (float)document_button.right + vx,
+                                  (float)document_button.bottom - scroll};
+            if (button.bottom > 0 && button.top < app->height)
+                draw_copy_button(app, button, copied, over_button);
+        }
         app->render_target->lpVtbl->PopAxisAlignedClip(app->render_target);
         for (i = 0; i < app->horizontal_regions.len; i++)
             draw_horizontal_region_scrollbar(app, i);
@@ -2737,7 +2888,8 @@ void tinta_render(TintaApp *app) {
                 (float)document_button.right + vx,
                 (float)document_button.bottom - scroll};
             bool copied = app->notice_kind == TINTA_NOTICE_COPIED &&
-                          app->notice_code_block < 0;
+                          app->notice_code_block < 0 &&
+                          app->notice_mermaid_block < 0;
             if (document_button.left >= app->scroll_x &&
                 button.bottom > 0 && button.top < app->height)
                 draw_copy_button(app, button, copied,
@@ -3023,12 +3175,15 @@ bool tinta_text_at(TintaApp *app, float x, float y, const char **url) {
     return hit_test_linear(app, x, y, NULL, url, &candidate);
 }
 
-static void show_copied_notice(TintaApp *app, int code_block) {
+static void show_copied_notice(TintaApp *app, int code_block,
+                               int mermaid_block) {
     app->notice_kind = TINTA_NOTICE_COPIED;
     app->notice_code_block = code_block;
+    app->notice_mermaid_block = mermaid_block;
     if (!SetTimer(app->hwnd, TINTA_TIMER_NOTIFICATION, 1000, NULL)) {
         app->notice_kind = TINTA_NOTICE_NONE;
         app->notice_code_block = -1;
+        app->notice_mermaid_block = -1;
     }
     InvalidateRect(app->hwnd, NULL, FALSE);
 }
@@ -3059,7 +3214,22 @@ bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied) {
     block = TINTA_VEC_PTR(TintaCodeBlock, app->code_blocks, (size_t)index);
     success = tinta_set_clipboard_text(
         app->hwnd, block->text, wcslen(block->text));
-    if (success) show_copied_notice(app, index);
+    if (success) show_copied_notice(app, index, -1);
+    if (copied) *copied = success;
+    return true;
+}
+
+bool tinta_copy_mermaid_at(TintaApp *app, int x, int y, bool *copied) {
+    int index = tinta_mermaid_block_at(app, x, y);
+    TintaMermaidBlock *block;
+    bool success;
+    if (copied) *copied = false;
+    if (index < 0 || !tinta_mermaid_button_at(app, x, y)) return false;
+    block = TINTA_VEC_PTR(
+        TintaMermaidBlock, app->mermaid_blocks, (size_t)index);
+    success = tinta_set_clipboard_text(
+        app->hwnd, block->text, wcslen(block->text));
+    if (success) show_copied_notice(app, -1, index);
     if (copied) *copied = success;
     return true;
 }
@@ -3075,7 +3245,7 @@ bool tinta_copy_document_at(TintaApp *app, int x, int y, bool *copied) {
             app->hwnd, wide.data ? wide.data : L"", wide.len);
     }
     tinta_str16_destroy(&wide);
-    if (success) show_copied_notice(app, -1);
+    if (success) show_copied_notice(app, -1, -1);
     if (copied) *copied = success;
     return true;
 }

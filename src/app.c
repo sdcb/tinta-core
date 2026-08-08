@@ -624,7 +624,9 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     app->zoom = settings->zoom;
     app->layout_dirty = true;
     app->hovered_code_block = -1;
+    app->hovered_mermaid_block = -1;
     app->notice_code_block = -1;
+    app->notice_mermaid_block = -1;
     app->active_horizontal_region = SIZE_MAX;
     app->hovered_horizontal_region = -1;
     app->dragging_horizontal_region = -1;
@@ -636,6 +638,7 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
     tinta_vec_init(&app->lines, sizeof(TintaDrawLine));
     tinta_vec_init(&app->bitmaps, sizeof(TintaDrawBitmap));
     tinta_vec_init(&app->code_blocks, sizeof(TintaCodeBlock));
+    tinta_vec_init(&app->mermaid_blocks, sizeof(TintaMermaidBlock));
     tinta_vec_init(&app->horizontal_regions, sizeof(TintaHorizontalRegion));
     tinta_vec_init(&app->horizontal_scroll_states,
                    sizeof(TintaHorizontalScrollState));
@@ -703,6 +706,7 @@ void tinta_app_destroy(TintaApp *app) {
     tinta_vec_destroy(&app->lines);
     tinta_vec_destroy(&app->bitmaps);
     tinta_vec_destroy(&app->code_blocks);
+    tinta_vec_destroy(&app->mermaid_blocks);
     tinta_vec_destroy(&app->horizontal_regions);
     tinta_vec_destroy(&app->horizontal_scroll_states);
     tinta_vec_destroy(&app->headings);
