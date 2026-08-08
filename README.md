@@ -87,6 +87,9 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 - The control owns parsing, Direct2D drawing, scrolling, selection, zoom,
   search highlights, TOC data, image decoding and UI Automation. File dialogs,
   persistence, search UI and context menus belong to the host.
+- Double-click selects a word. Triple-click selects the complete logical text
+  line, including its trailing newline, and dragging the third click extends
+  the selection by whole logical lines rather than visual wraps.
 - With keyboard navigation enabled, `Ctrl+0` resets zoom to 100% and
   `Ctrl++`/`Ctrl+-` adjust it by 10%. `Ctrl+mouse wheel` uses the same steps
   when mouse zoom is enabled.

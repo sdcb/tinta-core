@@ -52,6 +52,17 @@ typedef struct TintaControl {
     TintaPageMargins page_margins;
     unsigned int notification_depth;
     TintaStreamAsync *stream_async;
+    ULONGLONG double_click_tick;
+    POINT double_click_point;
+    ULONGLONG triple_click_tick;
+    POINT triple_click_point;
+    size_t line_selection_start;
+    size_t line_selection_end;
+    size_t line_notified_anchor;
+    size_t line_notified_focus;
+    bool double_click_armed;
+    bool suppress_next_double_click;
+    bool line_selecting;
 } TintaControl;
 
 static SRWLOCK g_class_lock = SRWLOCK_INIT;
@@ -65,6 +76,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                                                 WPARAM wparam, LPARAM lparam);
 static void control_destroy_state(TintaControl *control);
 static void control_activate_link(TintaControl *control, const char *url);
+static void control_reset_multi_click(TintaControl *control);
 
 static void control_add_ref(TintaControl *control) {
     if (control) InterlockedIncrement(&control->references);
@@ -615,6 +627,7 @@ static bool control_set_document(TintaControl *control,
     control_stream_stop(control);
     tinta_str16_destroy(&control->base_uri);
     control->base_uri = proposed_base;
+    control_reset_multi_click(control);
     control->ready_notified = false;
     return true;
 }
@@ -658,6 +671,109 @@ static int selection_character_class(wchar_t value) {
         (value >= L'0' && value <= L'9') || value == L'_') return 1;
     if ((unsigned int)value > 127 && !iswspace(value)) return 2;
     return 0;
+}
+
+static bool control_click_in_system_bounds(ULONGLONG earlier,
+                                           const POINT *earlier_point,
+                                           ULONGLONG now,
+                                           int x, int y) {
+    int half_width;
+    int half_height;
+    if (!earlier || !earlier_point || now < earlier ||
+        now - earlier > GetDoubleClickTime())
+        return false;
+    half_width = max(1, GetSystemMetrics(SM_CXDOUBLECLK) / 2);
+    half_height = max(1, GetSystemMetrics(SM_CYDOUBLECLK) / 2);
+    return abs(x - earlier_point->x) <= half_width &&
+           abs(y - earlier_point->y) <= half_height;
+}
+
+static void control_logical_line_range(const TintaApp *view, size_t position,
+                                       size_t *start, size_t *end) {
+    size_t line_start;
+    size_t line_end;
+    if (!view || !start || !end) return;
+    position = min(position, view->doc_text.len);
+    line_start = position;
+    while (line_start && view->doc_text.data[line_start - 1] != L'\n')
+        line_start--;
+    line_end = position;
+    while (line_end < view->doc_text.len &&
+           view->doc_text.data[line_end] != L'\n')
+        line_end++;
+    if (line_end < view->doc_text.len) line_end++;
+    *start = line_start;
+    *end = line_end;
+}
+
+static void control_reset_multi_click(TintaControl *control) {
+    if (!control) return;
+    if (control->line_selecting &&
+        GetCapture() == control->view.hwnd)
+        ReleaseCapture();
+    control->double_click_armed = false;
+    control->suppress_next_double_click = false;
+    control->line_selecting = false;
+}
+
+static bool control_begin_line_selection(TintaControl *control,
+                                         int x, int y) {
+    ULONGLONG now;
+    size_t position;
+    size_t start;
+    size_t end;
+    if (!control || !(control->options.flags & TINTA_OPTION_SELECTION) ||
+        !control->double_click_armed)
+        return false;
+    now = GetTickCount64();
+    if (!control_click_in_system_bounds(control->double_click_tick,
+            &control->double_click_point, now, x, y)) {
+        control->double_click_armed = false;
+        return false;
+    }
+    control->double_click_armed = false;
+    if (!tinta_text_at(&control->view, (float)x, (float)y, NULL))
+        return false;
+    tinta_hit_test(&control->view, (float)x, (float)y, &position, NULL);
+    control_logical_line_range(&control->view, position, &start, &end);
+    control->line_selection_start = start;
+    control->line_selection_end = end;
+    control->view.selection_anchor = start;
+    control->view.selection_focus = end;
+    control->view.selecting = false;
+    control->line_selecting = true;
+    control->line_notified_anchor = start;
+    control->line_notified_focus = end;
+    control->triple_click_tick = now;
+    control->triple_click_point.x = x;
+    control->triple_click_point.y = y;
+    control->suppress_next_double_click = true;
+    SetCapture(control->view.hwnd);
+    InvalidateRect(control->view.hwnd, NULL, FALSE);
+    notify_code(control, TMN_SELECTIONCHANGED);
+    tinta_uia_raise_selection_changed(&control->view);
+    return true;
+}
+
+static void control_extend_line_selection(TintaControl *control,
+                                          int x, int y) {
+    size_t position;
+    size_t start;
+    size_t end;
+    if (!control || !control->line_selecting) return;
+    tinta_hit_test(&control->view, (float)x, (float)y, &position, NULL);
+    control_logical_line_range(&control->view, position, &start, &end);
+    if (end <= control->line_selection_start) {
+        control->view.selection_anchor = control->line_selection_end;
+        control->view.selection_focus = start;
+    } else if (start >= control->line_selection_end) {
+        control->view.selection_anchor = control->line_selection_start;
+        control->view.selection_focus = end;
+    } else {
+        control->view.selection_anchor = control->line_selection_start;
+        control->view.selection_focus = control->line_selection_end;
+    }
+    InvalidateRect(control->view.hwnd, NULL, FALSE);
 }
 
 static bool find_matches_at(const TintaControl *control, size_t position,
@@ -803,6 +919,7 @@ static void control_begin_selection(TintaControl *control, int x, int y) {
     tinta_hit_test(&control->view, (float)x, (float)y,
                    &control->view.selection_anchor, &url);
     control->view.selection_focus = control->view.selection_anchor;
+    control->line_selecting = false;
     control->view.selecting = true;
     SetCapture(control->view.hwnd);
     InvalidateRect(control->view.hwnd, NULL, FALSE);
@@ -1153,8 +1270,11 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
                 view->layout_dirty = true;
                 InvalidateRect(view->hwnd, NULL, FALSE);
             }
-            if (!(control->options.flags & TINTA_OPTION_SELECTION))
+            if (!(control->options.flags & TINTA_OPTION_SELECTION)) {
                 view->selection_anchor = view->selection_focus = 0;
+                view->selecting = false;
+                control_reset_multi_click(control);
+            }
             if ((old_flags ^ control->options.flags) &
                 TINTA_OPTION_DOCUMENT_COPY_BUTTON) {
                 view->document_copy_button_enabled =
@@ -1609,6 +1729,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 control->view.mouse_y = y;
                 SetFocus(hwnd);
                 if (tinta_scrollbar_begin_drag(&control->view, x, y)) {
+                    control_reset_multi_click(control);
                     SetCapture(hwnd);
                 } else {
                     bool handled = false;
@@ -1647,7 +1768,12 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                                      16, NULL);
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
-                    if (!handled) control_begin_selection(control, x, y);
+                    if (handled) {
+                        control_reset_multi_click(control);
+                    } else if (!control_begin_line_selection(control, x, y)) {
+                        control->suppress_next_double_click = false;
+                        control_begin_selection(control, x, y);
+                    }
                 }
             }
             return 0;
@@ -1681,6 +1807,8 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 if (tinta_scrollbar_drag(&control->view, x, y)) {
                     if (control->view.dragging_horizontal_region < 0)
                         notify_code(control, TMN_SCROLLCHANGED);
+                } else if (control->line_selecting) {
+                    control_extend_line_selection(control, x, y);
                 } else if (control->view.selecting) {
                     tinta_hit_test(&control->view, (float)x, (float)y,
                                    &control->view.selection_focus, NULL);
@@ -1735,12 +1863,38 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
             return 0;
         case WM_LBUTTONDBLCLK:
             if (control && (control->options.flags & TINTA_OPTION_SELECTION)) {
+                int x = GET_X_LPARAM(lparam);
+                int y = GET_Y_LPARAM(lparam);
+                ULONGLONG now = GetTickCount64();
                 size_t position = 0;
                 size_t start;
                 size_t end;
                 int character_class = 0;
-                tinta_hit_test(&control->view, (float)GET_X_LPARAM(lparam),
-                    (float)GET_Y_LPARAM(lparam), &position, NULL);
+                if (control->suppress_next_double_click &&
+                    control_click_in_system_bounds(control->triple_click_tick,
+                        &control->triple_click_point, now, x, y)) {
+                    control->suppress_next_double_click = false;
+                    control->double_click_armed = false;
+                    control_begin_selection(control, x, y);
+                    return 0;
+                }
+                control->suppress_next_double_click = false;
+                if (tinta_scrollbar_begin_drag(&control->view, x, y)) {
+                    control_reset_multi_click(control);
+                    SetCapture(hwnd);
+                    return 0;
+                }
+                if (((control->options.flags &
+                      TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
+                     tinta_document_button_at(&control->view, x, y)) ||
+                    tinta_mermaid_button_at(&control->view, x, y) ||
+                    tinta_code_button_at(&control->view, x, y) ||
+                    tinta_collapsible_header_at(&control->view, x, y)) {
+                    control_reset_multi_click(control);
+                    return 0;
+                }
+                tinta_hit_test(&control->view, (float)x, (float)y,
+                               &position, NULL);
                 start = end = position;
                 if (position < control->view.doc_text.len)
                     character_class = selection_character_class(
@@ -1762,6 +1916,12 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 control->view.selection_anchor = start;
                 control->view.selection_focus = end;
                 control->view.selecting = false;
+                control->line_selecting = false;
+                control->double_click_tick = now;
+                control->double_click_point.x = x;
+                control->double_click_point.y = y;
+                control->double_click_armed =
+                    tinta_text_at(&control->view, (float)x, (float)y, NULL);
                 InvalidateRect(hwnd, NULL, FALSE);
                 notify_code(control, TMN_SELECTIONCHANGED);
                 tinta_uia_raise_selection_changed(&control->view);
@@ -1783,6 +1943,21 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam))) {
                 ReleaseCapture();
                 notify_code(control, TMN_SCROLLCHANGED);
+                return 0;
+            }
+            if (control && control->line_selecting) {
+                control_extend_line_selection(control,
+                    GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+                control->line_selecting = false;
+                ReleaseCapture();
+                if (control->view.selection_anchor !=
+                        control->line_notified_anchor ||
+                    control->view.selection_focus !=
+                        control->line_notified_focus) {
+                    notify_code(control, TMN_SELECTIONCHANGED);
+                    tinta_uia_raise_selection_changed(&control->view);
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
             if (control && control->view.selecting) {

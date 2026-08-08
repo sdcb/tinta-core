@@ -20,6 +20,7 @@
   reducing crossings and removing multi-bend exterior routing lanes.
 - Preserved combined nested inline styles, including emphasized and linked
   code spans, and removed the synthetic full-space gap after inline code.
+- Added triple-click logical-line selection with whole-line drag extension.
 
 - Upstream `tinta` changes have been reviewed through commit `ac521d6`.
 

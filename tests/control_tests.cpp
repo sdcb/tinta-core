@@ -16,6 +16,7 @@ static int autosize_notifications;
 static int resource_error_notifications;
 static int copy_notifications;
 static int scroll_notifications;
+static int selection_notifications;
 static bool block_resources = true;
 static bool post_quit_on_destroy;
 static int destroy_quit_code;
@@ -44,6 +45,8 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
             copy_notifications++;
         if (header && header->code == TMN_SCROLLCHANGED)
             scroll_notifications++;
+        if (header && header->code == TMN_SELECTIONCHANGED)
+            selection_notifications++;
         if (header && header->code == TMN_LINKACTIVATE) {
             link_notifications++;
             return TRUE;
@@ -231,6 +234,192 @@ int main() {
     }
     ShowWindow(parent, SW_SHOWNOACTIVATE);
     UpdateWindow(parent);
+    float dpi_scale = GetDpiForWindow(view) / 96.0f;
+    int text_x = static_cast<int>(45.0f * dpi_scale);
+    int first_line_y = static_cast<int>(25.0f * dpi_scale);
+    int third_line_y = static_cast<int>(79.0f * dpi_scale);
+    const wchar_t *line_markdown =
+        L"alpha beta  \n"
+        L"gamma delta  \n"
+        L"\u6700\u540e\u4e00\u884c";
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(line_markdown));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    TintaSelection word_selection{};
+    word_selection.cb_size = sizeof(word_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&word_selection)) ||
+        word_selection.start != 0 || word_selection.end != 5) {
+        std::cerr << "double click word selection regressed\n";
+        return 1;
+    }
+    int triple_notification_target = selection_notifications + 1;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    TintaSelection line_selection{};
+    line_selection.cb_size = sizeof(line_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&line_selection)) ||
+        line_selection.start != 0 || line_selection.end != 11 ||
+        selection_notifications != triple_notification_target) {
+        std::cerr << "triple click did not select the logical line\n";
+        return 1;
+    }
+    SendMessageW(view, WM_COPY, 0, 0);
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != L"alpha beta\n") {
+        std::cerr << "triple click did not include the trailing newline\n";
+        return 1;
+    }
+    SendMessageW(view, WM_MOUSEMOVE, MK_LBUTTON,
+                 MAKELPARAM(text_x, third_line_y));
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, third_line_y));
+    line_selection = {};
+    line_selection.cb_size = sizeof(line_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&line_selection)) ||
+        line_selection.start != 0 || line_selection.end != 28) {
+        std::cerr << "triple click drag did not extend by logical lines\n";
+        return 1;
+    }
+    SendMessageW(view, WM_COPY, 0, 0);
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != L"alpha beta\ngamma delta\n\u6700\u540e\u4e00\u884c\n") {
+        std::cerr << "logical line drag copied an incomplete range\n";
+        return 1;
+    }
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(line_markdown));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, third_line_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(text_x, third_line_y));
+    SendMessageW(view, WM_MOUSEMOVE, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, first_line_y));
+    line_selection = {};
+    line_selection.cb_size = sizeof(line_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&line_selection)) ||
+        line_selection.start != 0 || line_selection.end != 28) {
+        std::cerr << "reverse triple click drag did not preserve whole lines\n";
+        return 1;
+    }
+    const wchar_t *empty_line_markdown = L"first\n\nthird";
+    int second_paragraph_y = static_cast<int>(65.0f * dpi_scale);
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(empty_line_markdown));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_MOUSEMOVE, MK_LBUTTON,
+                 MAKELPARAM(text_x, second_paragraph_y));
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, second_paragraph_y));
+    SendMessageW(view, WM_COPY, 0, 0);
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != L"first\n\nthird\n") {
+        std::cerr << "logical line drag did not include an empty line\n";
+        return 1;
+    }
+    const wchar_t *wrapped_line =
+        L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    MoveWindow(view, 0, 0, 220, 480, TRUE);
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(wrapped_line));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, first_line_y));
+    line_selection = {};
+    line_selection.cb_size = sizeof(line_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&line_selection)) ||
+        line_selection.start != 0 || line_selection.end != 65) {
+        std::cerr << "visual wrapping split a logical line selection\n";
+        return 1;
+    }
+    MoveWindow(view, 0, 0, 640, 480, TRUE);
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(line_markdown));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, first_line_y));
+    line_selection = {};
+    line_selection.cb_size = sizeof(line_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&line_selection)) ||
+        line_selection.start != line_selection.end) {
+        std::cerr << "fourth click did not restart ordinary selection\n";
+        return 1;
+    }
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(wrapped_line));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    int distant_x = text_x + max(20, GetSystemMetrics(SM_CXDOUBLECLK));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(distant_x, first_line_y));
+    line_selection = {};
+    line_selection.cb_size = sizeof(line_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&line_selection)) ||
+        line_selection.start != line_selection.end) {
+        std::cerr << "distant third click ignored the system click bounds\n";
+        return 1;
+    }
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(distant_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    Sleep(GetDoubleClickTime() + 50);
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    line_selection = {};
+    line_selection.cb_size = sizeof(line_selection);
+    if (!SendMessageW(view, TMM_GETSELECTION, 0,
+                      reinterpret_cast<LPARAM>(&line_selection)) ||
+        line_selection.start != line_selection.end) {
+        std::cerr << "late third click ignored the system click timeout: "
+                  << line_selection.start << ", " << line_selection.end << "\n";
+        return 1;
+    }
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, first_line_y));
+    int link_target = link_notifications;
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(
+                     L"[linked text](https://example.test) trailing"));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    SendMessageW(view, WM_LBUTTONDBLCLK, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(text_x, first_line_y));
+    SendMessageW(view, WM_LBUTTONUP, 0,
+                 MAKELPARAM(text_x, first_line_y));
+    if (link_notifications != link_target) {
+        std::cerr << "triple click activated a link\n";
+        return 1;
+    }
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(L"```text\ncopy me\n```"));
     SendMessageW(view, WM_PAINT, 0, 0);
@@ -243,7 +432,6 @@ int main() {
     }
     SendMessageW(view, TMM_CLEARSELECTION, 0, 0);
     ValidateRect(view, nullptr);
-    float dpi_scale = GetDpiForWindow(view) / 96.0f;
     RECT code_client{};
     GetClientRect(view, &code_client);
     int copy_x = code_client.right - static_cast<int>(74.0f * dpi_scale);
