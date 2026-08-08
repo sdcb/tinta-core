@@ -98,8 +98,7 @@ static float clamp_float(float value, float minimum, float maximum) {
 
 static DWORD default_option_flags(void) {
     DWORD flags = TINTA_OPTION_SELECTION | TINTA_OPTION_KEYBOARD_NAVIGATION |
-                  TINTA_OPTION_MOUSE_ZOOM | TINTA_OPTION_CODE_COPY_BUTTON |
-                  TINTA_OPTION_MERMAID_COPY_BUTTON |
+                  TINTA_OPTION_MOUSE_ZOOM |
                   TINTA_OPTION_OPEN_UNHANDLED_LINKS;
 #if TINTA_ENABLE_LOCAL_IMAGES
     flags |= TINTA_OPTION_LOCAL_IMAGES;
@@ -114,8 +113,6 @@ static DWORD supported_option_flags(void) {
     DWORD flags = TINTA_OPTION_SELECTION |
                   TINTA_OPTION_KEYBOARD_NAVIGATION |
                   TINTA_OPTION_MOUSE_ZOOM |
-                  TINTA_OPTION_CODE_COPY_BUTTON |
-                  TINTA_OPTION_MERMAID_COPY_BUTTON |
                   TINTA_OPTION_DOCUMENT_COPY_BUTTON |
                   TINTA_OPTION_OPEN_UNHANDLED_LINKS;
 #if TINTA_ENABLE_LOCAL_IMAGES
@@ -1143,22 +1140,6 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
             if (!(control->options.flags & TINTA_OPTION_SELECTION))
                 view->selection_anchor = view->selection_focus = 0;
             if ((old_flags ^ control->options.flags) &
-                TINTA_OPTION_CODE_COPY_BUTTON) {
-                if (!(control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON)) {
-                    if (view->notice_kind == TINTA_NOTICE_COPIED &&
-                        view->notice_code_block >= 0) {
-                        KillTimer(view->hwnd, TINTA_TIMER_NOTIFICATION);
-                        view->notice_kind = TINTA_NOTICE_NONE;
-                        view->notice_code_block = -1;
-                        view->notice_mermaid_block = -1;
-                    }
-                }
-                view->hovered_code_block =
-                    (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) ?
-                    tinta_code_block_at(view, view->mouse_x, view->mouse_y) : -1;
-                InvalidateRect(view->hwnd, NULL, FALSE);
-            }
-            if ((old_flags ^ control->options.flags) &
                 TINTA_OPTION_DOCUMENT_COPY_BUTTON) {
                 view->document_copy_button_enabled =
                     (control->options.flags &
@@ -1172,24 +1153,6 @@ static LRESULT control_custom_message(TintaControl *control, UINT message,
                     view->notice_code_block = -1;
                     view->notice_mermaid_block = -1;
                 }
-                InvalidateRect(view->hwnd, NULL, FALSE);
-            }
-            if ((old_flags ^ control->options.flags) &
-                TINTA_OPTION_MERMAID_COPY_BUTTON) {
-                if (!(control->options.flags &
-                      TINTA_OPTION_MERMAID_COPY_BUTTON) &&
-                    view->notice_kind == TINTA_NOTICE_COPIED &&
-                    view->notice_mermaid_block >= 0) {
-                    KillTimer(view->hwnd, TINTA_TIMER_NOTIFICATION);
-                    view->notice_kind = TINTA_NOTICE_NONE;
-                    view->notice_code_block = -1;
-                    view->notice_mermaid_block = -1;
-                }
-                view->hovered_mermaid_block =
-                    (control->options.flags &
-                     TINTA_OPTION_MERMAID_COPY_BUTTON) ?
-                    tinta_mermaid_block_at(
-                        view, view->mouse_x, view->mouse_y) : -1;
                 InvalidateRect(view->hwnd, NULL, FALSE);
             }
             return TRUE;
@@ -1642,9 +1605,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                         else
                             notify_error(control, E_FAIL, L"copy-document",
                                 L"The Markdown document could not be copied to the clipboard.");
-                    } else if ((control->options.flags &
-                                TINTA_OPTION_MERMAID_COPY_BUTTON) &&
-                        tinta_copy_mermaid_at(
+                    } else if (tinta_copy_mermaid_at(
                             &control->view, x, y, &copied)) {
                         handled = true;
                         if (copied)
@@ -1652,9 +1613,8 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                         else
                             notify_error(control, E_FAIL, L"copy-mermaid",
                                 L"The Mermaid source could not be copied to the clipboard.");
-                    } else if ((control->options.flags &
-                                TINTA_OPTION_CODE_COPY_BUTTON) &&
-                        tinta_copy_code_at(&control->view, x, y, &copied)) {
+                    } else if (tinta_copy_code_at(
+                            &control->view, x, y, &copied)) {
                         handled = true;
                         if (copied)
                             notify_code(control, TMN_COPYCOMPLETED);
@@ -1670,20 +1630,17 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
             if (control) {
                 int x = GET_X_LPARAM(lparam);
                 int y = GET_Y_LPARAM(lparam);
-                bool old_over_copy_button =
-                    (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) &&
-                    tinta_code_button_at(&control->view,
-                        control->view.mouse_x, control->view.mouse_y);
+                bool old_over_copy_button = tinta_code_button_at(
+                    &control->view,
+                    control->view.mouse_x, control->view.mouse_y);
                 bool old_over_document_button =
                     (control->options.flags &
                      TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
                     tinta_document_button_at(&control->view,
                         control->view.mouse_x, control->view.mouse_y);
-                bool old_over_mermaid_button =
-                    (control->options.flags &
-                     TINTA_OPTION_MERMAID_COPY_BUTTON) &&
-                    tinta_mermaid_button_at(&control->view,
-                        control->view.mouse_x, control->view.mouse_y);
+                bool old_over_mermaid_button = tinta_mermaid_button_at(
+                    &control->view,
+                    control->view.mouse_x, control->view.mouse_y);
                 control->view.mouse_x = x;
                 control->view.mouse_y = y;
                 if (!control->view.tracking_mouse) {
@@ -1714,12 +1671,9 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                     hover_changed = tinta_scrollbar_update_hover(
                         &control->view, x, y);
                     control->view.hovered_code_block =
-                        (control->options.flags & TINTA_OPTION_CODE_COPY_BUTTON) ?
-                        tinta_code_block_at(&control->view, x, y) : -1;
+                        tinta_code_block_at(&control->view, x, y);
                     control->view.hovered_mermaid_block =
-                        (control->options.flags &
-                         TINTA_OPTION_MERMAID_COPY_BUTTON) ?
-                        tinta_mermaid_block_at(&control->view, x, y) : -1;
+                        tinta_mermaid_block_at(&control->view, x, y);
                     over_copy_button =
                         control->view.hovered_code_block >= 0 &&
                         tinta_code_button_at(&control->view, x, y);

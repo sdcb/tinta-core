@@ -174,8 +174,8 @@ int main() {
                       reinterpret_cast<LPARAM>(&capabilities)) ||
         !(capabilities.flags & TINTA_CAPABILITY_STREAMING) ||
         !(capabilities.option_flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON) ||
-        !(capabilities.option_flags & TINTA_OPTION_MERMAID_COPY_BUTTON) ||
-        !(compiled_options.flags & TINTA_OPTION_MERMAID_COPY_BUTTON) ||
+        (capabilities.option_flags & (0x0008u | 0x0100u)) ||
+        (compiled_options.flags & (0x0008u | 0x0100u)) ||
         (compiled_options.flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON)) {
         std::cerr << "version/capability query failed\n";
         return 1;
@@ -257,6 +257,32 @@ int main() {
         copied_text != L"copy me\n" ||
         copy_notifications != copy_target) {
         std::cerr << "code copy button did not copy on first hover\n";
+        return 1;
+    }
+    TintaOptions no_copy_options{};
+    no_copy_options.cb_size = sizeof(no_copy_options);
+    no_copy_options.flags = 0x0008u | 0x0100u;
+    if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&no_copy_options)) ||
+        !SendMessageW(view, TMM_GETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&no_copy_options)) ||
+        no_copy_options.flags != 0) {
+        std::cerr << "removed copy option bits were not filtered\n";
+        return 1;
+    }
+    copy_target = copy_notifications + 1;
+    SendMessageW(view, WM_MOUSEMOVE, 0, MAKELPARAM(copy_x, copy_y));
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(copy_x, copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != L"copy me\n" ||
+        copy_notifications != copy_target) {
+        std::cerr << "code copy depended on removed options\n";
+        return 1;
+    }
+    if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                      reinterpret_cast<LPARAM>(&compiled_options))) {
+        std::cerr << "default options restore failed\n";
         return 1;
     }
     SendMessageW(view, WM_SETTEXT, 0,
@@ -660,22 +686,30 @@ int main() {
         mermaid_options.cb_size = sizeof(mermaid_options);
         if (!SendMessageW(view, TMM_GETOPTIONS, 0,
                           reinterpret_cast<LPARAM>(&mermaid_options))) {
-            std::cerr << "Mermaid copy option query failed\n";
+            std::cerr << "Mermaid options query failed\n";
             return 1;
         }
-        mermaid_options.flags &= ~TINTA_OPTION_MERMAID_COPY_BUTTON;
+        TintaOptions saved_mermaid_options = mermaid_options;
+        mermaid_options.flags = 0;
         if (!SendMessageW(view, TMM_SETOPTIONS, 0,
                           reinterpret_cast<LPARAM>(&mermaid_options))) {
-            std::cerr << "Mermaid copy option disable failed\n";
+            std::cerr << "empty options update failed\n";
             return 1;
         }
-        int disabled_mermaid_target = copy_notifications;
+        int unconditional_mermaid_target = copy_notifications + 1;
         SendMessageW(view, WM_MOUSEMOVE, 0,
                      MAKELPARAM(mermaid_copy_x, mermaid_copy_y));
         SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
                      MAKELPARAM(mermaid_copy_x, mermaid_copy_y));
-        if (copy_notifications != disabled_mermaid_target) {
-            std::cerr << "disabled Mermaid copy button remained active\n";
+        if (!read_clipboard_text(view, &copied_text) ||
+            copied_text != mermaid_source ||
+            copy_notifications != unconditional_mermaid_target) {
+            std::cerr << "Mermaid copy depended on removed options\n";
+            return 1;
+        }
+        if (!SendMessageW(view, TMM_SETOPTIONS, 0,
+                          reinterpret_cast<LPARAM>(&saved_mermaid_options))) {
+            std::cerr << "Mermaid options restore failed\n";
             return 1;
         }
     }

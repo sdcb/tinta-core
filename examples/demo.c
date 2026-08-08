@@ -123,8 +123,6 @@ static void load_default_document(void) {
     options.flags = TINTA_OPTION_SELECTION |
                     TINTA_OPTION_KEYBOARD_NAVIGATION |
                     TINTA_OPTION_MOUSE_ZOOM |
-                    TINTA_OPTION_CODE_COPY_BUTTON |
-                    TINTA_OPTION_MERMAID_COPY_BUTTON |
                     TINTA_OPTION_DOCUMENT_COPY_BUTTON |
                     TINTA_OPTION_LOCAL_IMAGES |
                     TINTA_OPTION_REMOTE_IMAGES |

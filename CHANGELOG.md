@@ -8,8 +8,8 @@
   `TMM_SETPAGEMARGINS` and `TMM_GETPAGEMARGINS`.
 - Moved wide code and Mermaid content into block-local horizontal scrolling,
   while retaining a 240-DIP minimum block width for very narrow hosts.
-- Added an independently configurable Mermaid source Copy button through
-  `TINTA_OPTION_MERMAID_COPY_BUTTON`, placed in a dedicated Mermaid header.
+- Made source Copy/Copied controls a permanent part of the Code and Mermaid
+  headers, without runtime option flags.
 
 ## 1.0.0
 
