@@ -1,3 +1,4 @@
+#include "test_harness.h"
 #include "document.h"
 #if TINTA_ENABLE_MERMAID
 #include "mermaid.h"
@@ -7,11 +8,10 @@
 #include <iostream>
 
 namespace {
-int failures = 0;
+TintaTestContext *test_context = nullptr;
+
 void check(bool condition, const char *message) {
-    if (condition) return;
-    std::cerr << "FAIL: " << message << '\n';
-    failures++;
+    test_context->check(condition, message);
 }
 
 TintaParseResult parse_doc(const char *text, const char *path) {
@@ -19,7 +19,8 @@ TintaParseResult parse_doc(const char *text, const char *path) {
 }
 }
 
-int main() {
+void run_document_tests(TintaTestContext &tests) {
+    test_context = &tests;
     check(tinta_is_supported_document_path_utf8("notes.md"), ".md supported");
     check(tinta_is_supported_document_path_utf8("notes.MARKDOWN"), ".markdown case insensitive");
     check(tinta_is_supported_document_path_utf16(L"diagram.MMD"), ".mmd supported");
@@ -267,10 +268,4 @@ int main() {
     check(!too_deep.success, "Markdown nesting depth limit is enforced during parsing");
     tinta_parse_result_destroy(&too_deep);
 
-    if (failures) {
-        std::cerr << failures << " test(s) failed\n";
-        return 1;
-    }
-    std::cout << "All document C tests passed\n";
-    return 0;
 }

@@ -1,3 +1,4 @@
+#include "test_harness.h"
 #include "mermaid.h"
 
 #include <cstring>
@@ -6,11 +7,9 @@
 #include <vector>
 
 namespace {
-int failures = 0;
+TintaTestContext *test_context = nullptr;
 void check(bool condition, const char *message) {
-    if (condition) return;
-    std::cerr << "FAIL: " << message << '\n';
-    failures++;
+    test_context->check(condition, message);
 }
 
 TintaMermaidParseResult parse(const char *source) {
@@ -350,15 +349,10 @@ E --> F
 }
 }
 
-int main() {
+void run_mermaid_tests(TintaTestContext &tests) {
+    test_context = &tests;
     testStyledFlowchart();
     testAliasesChainingAndLayout();
     testSpecialCases();
     testSubgraphs();
-    if (failures) {
-        std::cerr << failures << " test(s) failed\n";
-        return 1;
-    }
-    std::cout << "All Mermaid C tests passed\n";
-    return 0;
 }

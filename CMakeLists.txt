@@ -182,24 +182,29 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             set(TINTA_LAYOUT_TEST_LIBRARY tinta_layout_test_support)
         endif()
 
-        add_executable(core_tests tests/core_tests.cpp)
-        target_include_directories(core_tests PRIVATE src/internal)
-        target_link_libraries(core_tests PRIVATE tinta_test_support)
-        add_test(NAME core_containers COMMAND core_tests)
-
+        set(TINTA_UNIT_TEST_SOURCES
+            tests/unit_tests.cpp
+            tests/test_harness.cpp
+            tests/core_tests.cpp
+            tests/document_tests.cpp)
         if(TINTA_ENABLE_SVG)
-            add_executable(svg_tests tests/svg_tests.cpp)
-            target_include_directories(svg_tests PRIVATE src/internal)
-            target_link_libraries(svg_tests PRIVATE tinta_test_support)
-            add_test(NAME svg_sources COMMAND svg_tests)
+            list(APPEND TINTA_UNIT_TEST_SOURCES tests/svg_tests.cpp)
         endif()
-
         if(TINTA_ENABLE_MERMAID)
-            add_executable(mermaid_tests tests/mermaid_tests.cpp)
-            target_include_directories(mermaid_tests PRIVATE src/internal)
-            target_link_libraries(mermaid_tests PRIVATE tinta_test_support)
-            add_test(NAME mermaid_parser COMMAND mermaid_tests)
+            list(APPEND TINTA_UNIT_TEST_SOURCES tests/mermaid_tests.cpp)
         endif()
+        if(TINTA_ENABLE_SYNTAX)
+            list(APPEND TINTA_UNIT_TEST_SOURCES tests/syntax_tests.cpp)
+        endif()
+        add_executable(tinta_unit_tests ${TINTA_UNIT_TEST_SOURCES})
+        target_include_directories(tinta_unit_tests PRIVATE src/internal)
+        target_link_libraries(tinta_unit_tests PRIVATE tinta_test_support)
+        target_compile_definitions(tinta_unit_tests PRIVATE
+            TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
+            TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
+            TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
+        add_test(NAME unit COMMAND tinta_unit_tests)
+        set_tests_properties(unit PROPERTIES LABELS unit)
 
         add_executable(layout_tests tests/layout_tests.cpp)
         target_include_directories(layout_tests PRIVATE src/internal)
@@ -209,20 +214,7 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
             TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
         add_test(NAME renderer_layout COMMAND layout_tests)
-
-        add_executable(document_tests tests/document_tests.cpp)
-        target_include_directories(document_tests PRIVATE src/internal)
-        target_link_libraries(document_tests PRIVATE tinta_test_support)
-        target_compile_definitions(document_tests PRIVATE
-            TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>)
-        add_test(NAME document_types COMMAND document_tests)
-
-        if(TINTA_ENABLE_SYNTAX)
-            add_executable(syntax_tests tests/syntax_tests.cpp)
-            target_include_directories(syntax_tests PRIVATE src/internal)
-            target_link_libraries(syntax_tests PRIVATE tinta_test_support)
-            add_test(NAME syntax_highlighting COMMAND syntax_tests)
-        endif()
+        set_tests_properties(renderer_layout PROPERTIES LABELS layout)
 
         add_executable(control_tests tests/control_tests.cpp)
         target_link_libraries(control_tests PRIVATE Tinta::Core)
@@ -236,25 +228,27 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
             TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
         add_test(NAME markdown_control COMMAND control_tests)
+        set_tests_properties(markdown_control PROPERTIES LABELS control)
         if(TINTA_ENABLE_UIA)
             add_executable(uia_tests tests/uia_tests.cpp)
             target_link_libraries(uia_tests PRIVATE Tinta::Core
                 ole32 oleaut32 uiautomationcore)
             target_compile_definitions(uia_tests PRIVATE UNICODE _UNICODE)
             add_test(NAME uia_provider COMMAND uia_tests)
+            set_tests_properties(uia_provider PROPERTIES LABELS uia)
         endif()
     endif()
 endif()
 
 if(TINTA_BUILD_FUZZERS)
-    add_executable(tinta_markdown_fuzzer tests/markdown_fuzzer.c)
+    add_executable(tinta_markdown_fuzzer fuzz/markdown_fuzzer.c)
     target_include_directories(tinta_markdown_fuzzer PRIVATE
         src/internal vendor/md4c/src)
     target_link_libraries(tinta_markdown_fuzzer PRIVATE tinta_test_support)
 endif()
 
 if(TINTA_BUILD_BENCHMARKS)
-    add_executable(tinta_benchmark tests/benchmark.c)
+    add_executable(tinta_benchmark benchmarks/benchmark.c)
     target_include_directories(tinta_benchmark PRIVATE src/internal)
     target_link_libraries(tinta_benchmark PRIVATE tinta_test_support)
 endif()

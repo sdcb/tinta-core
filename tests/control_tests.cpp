@@ -156,22 +156,56 @@ static bool copy_document_text(HWND view, const wchar_t *markdown,
     return read_clipboard_text(view, copied);
 }
 
-int main() {
+struct ControlFixture {
     HINSTANCE instance = GetModuleHandleW(nullptr);
-    WNDCLASSW parent_class{};
-    parent_class.lpfnWndProc = parent_proc;
-    parent_class.hInstance = instance;
-    parent_class.lpszClassName = L"TintaControlTestParent";
-    if (FAILED(TintaCoreInitialize()) || !RegisterClassW(&parent_class)) return 1;
-    HWND parent = CreateWindowW(parent_class.lpszClassName, L"test",
-        WS_OVERLAPPEDWINDOW, 0, 0, 640, 480, nullptr, nullptr, instance, nullptr);
-    HWND view = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW, L"# Heading\n\nhello world",
-        WS_CHILD | WS_VISIBLE, 0, 0, 640, 480, parent,
-        reinterpret_cast<HMENU>(100), instance, nullptr);
-    if (!parent || !view) {
+    HWND parent = nullptr;
+    HWND view = nullptr;
+    bool core_initialized = false;
+    bool parent_class_registered = false;
+
+    bool create() {
+        WNDCLASSW parent_class{};
+        parent_class.lpfnWndProc = parent_proc;
+        parent_class.hInstance = instance;
+        parent_class.lpszClassName = L"TintaControlTestParent";
+        if (FAILED(TintaCoreInitialize())) return false;
+        core_initialized = true;
+        if (!RegisterClassW(&parent_class)) return false;
+        parent_class_registered = true;
+
+        parent = CreateWindowW(parent_class.lpszClassName, L"test",
+            WS_OVERLAPPEDWINDOW, 0, 0, 640, 480, nullptr, nullptr, instance,
+            nullptr);
+        view = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW,
+            L"# Heading\n\nhello world", WS_CHILD | WS_VISIBLE, 0, 0, 640,
+            480, parent, reinterpret_cast<HMENU>(100), instance, nullptr);
+        return parent && view;
+    }
+
+    ~ControlFixture() {
+        if (view && IsWindow(view)) DestroyWindow(view);
+        if (parent && IsWindow(parent)) DestroyWindow(parent);
+        if (parent_class_registered)
+            UnregisterClassW(L"TintaControlTestParent", instance);
+        if (core_initialized) TintaCoreUninitialize();
+    }
+};
+
+static void begin_control_scenario(const char *name) {
+    std::cout << "[control] " << name << '\n';
+}
+
+int main() {
+    ControlFixture fixture;
+    if (!fixture.create()) {
         std::cerr << "control creation failed\n";
         return 1;
     }
+    const HINSTANCE instance = fixture.instance;
+    const HWND parent = fixture.parent;
+    const HWND view = fixture.view;
+
+    begin_control_scenario("API, capabilities, and document copy");
     TintaOptions compiled_options{};
     compiled_options.cb_size = sizeof(compiled_options);
     if (!SendMessageW(view, TMM_GETOPTIONS, 0,
@@ -304,6 +338,7 @@ int main() {
         }
     }
 #endif
+    begin_control_scenario("selection and pointer interaction");
     float dpi_scale = GetDpiForWindow(view) / 96.0f;
     int text_x = static_cast<int>(45.0f * dpi_scale);
     int first_line_y = static_cast<int>(25.0f * dpi_scale);
@@ -802,6 +837,7 @@ int main() {
         return 1;
     }
 #endif
+    begin_control_scenario("options, limits, and layout behavior");
     TintaLimits limits{};
     limits.cb_size = sizeof(limits);
     if (!SendMessageW(view, TMM_GETLIMITS, 0,
@@ -928,6 +964,7 @@ int main() {
         return SendMessageW(view, TMM_GETCONTENTSIZE, 0,
                             reinterpret_cast<LPARAM>(size)) != FALSE;
     };
+    begin_control_scenario("code and Mermaid scrolling");
     TintaContentSize short_code_size{};
     if (!load_and_measure(L"```text\nshort\n```", &short_code_size)) {
         std::cerr << "short code layout failed\n";
@@ -1078,6 +1115,7 @@ int main() {
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(L"# Heading\n\nhello world"));
     SendMessageW(view, WM_PAINT, 0, 0);
+    begin_control_scenario("find and autosize");
     TintaFindRequest find{};
     find.cb_size = sizeof(find);
     find.text = L"hello";
@@ -1148,6 +1186,7 @@ int main() {
     }
     SetWindowPos(view, nullptr, 0, 0, 640, 480,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    begin_control_scenario("streaming");
     TintaOptions stream_options{};
     stream_options.cb_size = sizeof(stream_options);
     if (!SendMessageW(view, TMM_GETOPTIONS, 0,
@@ -1264,6 +1303,7 @@ int main() {
         std::cerr << "disabled autosize changed the fixed height\n";
         return 1;
     }
+    begin_control_scenario("resource and lifecycle isolation");
     TintaDocument image_document{};
     const char image_markdown[] = "# Image\n\n![](missing.png)\n";
     image_document.cb_size = sizeof(image_document);
@@ -1407,7 +1447,6 @@ int main() {
         std::cerr << "destroying a control consumed the host's quit message\n";
         return 1;
     }
-    TintaCoreUninitialize();
     std::cout << "Control tests passed\n";
     return 0;
 }

@@ -1,48 +1,65 @@
+#include "test_harness.h"
 #include "syntax.h"
 
-#include <iostream>
+#include <cwchar>
 
-int main() {
-    if (tinta_syntax_language("cpp") != 1 || tinta_syntax_language("python") != 2 ||
-        tinta_syntax_language("typescript") != 3 || tinta_syntax_language("c#") != 7) {
-        std::cerr << "language detection failed\n";
-        return 1;
-    }
+void test_syntax_languages(TintaTestContext &tests) {
+    tests.check(tinta_syntax_language("cpp") == 1 &&
+                    tinta_syntax_language("python") == 2 &&
+                    tinta_syntax_language("typescript") == 3 &&
+                    tinta_syntax_language("c#") == 7,
+                "language detection");
+}
+
+void test_syntax_token_classes(TintaTestContext &tests) {
     const wchar_t *line = L"if (value == 42) return \"ok\"; // comment";
     TintaVec tokens{};
-    tinta_vec_init(&tokens, sizeof(TintaSyntaxToken));
-    bool block = false;
-    if (!tinta_syntax_tokenize(line, wcslen(line), 1, &block, &tokens)) return 1;
-    bool control = false, number = false, string = false, comment = false;
-    for (size_t i = 0; i < tokens.len; i++) {
-        auto token = TINTA_VEC_AT(TintaSyntaxToken, tokens, i);
-        control |= token.type == TINTA_SYNTAX_CONTROL;
-        number |= token.type == TINTA_SYNTAX_NUMBER;
-        string |= token.type == TINTA_SYNTAX_STRING;
-        comment |= token.type == TINTA_SYNTAX_COMMENT;
-    }
-    tinta_vec_destroy(&tokens);
-    if (!control || !number || !string || !comment) {
-        std::cerr << "token classes missing\n";
-        return 1;
-    }
+    const bool initialized = tinta_vec_init(&tokens, sizeof(TintaSyntaxToken));
+    tests.check(initialized, "token vector initialization");
+    if (!initialized) return;
 
-    tinta_vec_init(&tokens, sizeof(TintaSyntaxToken));
-    block = false;
-    const wchar_t *types = L"size_t count = parse();";
-    if (!tinta_syntax_tokenize(types, wcslen(types), 1, &block, &tokens))
-        return 1;
-    bool type = false, function = false;
-    for (size_t i = 0; i < tokens.len; i++) {
-        auto token = TINTA_VEC_AT(TintaSyntaxToken, tokens, i);
-        type |= token.type == TINTA_SYNTAX_TYPE;
-        function |= token.type == TINTA_SYNTAX_FUNCTION;
+    bool block = false;
+    const bool tokenized = tinta_syntax_tokenize(line, std::wcslen(line), 1,
+                                                 &block, &tokens);
+    tests.check(tokenized, "tokenization");
+    if (tokenized) {
+        bool control = false;
+        bool number = false;
+        bool string = false;
+        bool comment = false;
+        for (size_t index = 0; index < tokens.len; index++) {
+            const auto token = TINTA_VEC_AT(TintaSyntaxToken, tokens, index);
+            control |= token.type == TINTA_SYNTAX_CONTROL;
+            number |= token.type == TINTA_SYNTAX_NUMBER;
+            string |= token.type == TINTA_SYNTAX_STRING;
+            comment |= token.type == TINTA_SYNTAX_COMMENT;
+        }
+        tests.check(control && number && string && comment,
+                    "token classes");
     }
     tinta_vec_destroy(&tokens);
-    if (!type || !function) {
-        std::cerr << "type or function classification missing\n";
-        return 1;
+}
+
+void test_syntax_type_and_function(TintaTestContext &tests) {
+    const wchar_t *line = L"size_t count = parse();";
+    TintaVec tokens{};
+    const bool initialized = tinta_vec_init(&tokens, sizeof(TintaSyntaxToken));
+    tests.check(initialized, "type token vector initialization");
+    if (!initialized) return;
+
+    bool block = false;
+    const bool tokenized = tinta_syntax_tokenize(line, std::wcslen(line), 1,
+                                                 &block, &tokens);
+    tests.check(tokenized, "type tokenization");
+    if (tokenized) {
+        bool type = false;
+        bool function = false;
+        for (size_t index = 0; index < tokens.len; index++) {
+            const auto token = TINTA_VEC_AT(TintaSyntaxToken, tokens, index);
+            type |= token.type == TINTA_SYNTAX_TYPE;
+            function |= token.type == TINTA_SYNTAX_FUNCTION;
+        }
+        tests.check(type && function, "type and function classification");
     }
-    std::cout << "Syntax tests passed\n";
-    return 0;
+    tinta_vec_destroy(&tokens);
 }

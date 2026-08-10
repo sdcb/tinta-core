@@ -1,3 +1,4 @@
+#include "test_harness.h"
 #include "svg.h"
 
 #include <cmath>
@@ -6,12 +7,10 @@
 
 namespace {
 
-int failures;
+TintaTestContext *test_context = nullptr;
 
 void check(bool condition, const char *message) {
-    if (condition) return;
-    std::cerr << "FAIL: " << message << '\n';
-    failures++;
+    test_context->check(condition, message);
 }
 
 void check_size(const char *source, float width, float height,
@@ -25,7 +24,8 @@ void check_size(const char *source, float width, float height,
 
 }  // namespace
 
-int main() {
+void run_svg_tests(TintaTestContext &tests) {
+    test_context = &tests;
     check(tinta_svg_uri_candidate("image.svg?theme=dark#icon"),
           "SVG extension with query and fragment");
     check(tinta_svg_uri_candidate("DATA:IMAGE/SVG+XML,%3Csvg%3E%3C/svg%3E"),
@@ -77,9 +77,4 @@ int main() {
               &decoded, &info),
           "Data URI byte limit enforced");
 
-    if (!failures) {
-        std::cout << "SVG parser tests passed\n";
-        return 0;
-    }
-    return 1;
 }

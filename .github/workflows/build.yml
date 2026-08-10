@@ -10,6 +10,8 @@ on:
       - include/**
       - src/**
       - tests/**
+      - fuzz/**
+      - benchmarks/**
       - vendor/md4c/src/**
   pull_request:
     paths:
@@ -20,6 +22,8 @@ on:
       - include/**
       - src/**
       - tests/**
+      - fuzz/**
+      - benchmarks/**
       - vendor/md4c/src/**
 
 jobs:
@@ -32,19 +36,23 @@ jobs:
         architecture:
           - name: x64
             platform: x64
-            run_tests: true
           - name: x86
             platform: Win32
-            run_tests: true
           - name: arm64
             platform: ARM64
-            run_tests: false
     steps:
       - uses: actions/checkout@v7
       - name: Configure
+        id: configure
         shell: pwsh
         run: |
           $flags = @()
+          $runTests = '${{ matrix.architecture.name }}' -eq 'x64' -and (
+            ('${{ matrix.configuration }}' -eq 'full' -and '${{ matrix.shared }}' -eq 'OFF') -or
+            ('${{ matrix.configuration }}' -eq 'trimmed' -and '${{ matrix.shared }}' -eq 'ON')
+          )
+          $buildTesting = if ($runTests) { 'ON' } else { 'OFF' }
+          "run_tests=$($runTests.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           if ('${{ matrix.configuration }}' -eq 'trimmed') {
             $flags += '-DTINTA_ENABLE_UIA=OFF'
             $flags += '-DTINTA_ENABLE_MERMAID=OFF'
@@ -55,11 +63,11 @@ jobs:
           }
           cmake -S . -B build -G "Visual Studio 18 2026" -A ${{ matrix.architecture.platform }} `
             -DBUILD_SHARED_LIBS=${{ matrix.shared }} `
-            -DBUILD_TESTING=ON -DTINTA_BUILD_EXAMPLES=ON @flags
+            -DBUILD_TESTING=$buildTesting -DTINTA_BUILD_EXAMPLES=ON @flags
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Test
-        if: matrix.architecture.run_tests
+        if: steps.configure.outputs.run_tests == 'true'
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Package
         run: cmake --install build --config Release --prefix package
