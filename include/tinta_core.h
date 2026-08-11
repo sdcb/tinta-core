@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 #define TINTA_CORE_VERSION_MAJOR 1
-#define TINTA_CORE_VERSION_MINOR 1
+#define TINTA_CORE_VERSION_MINOR 2
 #define TINTA_CORE_VERSION_PATCH 0
 
 /* Register this class with TintaCoreInitialize before calling CreateWindowExW. */
@@ -290,7 +290,8 @@ enum {
     TINTA_CAPABILITY_REMOTE_IMAGES = 0x0008,
     TINTA_CAPABILITY_LOCAL_IMAGES = 0x0010,
     TINTA_CAPABILITY_STREAMING = 0x0020,
-    TINTA_CAPABILITY_SVG = 0x0040
+    TINTA_CAPABILITY_SVG = 0x0040,
+    TINTA_CAPABILITY_MATH = 0x0080
 };
 
 typedef struct TintaVersionInfo {

@@ -17,6 +17,14 @@ void check(bool condition, const char *message) {
 TintaParseResult parse_doc(const char *text, const char *path) {
     return tinta_parse_document(text, std::strlen(text), path, nullptr);
 }
+
+int count_type(const TintaElement *element, TintaElementType type) {
+    int count = element && element->type == type ? 1 : 0;
+    if (!element) return count;
+    for (size_t i = 0; i < element->child_count; i++)
+        count += count_type(element->children[i], type);
+    return count;
+}
 }
 
 void run_document_tests(TintaTestContext &tests) {
@@ -60,6 +68,100 @@ void run_document_tests(TintaTestContext &tests) {
         check(highlights == 1 && supers == 1 && subs == 1 && strikes == 1 && code == 1, "extension counts");
     }
     tinta_parse_result_destroy(&ext);
+
+    auto math = parse_doc(
+        "price \\$5, inline $x^2$ and \\(a+b\\).\n\n"
+        "$$\\frac{a}{b}\n+ c$$\n\n"
+        "\\[\\begin{matrix}a&b\\\\c&d\\end{matrix}\\]\n\n"
+        "`$code$`\n\n```tex\n$$fenced$$\n```\n\n"
+        "~~~tex\n\\(tilde fenced\\)\n~~~\n",
+        "math.md");
+    check(math.success && math.root && math.root->child_count >= 5,
+          "all Markdown math delimiter forms parse safely");
+    if (math.success && math.root->child_count >= 3) {
+        auto *paragraph = math.root->children[0];
+        int inline_count = 0;
+        for (size_t i = 0; i < paragraph->child_count; i++) {
+            auto *child = paragraph->children[i];
+            if (child->type == TINTA_ELEMENT_MATH_INLINE) {
+                inline_count++;
+                check(child->raw && (child->raw[0] == '$' ||
+                      (child->raw[0] == '\\' && child->raw[1] == '(')),
+                      "inline math preserves its original delimiters");
+                check(child->source_offset != SIZE_MAX,
+                      "inline math maps back to its original source offset");
+            }
+        }
+        check(inline_count == 2,
+              "dollar and parenthesized inline math are recognized");
+        int display_count = count_type(
+            math.root, TINTA_ELEMENT_MATH_DISPLAY);
+        for (size_t i = 0; i < math.root->child_count; i++) {
+            auto *block = math.root->children[i];
+            for (size_t j = 0; j < block->child_count; j++) {
+                auto *child = block->children[j];
+                if (child->type == TINTA_ELEMENT_MATH_DISPLAY) {
+                    check(child->raw && (child->raw[0] == '$' ||
+                          (child->raw[0] == '\\' && child->raw[1] == '[')),
+                          "display math preserves its original delimiters");
+                    check(std::strchr(child->text, '\n') != nullptr ||
+                          std::strstr(child->text, "matrix") != nullptr,
+                          "display math keeps multiline/environment source");
+                }
+            }
+        }
+        check(display_count == 2,
+              "dollar and bracketed display math are recognized");
+    }
+    tinta_parse_result_destroy(&math);
+
+    auto unmatched_math = parse_doc(
+        "unclosed $x and \\(y plus money $5.00 and `\\(code\\)`\n"
+        "$inline does\nnot cross$ and \\(neither\ndoes this\\)\n",
+        "math.md");
+    check(unmatched_math.success,
+          "unclosed, currency, escaped, and code delimiters remain text");
+    if (unmatched_math.success && unmatched_math.root->child_count) {
+        int math_count = 0;
+        auto *paragraph = unmatched_math.root->children[0];
+        for (size_t i = 0; i < paragraph->child_count; i++)
+            math_count += paragraph->children[i]->type ==
+                          TINTA_ELEMENT_MATH_INLINE;
+        check(math_count == 0,
+              "unclosed and currency-like input does not invent math spans");
+    }
+    tinta_parse_result_destroy(&unmatched_math);
+
+    auto unmatched_code_then_math = parse_doc(
+        "unmatched ` marker then \\(x+y\\)\n", "math.md");
+    check(unmatched_code_then_math.success &&
+              count_type(unmatched_code_then_math.root,
+                         TINTA_ELEMENT_MATH_INLINE) == 1,
+          "an unmatched backtick does not suppress later closed math");
+    tinta_parse_result_destroy(&unmatched_code_then_math);
+
+    auto math_containers = parse_doc(
+        "> quote $q$\n\n- item \\(i\\)\n\n"
+        "| Formula | Value |\n|---|---|\n| $x$ | 1 |\n",
+        "math.md");
+    check(math_containers.success &&
+              count_type(math_containers.root,
+                         TINTA_ELEMENT_MATH_INLINE) == 3,
+          "math spans survive quotes, lists, and tables");
+    tinta_parse_result_destroy(&math_containers);
+
+    const char *stream_math = "prefix \\(x+y\\) suffix";
+    for (size_t prefix = 0; prefix <= std::strlen(stream_math); prefix++) {
+        auto partial = tinta_markdown_parse(
+            stream_math, prefix, nullptr);
+        check(partial.success,
+              "incremental math prefixes remain parseable");
+        if (prefix == std::strlen(stream_math))
+            check(count_type(partial.root,
+                             TINTA_ELEMENT_MATH_INLINE) == 1,
+                  "incremental math converges to the closed span");
+        tinta_parse_result_destroy(&partial);
+    }
 
     auto html_scripts = parse_doc(
         "H<sub class='chem'>2</sub>O and x<SUP data-kind='power'>n</SUP>\n",

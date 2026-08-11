@@ -12,6 +12,10 @@
 #if TINTA_ENABLE_MERMAID
 #include "mermaid.h"
 #endif
+#if TINTA_ENABLE_MATH
+#include "math_layout.h"
+#include "tinta_math.h"
+#endif
 #include "win_graphics_c.h"
 
 #ifdef __cplusplus
@@ -73,6 +77,9 @@ typedef struct TintaTextRun {
     char *url;
     bool underline;
     bool strikethrough;
+    bool decorative;
+    bool atomic;
+    bool hidden;
     size_t horizontal_region;
 } TintaTextRun;
 
@@ -168,7 +175,8 @@ typedef enum TintaHorizontalRegionKind {
     TINTA_HORIZONTAL_CODE,
     TINTA_HORIZONTAL_MERMAID,
     TINTA_HORIZONTAL_SVG,
-    TINTA_HORIZONTAL_DETAILS
+    TINTA_HORIZONTAL_DETAILS,
+    TINTA_HORIZONTAL_MATH
 } TintaHorizontalRegionKind;
 
 typedef struct TintaHorizontalRegion {
@@ -264,6 +272,17 @@ typedef struct TintaMermaidCacheEntry {
     const TintaElement *element;
     TintaMermaidParseResult parsed;
 } TintaMermaidCacheEntry;
+#endif
+#if TINTA_ENABLE_MATH
+typedef struct TintaMathCacheEntry {
+    const TintaElement *element;
+    TintaMathParseResult parsed;
+    TintaMathLayout layout;
+    float font_size;
+    int theme_index;
+    bool display;
+    bool layout_ready;
+} TintaMathCacheEntry;
 #endif
 
 typedef struct TintaApp TintaApp;
@@ -370,6 +389,10 @@ struct TintaApp {
 #if TINTA_ENABLE_MERMAID
     TintaVec mermaid_cache;
 #endif
+#if TINTA_ENABLE_MATH
+    TintaVec math_cache;
+    size_t math_ast_nodes_used;
+#endif
     TintaImageAsync *image_async;
     TintaResolveImageFn resolve_image;
     TintaInvokeLinkFn invoke_link;
@@ -455,6 +478,9 @@ void tinta_app_clear_mermaid_cache(TintaApp *app);
 const TintaMermaidParseResult *tinta_app_mermaid_parse(
     TintaApp *app, const TintaElement *element,
     const char *source, size_t length);
+#endif
+#if TINTA_ENABLE_MATH
+void tinta_app_clear_math_cache(TintaApp *app);
 #endif
 
 void tinta_layout_clear(TintaApp *app);

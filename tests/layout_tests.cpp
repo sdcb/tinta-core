@@ -219,6 +219,112 @@ void test_inline_styles(TintaApp &app) {
           "HTML sup preserves enclosing link semantics");
 }
 
+void test_math_layout(TintaApp &app) {
+    const char *source =
+        "before $\\frac{a_1}{\\sqrt{x}}$ after\n\n"
+        "prefix $$x^2+y^2$$ suffix\n\n"
+        "$$\\begin{pmatrix}abcdefghij&klmnopqrst&uvwxyzabcd&efghijklmn&"
+        "opqrstuvwx&yzabcdefgh&ijklmnopqr&stuvwxyzab\\\\"
+        "abcdefghij&klmnopqrst&uvwxyzabcd&efghijklmn&opqrstuvwx&"
+        "yzabcdefgh&ijklmnopqr&stuvwxyzab\\end{pmatrix}$$\n";
+    check(load(app, source), "math document lays out");
+    if (!app.layout_complete) return;
+    check(std::wcsstr(app.doc_text.data, L"$\\frac{a_1}{\\sqrt{x}}$") !=
+              nullptr &&
+          std::wcsstr(app.doc_text.data, L"$$\\begin{pmatrix}") != nullptr,
+          "logical document preserves original math delimiters and source");
+
+    TintaTextRun *inline_anchor = nullptr;
+    TintaTextRun *display_anchor = nullptr;
+    TintaTextRun *embedded_anchor = nullptr;
+    size_t decorative = 0;
+    for (size_t i = 0; i < app.text_runs.len; i++) {
+        auto *run = TINTA_VEC_PTR(TintaTextRun, app.text_runs, i);
+        if (run->decorative) {
+            decorative++;
+            check(run->doc_length == 0,
+                  "math drawing runs do not duplicate logical text");
+        }
+        if (run->atomic && run->text && run->text[0] == L'$') {
+            if (run->text_length > 1 && run->text[1] == L'$')
+                if (!embedded_anchor) embedded_anchor = run;
+                else display_anchor = run;
+            else
+                inline_anchor = run;
+        }
+    }
+
+#if TINTA_ENABLE_MATH
+    if (inline_anchor && display_anchor) {
+        check(inline_anchor->hidden && display_anchor->hidden && decorative > 0,
+              "native math uses hidden atomic anchors and decorative glyphs");
+        check(inline_anchor->height >
+                  app.body_format->lpVtbl->GetFontSize(app.body_format),
+              "fraction and root expand the inline ascent/descent");
+        auto *prefix = find_run(app, L"prefix ");
+        auto *suffix = find_run(app, L" suffix");
+        check(embedded_anchor && prefix && suffix &&
+                  prefix->y + prefix->height <= embedded_anchor->y + 1.0f &&
+                  suffix->y + 1.0f >= embedded_anchor->y +
+                                       embedded_anchor->height,
+              "display math embedded in a paragraph forces lines around it");
+        size_t left = SIZE_MAX;
+        size_t right = SIZE_MAX;
+        tinta_hit_test(&app, inline_anchor->x + 1,
+                       inline_anchor->y + inline_anchor->height * 0.5f,
+                       &left, nullptr);
+        tinta_hit_test(&app,
+                       inline_anchor->x + inline_anchor->width - 1,
+                       inline_anchor->y + inline_anchor->height * 0.5f,
+                       &right, nullptr);
+        check(left == inline_anchor->doc_start &&
+                  right == inline_anchor->doc_start +
+                           inline_anchor->doc_length,
+              "formula hit testing maps its halves to source boundaries");
+        bool math_region = false;
+        bool overflow = false;
+        for (size_t i = 0; i < app.horizontal_regions.len; i++) {
+            auto *region = TINTA_VEC_PTR(
+                TintaHorizontalRegion, app.horizontal_regions, i);
+            if (region->kind == TINTA_HORIZONTAL_MATH) {
+                math_region = true;
+                overflow = overflow || region->overflow;
+            }
+        }
+        check(math_region,
+              "display math receives an independent horizontal region");
+        check(overflow,
+              "overwide display math scrolls inside its own viewport");
+    } else {
+        check(find_run_containing(app, L"\\frac{a_1}") != nullptr,
+              "missing Cambria Math safely falls back to raw LaTeX");
+    }
+#else
+    check(!inline_anchor && !display_anchor && decorative == 0 &&
+              find_run_containing(app, L"\\frac{a_1}") != nullptr,
+          "math-disabled builds display raw LaTeX");
+#endif
+
+    check(load(app, "bad $x+\\unknowncommand{y}$ formula"),
+          "unsupported math safely lays out");
+    auto *unknown = find_run_containing(app, L"\\unknowncommand");
+    check(unknown && !unknown->atomic && !unknown->hidden,
+          "unsupported formulas fall back to visible original LaTeX");
+
+#if TINTA_ENABLE_MATH
+    check(load(app, "limited $\\frac{a+b}{c+d}$ formula"),
+          "limited math fixture initially lays out");
+    size_t saved_limit = app.max_ast_nodes;
+    app.max_ast_nodes = app.ast_node_count + 1;
+    check(tinta_layout_document(&app),
+          "formula node exhaustion does not reject the document");
+    auto *limited = find_run_containing(app, L"\\frac{a+b}");
+    check(limited && !limited->atomic && !limited->hidden,
+          "formula node exhaustion falls back only that formula");
+    app.max_ast_nodes = saved_limit;
+#endif
+}
+
 #if TINTA_ENABLE_SVG
 void test_svg_layout(TintaApp &app) {
     const char *source =
@@ -782,6 +888,7 @@ int main() {
     }
 
     test_inline_styles(app);
+    test_math_layout(app);
     test_block_collapse(app);
     test_html_details(app);
 #if TINTA_ENABLE_SVG

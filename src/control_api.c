@@ -347,6 +347,9 @@ LRESULT tinta_control_dispatch_api(TintaControl *control, UINT message,
 #if TINTA_ENABLE_SVG
             flags |= TINTA_CAPABILITY_SVG;
 #endif
+#if TINTA_ENABLE_MATH
+            flags |= TINTA_CAPABILITY_MATH;
+#endif
             capabilities->cb_size = sizeof(*capabilities);
             capabilities->flags = flags;
             capabilities->option_flags =

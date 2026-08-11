@@ -23,6 +23,8 @@ typedef enum TintaElementType {
     TINTA_ELEMENT_HTML_BLOCK,
     TINTA_ELEMENT_TEXT,
     TINTA_ELEMENT_CODE,
+    TINTA_ELEMENT_MATH_INLINE,
+    TINTA_ELEMENT_MATH_DISPLAY,
     TINTA_ELEMENT_EMPHASIS,
     TINTA_ELEMENT_STRONG,
     TINTA_ELEMENT_LINK,
@@ -48,6 +50,7 @@ struct TintaElement {
     char *url;
     char *title;
     char *language;
+    char *raw;
     int level;
     bool ordered;
     bool tight;

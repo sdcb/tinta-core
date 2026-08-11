@@ -87,7 +87,9 @@ int main() {
         text = nullptr;
         if (ok) call = text_pattern->get_DocumentRange(&new_range);
         if (SUCCEEDED(call)) call = new_range->GetText(-1, &text);
-        ok = ok && SUCCEEDED(call) && text && wcsstr(text, L"Second revision");
+        ok = ok && SUCCEEDED(call) && text &&
+             wcsstr(text, L"Second revision") &&
+             wcsstr(text, L"$\\frac{a}{b}$");
         if (!ok && !failure_stage) failure_stage = 3;
         SysFreeString(text);
         text = nullptr;
@@ -146,7 +148,8 @@ int main() {
         pump_messages();
         if (phase.load() == 1) {
             std::wstring document =
-                L"# Second revision\n\n[link](https://example.com)\n\n";
+                L"# Second revision\n\n$\\frac{a}{b}$\n\n"
+                L"[link](https://example.com)\n\n";
             for (int index = 0; index < 100; index++)
                 document += L"scrolling content\n\n";
             SendMessageW(view, WM_SETTEXT, 0,

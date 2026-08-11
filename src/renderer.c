@@ -7,6 +7,11 @@
 #include "svg.h"
 #include <shlwapi.h>
 #endif
+#if TINTA_ENABLE_MATH
+#include "math_layout.h"
+#include "math_opentype.h"
+#include "tinta_math.h"
+#endif
 
 #include <ctype.h>
 #include <commdlg.h>
@@ -24,6 +29,11 @@ typedef struct InlineState {
     float y;
     float line_height;
     float base_line_height;
+    float line_ascent;
+    float line_descent;
+    size_t line_run_start;
+    size_t line_rect_start;
+    size_t line_line_start;
 } InlineState;
 
 typedef struct InlineStyle {
@@ -211,6 +221,9 @@ void tinta_horizontal_region_clear_states(TintaApp *app) {
     tinta_vec_clear(&app->horizontal_scroll_states);
     tinta_vec_clear(&app->block_collapse_states);
     tinta_vec_clear(&app->horizontal_regions);
+#if TINTA_ENABLE_MATH
+    app->math_ast_nodes_used = 0;
+#endif
     app->active_horizontal_region = SIZE_MAX;
     app->hovered_horizontal_region = -1;
     app->dragging_horizontal_region = -1;
@@ -1013,6 +1026,9 @@ static bool add_line_alpha(TintaApp *app, float x1, float y1, float x2, float y2
 static bool flatten(const TintaElement *element, TintaStr8 *output) {
     size_t i;
     if (element->type == TINTA_ELEMENT_TEXT) return tinta_str8_append(output, element->text, strlen(element->text));
+    if ((element->type == TINTA_ELEMENT_MATH_INLINE ||
+         element->type == TINTA_ELEMENT_MATH_DISPLAY) && element->raw)
+        return tinta_str8_append(output, element->raw, strlen(element->raw));
     if (element->type == TINTA_ELEMENT_MERMAID_DIAGRAM && element->text && element->text[0])
         return tinta_str8_append(output, element->text, strlen(element->text));
     if (element->type == TINTA_ELEMENT_SOFT_BREAK) return tinta_str8_append_char(output, ' ');
@@ -1062,6 +1078,45 @@ static bool text_clusters(TintaApp *app, IDWriteTextFormat *format,
     return true;
 }
 
+static void inline_reset_line(TintaApp *app, InlineState *state) {
+    state->line_height = state->base_line_height;
+    state->line_ascent = state->base_line_height * 0.78f;
+    state->line_descent = state->base_line_height - state->line_ascent;
+    state->line_run_start = app->text_runs.len;
+    state->line_rect_start = app->rects.len;
+    state->line_line_start = app->lines.len;
+}
+
+static void inline_begin(TintaApp *app, InlineState *state) {
+    inline_reset_line(app, state);
+}
+
+static void inline_next_line(TintaApp *app, InlineState *state) {
+    state->x = state->left;
+    state->y += state->line_height;
+    inline_reset_line(app, state);
+}
+
+static void inline_shift_current_line(TintaApp *app,
+                                      const InlineState *state,
+                                      float amount) {
+    size_t i;
+    if (amount <= 0) return;
+    for (i = state->line_run_start; i < app->text_runs.len; i++)
+        TINTA_VEC_AT(TintaTextRun, app->text_runs, i).y += amount;
+    for (i = state->line_rect_start; i < app->rects.len; i++) {
+        TintaDrawRect *rect = TINTA_VEC_PTR(TintaDrawRect, app->rects, i);
+        rect->rect.top += (LONG)ceilf(amount);
+        rect->rect.bottom += (LONG)ceilf(amount);
+    }
+    for (i = state->line_line_start; i < app->lines.len; i++) {
+        TintaDrawLine *line = TINTA_VEC_PTR(TintaDrawLine, app->lines, i);
+        line->a.y += (LONG)ceilf(amount);
+        line->b.y += (LONG)ceilf(amount);
+    }
+    app->hit_index_dirty = true;
+}
+
 static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
                         size_t length, const InlineStyle *style) {
     size_t position = 0;
@@ -1075,8 +1130,7 @@ static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
         if (newline == position) {
             const wchar_t nl = L'\n';
             if (!tinta_str16_append(&app->doc_text, &nl, 1)) return false;
-            state->x = state->left; state->y += state->line_height;
-            state->line_height = state->base_line_height; position++; continue;
+            inline_next_line(app, state); position++; continue;
         }
         if (!text_clusters(app, style->format, text + position,
                            newline - position, &clusters, &cluster_count))
@@ -1098,9 +1152,7 @@ static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
                 scan++;
             }
             if (scan == cluster_index && state->x > state->left) {
-                state->x = state->left;
-                state->y += state->line_height;
-                state->line_height = state->base_line_height;
+                inline_next_line(app, state);
                 continue;
             }
             if (scan == cluster_index) scan++;
@@ -1133,8 +1185,7 @@ static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
                     line_position += clusters[cluster_index].length;
                     cluster_index++;
                 }
-                state->x = state->left; state->y += state->line_height;
-                state->line_height = state->base_line_height;
+                inline_next_line(app, state);
             } else state->x += run->width;
         }
         free(clusters);
@@ -1142,13 +1193,378 @@ static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
         if (position < length && text[position] == L'\n') {
             const wchar_t nl = L'\n';
             if (!tinta_str16_append(&app->doc_text, &nl, 1)) return false;
-            state->x = state->left;
-            state->y += state->line_height;
-            state->line_height = state->base_line_height;
+            inline_next_line(app, state);
             position++;
         }
     }
     return true;
+}
+
+#if TINTA_ENABLE_MATH
+static bool font_name_contains(const wchar_t *name, size_t name_length,
+                               const wchar_t *family) {
+    size_t family_length = wcslen(family);
+    size_t index;
+    if (family_length > name_length) return false;
+    for (index = 0; index <= name_length - family_length; index++) {
+        if (_wcsnicmp(name + index, family, family_length) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool math_font_available(void) {
+    static int cached = -1;
+    static const wchar_t *paths[] = {
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"
+    };
+    static const HKEY roots[] = {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER};
+    size_t root_index;
+    if (cached >= 0) return cached != 0;
+    cached = 0;
+    for (root_index = 0; root_index < 2 && !cached; root_index++) {
+        HKEY key = NULL;
+        DWORD index = 0;
+        if (RegOpenKeyExW(roots[root_index], paths[root_index], 0,
+                          KEY_READ, &key) != ERROR_SUCCESS) continue;
+        for (;;) {
+            wchar_t name[256];
+            wchar_t value[512];
+            wchar_t expanded[512];
+            wchar_t font_path[768];
+            DWORD name_length = (DWORD)(sizeof(name) / sizeof(name[0]));
+            DWORD value_size = (DWORD)sizeof(value);
+            DWORD value_type = 0;
+            LONG status = RegEnumValueW(key, index++, name, &name_length,
+                                        NULL, &value_type,
+                                        (BYTE *)value, &value_size);
+            if (status == ERROR_NO_MORE_ITEMS) break;
+            if (status == ERROR_SUCCESS &&
+                font_name_contains(name, name_length, L"Cambria Math") &&
+                (value_type == REG_SZ || value_type == REG_EXPAND_SZ) &&
+                value_size >= sizeof(wchar_t)) {
+                const wchar_t *font_file = value;
+                value[(sizeof(value) / sizeof(value[0])) - 1] = 0;
+                if (value_type == REG_EXPAND_SZ &&
+                    ExpandEnvironmentStringsW(value, expanded,
+                        (DWORD)(sizeof(expanded) / sizeof(expanded[0]))) > 0)
+                    font_file = expanded;
+                if ((font_file[0] == L'\\' && font_file[1] == L'\\') ||
+                    (font_file[0] && font_file[1] == L':')) {
+                    wcsncpy_s(font_path,
+                        sizeof(font_path) / sizeof(font_path[0]),
+                        font_file, _TRUNCATE);
+                } else {
+                    UINT windows_length = GetWindowsDirectoryW(
+                        font_path,
+                        (UINT)(sizeof(font_path) / sizeof(font_path[0])));
+                    if (!windows_length ||
+                        windows_length >= sizeof(font_path) /
+                                          sizeof(font_path[0]))
+                        continue;
+                    wcscat_s(font_path,
+                        sizeof(font_path) / sizeof(font_path[0]),
+                        L"\\Fonts\\");
+                    wcscat_s(font_path,
+                        sizeof(font_path) / sizeof(font_path[0]),
+                        font_file);
+                }
+                cached = tinta_math_ot_font_file_valid(font_path, NULL) ? 1 : 0;
+                if (cached) break;
+            }
+        }
+        RegCloseKey(key);
+    }
+    return cached != 0;
+}
+
+static IDWriteTextFormat *create_math_format(
+        TintaApp *app, float font_size, TintaMathTextStyle style) {
+    const wchar_t *family = L"Cambria Math";
+    TintaDWriteFontWeight weight = TINTA_DWRITE_FONT_WEIGHT_NORMAL;
+    TintaDWriteFontStyle font_style = TINTA_DWRITE_FONT_STYLE_NORMAL;
+    IDWriteTextFormat *format = NULL;
+    if (style == TINTA_MATH_STYLE_TEXT || style == TINTA_MATH_STYLE_SANS)
+        family = app->theme->font_family;
+    else if (style == TINTA_MATH_STYLE_MONO)
+        family = app->theme->code_font_family;
+    if (style == TINTA_MATH_STYLE_BOLD)
+        weight = TINTA_DWRITE_FONT_WEIGHT_BOLD;
+    if (style == TINTA_MATH_STYLE_ITALIC)
+        font_style = TINTA_DWRITE_FONT_STYLE_ITALIC;
+    if (FAILED(app->dwrite_factory->lpVtbl->CreateTextFormat(
+            app->dwrite_factory, family, NULL, weight, font_style,
+            TINTA_DWRITE_FONT_STRETCH_NORMAL, font_size, L"en-us", &format)) ||
+        !format) return NULL;
+    format->lpVtbl->SetParagraphAlignment(
+        format, TINTA_DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    format->lpVtbl->SetWordWrapping(
+        format, TINTA_DWRITE_WORD_WRAPPING_NO_WRAP);
+    return format;
+}
+
+static bool measure_math_text(void *opaque, const char *utf8, size_t length,
+                              float font_size, TintaMathTextStyle style,
+                              TintaMathGlyphMetrics *result) {
+    TintaApp *app = (TintaApp *)opaque;
+    TintaStr16 wide = {0};
+    IDWriteTextFormat *format = NULL;
+    IDWriteTextLayout *layout = NULL;
+    TintaDWriteTextMetrics metrics = {0};
+    bool ok = tinta_utf8_to_utf16(utf8, length, &wide);
+    if (ok) format = create_math_format(app, font_size, style);
+    if (ok && format)
+        ok = create_text_layout(app, format, wide.data, wide.len,
+                                100000.0f, &layout, &metrics);
+    if (ok) {
+        result->width = metrics.widthIncludingTrailingWhitespace;
+        result->ascent = metrics.height * 0.78f;
+        result->descent = metrics.height - result->ascent;
+    }
+    if (layout) layout->lpVtbl->Release(layout);
+    if (format) format->lpVtbl->Release(format);
+    tinta_str16_destroy(&wide);
+    return ok;
+}
+
+static TintaMathCacheEntry *math_cache_entry(
+        TintaApp *app, const TintaElement *element,
+        float font_size, bool display) {
+    enum { TINTA_MATH_CACHE_LIMIT = 128 };
+    TintaMathCacheEntry entry;
+    TintaMathCacheEntry *cached = NULL;
+    size_t i;
+    for (i = 0; i < app->math_cache.len; i++) {
+        TintaMathCacheEntry *candidate = TINTA_VEC_PTR(
+            TintaMathCacheEntry, app->math_cache, i);
+        if (candidate->element == element) {
+            cached = candidate;
+            break;
+        }
+    }
+    if (!cached) {
+        if (app->math_cache.len >= TINTA_MATH_CACHE_LIMIT) {
+            TintaMathCacheEntry *oldest = TINTA_VEC_PTR(
+                TintaMathCacheEntry, app->math_cache, 0);
+            tinta_math_node_destroy(oldest->parsed.root);
+            tinta_math_layout_destroy(&oldest->layout);
+            memmove(app->math_cache.data,
+                    (unsigned char *)app->math_cache.data +
+                        sizeof(TintaMathCacheEntry),
+                    (app->math_cache.len - 1) * sizeof(TintaMathCacheEntry));
+            app->math_cache.len--;
+        }
+        memset(&entry, 0, sizeof(entry));
+        entry.element = element;
+        entry.parsed = tinta_math_parse(
+            element->text, strlen(element->text),
+            app->max_ast_nodes, app->max_ast_depth);
+        if (!tinta_vec_push(&app->math_cache, &entry)) {
+            tinta_math_node_destroy(entry.parsed.root);
+            return NULL;
+        }
+        cached = TINTA_VEC_PTR(TintaMathCacheEntry, app->math_cache,
+                               app->math_cache.len - 1);
+    }
+    if (!cached->parsed.success) return cached;
+    if (!cached->layout_ready ||
+        fabsf(cached->font_size - font_size) > 0.01f ||
+        cached->theme_index != app->theme_index ||
+        cached->display != display) {
+        tinta_math_layout_destroy(&cached->layout);
+        cached->font_size = font_size;
+        cached->theme_index = app->theme_index;
+        cached->display = display;
+        cached->layout_ready = tinta_math_layout_build(
+            cached->parsed.root, font_size, display,
+            measure_math_text, app, &cached->layout);
+    }
+    return cached;
+}
+
+static bool append_math_anchor(TintaApp *app, const wchar_t *text,
+                               size_t length, float x, float y,
+                               float width, float height,
+                               TintaTextRun **created) {
+    TintaTextRun run;
+    TintaDWriteTextMetrics metrics;
+    size_t old_document_length = app->doc_text.len;
+    memset(&run, 0, sizeof(run));
+    run.text = tinta_wcsdup_n(text, length);
+    run.url = tinta_str8_dup("", 0);
+    if (!run.text || !run.url ||
+        !create_text_layout(app, app->body_format, run.text, length,
+                            100000.0f, &run.layout, &metrics)) {
+        free(run.text); free(run.url);
+        return false;
+    }
+    run.text_length = length;
+    run.color = app->theme->text;
+    run.opacity = 1.0f;
+    run.x = x; run.y = y; run.width = width; run.height = height;
+    run.doc_start = app->doc_text.len; run.doc_length = length;
+    run.horizontal_region = app->active_horizontal_region;
+    run.atomic = true;
+    run.hidden = true;
+    if (!tinta_str16_append(&app->doc_text, text, length) ||
+        !tinta_vec_push(&app->text_runs, &run)) {
+        app->doc_text.len = old_document_length;
+        if (app->doc_text.data) app->doc_text.data[old_document_length] = 0;
+        run.layout->lpVtbl->Release(run.layout);
+        free(run.text); free(run.url);
+        return false;
+    }
+    app->hit_index_dirty = true;
+    if (created) *created = TINTA_VEC_PTR(
+        TintaTextRun, app->text_runs, app->text_runs.len - 1);
+    return true;
+}
+
+static bool emit_math_layout(TintaApp *app, const TintaMathLayout *layout,
+                             const char *raw, float x, float top) {
+    TintaStr16 raw_wide = {0};
+    size_t i;
+    float baseline = top + layout->ascent;
+    if (!tinta_utf8_to_utf16(raw, strlen(raw), &raw_wide) ||
+        !append_math_anchor(app, raw_wide.data, raw_wide.len, x, top,
+                            layout->width,
+                            layout->ascent + layout->descent, NULL)) {
+        tinta_str16_destroy(&raw_wide);
+        return false;
+    }
+    tinta_str16_destroy(&raw_wide);
+    for (i = 0; i < layout->primitive_count; i++) {
+        const TintaMathPrimitive *primitive = &layout->primitives[i];
+        if (primitive->type == TINTA_MATH_PRIMITIVE_RULE) {
+            if (!add_line(app, x + primitive->x,
+                          baseline + primitive->baseline,
+                          x + primitive->x2, baseline + primitive->y2,
+                          app->theme->text,
+                          maxf(1.0f, primitive->thickness))) return false;
+        } else {
+            TintaStr16 wide = {0};
+            TintaMathGlyphMetrics glyph = {0};
+            IDWriteTextFormat *format = NULL;
+            TintaTextRun *run = NULL;
+            bool ok = tinta_utf8_to_utf16(
+                primitive->text, primitive->text_length, &wide) &&
+                measure_math_text(app, primitive->text,
+                    primitive->text_length, primitive->font_size,
+                    primitive->style, &glyph);
+            if (ok) format = create_math_format(
+                app, primitive->font_size, primitive->style);
+            if (ok && format)
+                ok = append_run_ex(app, wide.data, wide.len, format,
+                    app->theme->text, x + primitive->x,
+                    baseline + primitive->baseline - glyph.ascent,
+                    NULL, false, &run);
+            if (run) run->decorative = true;
+            if (format) format->lpVtbl->Release(format);
+            tinta_str16_destroy(&wide);
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+
+static bool layout_math_native(TintaApp *app, const TintaElement *element,
+                               InlineState *state, bool display) {
+    TintaMathCacheEntry *cached;
+    const TintaMathLayout *layout;
+    float font_size = state->base_line_height / 1.7f;
+    float x;
+    float top;
+    size_t region_index = SIZE_MAX;
+    RECT viewport;
+    bool ok = false;
+    size_t remaining;
+    if (!math_font_available()) return false;
+    cached = math_cache_entry(app, element, font_size, display);
+    if (!cached || !cached->parsed.success || !cached->layout_ready)
+        return false;
+    remaining = app->max_ast_nodes > app->ast_node_count +
+                    app->math_ast_nodes_used ?
+        app->max_ast_nodes - app->ast_node_count -
+            app->math_ast_nodes_used : 0;
+    if (cached->parsed.node_count > remaining) return false;
+    app->math_ast_nodes_used += cached->parsed.node_count;
+    layout = &cached->layout;
+    if (!display && state->x + layout->width > state->right &&
+        state->x > state->left) inline_next_line(app, state);
+    if (display) {
+        if (state->x > state->left) {
+            if (!tinta_str16_append(&app->doc_text, L"\n", 1)) {
+                ok = false;
+                goto done;
+            }
+            inline_next_line(app, state);
+        }
+        viewport.left = (LONG)state->left;
+        viewport.right = (LONG)state->right;
+        viewport.top = (LONG)state->y;
+        viewport.bottom = (LONG)ceilf(
+            state->y + layout->ascent + layout->descent);
+        region_index = begin_horizontal_region(
+            app, TINTA_HORIZONTAL_MATH, element->source_offset,
+            viewport, true);
+        if (region_index == SIZE_MAX) { ok = false; goto done; }
+        x = layout->width <= state->right - state->left ?
+            state->left + (state->right - state->left - layout->width) * 0.5f :
+            state->left;
+        top = state->y;
+    } else {
+        float extra_ascent = layout->ascent - state->line_ascent;
+        if (extra_ascent > 0) {
+            inline_shift_current_line(app, state, extra_ascent);
+            state->line_ascent = layout->ascent;
+        }
+        state->line_descent = maxf(state->line_descent, layout->descent);
+        state->line_height = state->line_ascent + state->line_descent;
+        x = state->x;
+        top = state->y + state->line_ascent - layout->ascent;
+    }
+    ok = emit_math_layout(app, layout, element->raw, x, top);
+    if (!ok) goto done;
+    if (display) {
+        TintaHorizontalRegion *region;
+        finish_horizontal_region(app, region_index);
+        region = horizontal_region(app, region_index);
+        state->y += layout->ascent + layout->descent +
+                    (region && region->overflow ? ui_scale(app, 14) : 0);
+        state->x = state->left;
+        inline_reset_line(app, state);
+        state->line_height = 0;
+        if (!tinta_str16_append(&app->doc_text, L"\n", 1)) ok = false;
+    } else {
+        state->x += layout->width;
+    }
+done:
+    if (!ok && region_index != SIZE_MAX &&
+        app->active_horizontal_region == region_index)
+        finish_horizontal_region(app, region_index);
+    return ok;
+}
+#endif
+
+static bool layout_math_fallback(TintaApp *app, const TintaElement *element,
+                                 InlineState *state, InlineStyle *style,
+                                 bool display) {
+    TintaStr16 wide = {0};
+    bool ok;
+    if (display && state->x > state->left) {
+        if (!tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
+        inline_next_line(app, state);
+    }
+    ok = tinta_utf8_to_utf16(element->raw, strlen(element->raw), &wide) &&
+         add_wrapped(app, state, wide.data, wide.len, style);
+    tinta_str16_destroy(&wide);
+    if (ok && display) {
+        if (!tinta_str16_append(&app->doc_text, L"\n", 1)) return false;
+        inline_next_line(app, state);
+        state->line_height = 0;
+    }
+    return ok;
 }
 
 static bool layout_image(TintaApp *app, const TintaElement *element,
@@ -1210,14 +1626,10 @@ static bool layout_inline(TintaApp *app, const TintaElement *element, InlineStat
         space_size = measure(app, style.format, L" ", 1);
         width = (float)max(base_size.cx, annotation_size.cx);
         if (state->x + width > state->right && state->x > state->left) {
-            state->x = state->left;
-            state->y += state->line_height;
-            state->line_height = state->base_line_height;
+            inline_next_line(app, state);
         }
         if (state->x > state->left) {
-            state->x = state->left;
-            state->y += state->line_height;
-            state->line_height = state->base_line_height;
+            inline_next_line(app, state);
         }
         annotation_y = state->y;
         annotation_x = state->x + (width - annotation_size.cx) * 0.5f;
@@ -1247,8 +1659,16 @@ ruby_done:
     if (element->type == TINTA_ELEMENT_IMAGE) {
         state->x = state->left;
         if (!layout_image(app, element, &state->y, state->left, state->right)) return false;
-        state->line_height = state->base_line_height;
+        inline_reset_line(app, state);
         return true;
+    }
+    if (element->type == TINTA_ELEMENT_MATH_INLINE ||
+        element->type == TINTA_ELEMENT_MATH_DISPLAY) {
+        bool display = element->type == TINTA_ELEMENT_MATH_DISPLAY;
+#if TINTA_ENABLE_MATH
+        if (layout_math_native(app, element, state, display)) return true;
+#endif
+        return layout_math_fallback(app, element, state, &style, display);
     }
     if (element->type == TINTA_ELEMENT_CODE) {
         TintaStr8 utf8 = {0};
@@ -1266,9 +1686,7 @@ ruby_done:
         }
         code_size = measure(app, format, wide.data, wide.len);
         if (state->x + code_size.cx > state->right && state->x > state->left) {
-            state->x = state->left;
-            state->y += state->line_height;
-            state->line_height = state->base_line_height;
+            inline_next_line(app, state);
         }
         add_rect(app, state->x - scale(app, 2), state->y,
                  state->x + code_size.cx + scale(app, 4),
@@ -1343,6 +1761,7 @@ static bool layout_paragraph(TintaApp *app, const TintaElement *element,
         .color = app->theme->text
     };
     size_t i;
+    inline_begin(app, &state);
     for (i = 0; i < element->child_count; i++)
         if (!layout_inline(app, element->children[i], &state, style)) return false;
     *y = state.y + state.line_height + scale(app, 14);
@@ -1411,12 +1830,16 @@ static bool layout_heading(TintaApp *app, const TintaElement *element,
         line_height = format_line_height(app->heading_formats[level - 1]);
         state.left = state.x = left; state.right = right; state.y = *y;
         state.line_height = line_height; state.base_line_height = line_height;
+        inline_begin(app, &state);
         {
             InlineStyle style = {
                 .format = app->heading_formats[level - 1],
                 .color = app->theme->heading
             };
-            ok = add_wrapped(app, &state, wide.data, wide.len, &style);
+            size_t child;
+            for (child = 0; ok && child < element->child_count; child++)
+                ok = layout_inline(app, element->children[child],
+                                   &state, style);
         }
         *y = state.y + state.line_height;
         heading.text = tinta_wcsdup_n(wide.data, wide.len);
@@ -1623,6 +2046,7 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
                              line_height, line_height};
         bool inline_active = false;
         size_t child;
+        inline_begin(app, &state);
         if (item->task)
             wcscpy_s(marker, 32, item->task_checked ? L"\x2611 " : L"\x2610 ");
         else if (element->ordered)
@@ -1643,6 +2067,7 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
                 }
                 state = (InlineState){item_left, right, item_left, *y,
                                       line_height, line_height};
+                inline_begin(app, &state);
                 for (inline_index = 0; inline_index < content->child_count;
                      inline_index++) {
                     InlineStyle style = {
@@ -1657,6 +2082,8 @@ static bool layout_list(TintaApp *app, const TintaElement *element,
                     return false;
             } else if (content->type == TINTA_ELEMENT_TEXT ||
                        content->type == TINTA_ELEMENT_CODE ||
+                       content->type == TINTA_ELEMENT_MATH_INLINE ||
+                       content->type == TINTA_ELEMENT_MATH_DISPLAY ||
                        content->type == TINTA_ELEMENT_EMPHASIS ||
                        content->type == TINTA_ELEMENT_STRONG ||
                        content->type == TINTA_ELEMENT_LINK ||
@@ -1778,6 +2205,7 @@ static bool layout_table(TintaApp *app, const TintaElement *element,
             }
             InlineState state={inner_left,inner_right,content_x,row_top+scale(app,7),line_height,line_height};
             size_t child;
+            inline_begin(app, &state);
             for(child=0;child<row->children[c]->child_count;child++)
                 {
                     InlineStyle style = {
@@ -1848,6 +2276,7 @@ static bool layout_details(TintaApp *app, const TintaElement *element,
     summary = element->children[0];
     state = (InlineState){text_left, right, text_left,
         top + scale(app, 6), line_height, line_height};
+    inline_begin(app, &state);
     style = (InlineStyle){
         .format = app->bold_format,
         .color = app->theme->text,
@@ -3176,6 +3605,7 @@ static void fill_color(TintaApp *app, const RECT *rect, uint32_t color) {
 static void draw_run(TintaApp *app, const TintaTextRun *run, float vx, float scroll) {
     D2D1_POINT_2F origin = {vx + run->x, run->y - scroll};
     D2D1_POINT_2F a, b;
+    if (run->hidden) return;
     if (origin.y + run->height < 0 || origin.y > app->height) return;
     set_brush_alpha(app, run->color, run->opacity);
     tinta_draw_text_layout(app, origin, run->layout,
@@ -3201,6 +3631,14 @@ static void highlight_run(TintaApp *app, const TintaTextRun *run, float vx,
         run->y - scroll > app->height ||
         end <= run->doc_start || start >= run->doc_start + run->doc_length)
         return;
+    if (run->atomic) {
+        rect.left = (LONG)(vx + run->x);
+        rect.right = (LONG)ceilf(vx + run->x + run->width);
+        rect.top = (LONG)(run->y - scroll);
+        rect.bottom = (LONG)ceilf(run->y - scroll + run->height);
+        fill_color(app, &rect, color);
+        return;
+    }
     local_start = start > run->doc_start ? start - run->doc_start : 0;
     local_end = end < run->doc_start + run->doc_length ? end - run->doc_start : run->doc_length;
     if (local_start >= local_end || local_start > UINT32_MAX || local_end > UINT32_MAX) return;
@@ -4326,7 +4764,8 @@ static bool rebuild_hit_index(TintaApp *app) {
         int first_bucket;
         int last_bucket;
         int bucket;
-        if (!isfinite(run->y) || !isfinite(run->height) || run->height < 0 ||
+        if (run->decorative || !isfinite(run->y) ||
+            !isfinite(run->height) || run->height < 0 ||
             run->y < (float)INT_MIN * TINTA_HIT_BUCKET_HEIGHT ||
             run->y > (float)INT_MAX * TINTA_HIT_BUCKET_HEIGHT)
             continue;
@@ -4369,7 +4808,9 @@ static size_t hit_bucket_lower_bound(const TintaVec *entries, int bucket) {
 static bool consider_hit_run(TintaApp *app, TintaTextRun *run, float x, float y,
                              size_t *position,
                              const char **url, HitCandidate *candidate) {
-    const TintaHorizontalRegion *region = horizontal_region_const(
+    const TintaHorizontalRegion *region;
+    if (run->decorative) return false;
+    region = horizontal_region_const(
         app, run->horizontal_region);
     if (region) {
         if (!horizontal_region_point_visible(
@@ -4387,7 +4828,10 @@ static bool consider_hit_run(TintaApp *app, TintaTextRun *run, float x, float y,
         BOOL trailing = FALSE;
         BOOL inside = FALSE;
         TintaDWriteHitTestMetrics metrics;
-        if (position && SUCCEEDED(run->layout->lpVtbl->HitTestPoint(
+        if (position && run->atomic) {
+            *position = x < run->x + run->width * 0.5f ?
+                run->doc_start : run->doc_start + run->doc_length;
+        } else if (position && SUCCEEDED(run->layout->lpVtbl->HitTestPoint(
                 run->layout, x - run->x, y - run->y,
                 &trailing, &inside, &metrics))) {
             size_t offset = metrics.textPosition +
@@ -4501,6 +4945,10 @@ void tinta_hit_test(TintaApp *app, float x, float y, size_t *position,
             *position = nearest->doc_start;
         } else if (x >= right) {
             *position = nearest->doc_start + nearest->doc_length;
+        } else if (nearest->atomic) {
+            *position = x < nearest->x + nearest->width * 0.5f ?
+                nearest->doc_start :
+                nearest->doc_start + nearest->doc_length;
         } else {
             BOOL trailing = FALSE, inside = FALSE;
             TintaDWriteHitTestMetrics metrics;

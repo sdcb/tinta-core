@@ -13,10 +13,25 @@ typedef struct ParserContext {
     TintaVec stack;
     TintaStr8 current_text;
     const char *input_start;
+    const char *original_start;
+    const size_t *offset_map;
+    size_t span_cursor;
+    TintaVec math_delimiters;
+    size_t next_math_delimiter;
     bool failed;
     bool suppress_rp_text;
     size_t max_depth;
 } ParserContext;
+
+typedef struct MathDelimiter {
+    size_t normalized_start;
+    size_t normalized_content;
+    size_t original_start;
+    size_t original_length;
+    size_t original_content_start;
+    size_t original_content_length;
+    bool display;
+} MathDelimiter;
 
 static _Thread_local size_t current_node_limit;
 static _Thread_local size_t current_node_count;
@@ -52,6 +67,14 @@ static bool is_space_char(char value) {
 
 static char *empty_string(void) { return tinta_str8_dup("", 0); }
 
+static size_t context_source_offset(const ParserContext *context,
+                                    const char *pointer) {
+    size_t offset;
+    if (!context || !pointer || pointer < context->input_start) return SIZE_MAX;
+    offset = (size_t)(pointer - context->input_start);
+    return context->offset_map ? context->offset_map[offset] : offset;
+}
+
 TintaElement *tinta_element_create(TintaElementType type) {
     if (current_node_limit && current_node_count >= current_node_limit)
         return NULL;
@@ -65,7 +88,9 @@ TintaElement *tinta_element_create(TintaElementType type) {
     element->url = empty_string();
     element->title = empty_string();
     element->language = empty_string();
-    if (!element->text || !element->url || !element->title || !element->language) {
+    element->raw = empty_string();
+    if (!element->text || !element->url || !element->title ||
+        !element->language || !element->raw) {
         tinta_element_destroy(element);
         return NULL;
     }
@@ -81,6 +106,7 @@ void tinta_element_destroy(TintaElement *element) {
     free(element->url);
     free(element->title);
     free(element->language);
+    free(element->raw);
     free(element);
 }
 
@@ -117,7 +143,9 @@ static TintaElement *context_current(ParserContext *context) {
 static bool context_flush_text(ParserContext *context) {
     TintaElement *current = context_current(context);
     if (!context->current_text.len || !current) return true;
-    if (current->type == TINTA_ELEMENT_HTML_BLOCK) {
+    if (current->type == TINTA_ELEMENT_HTML_BLOCK ||
+        current->type == TINTA_ELEMENT_MATH_INLINE ||
+        current->type == TINTA_ELEMENT_MATH_DISPLAY) {
         size_t old = strlen(current->text);
         char *text = (char *)realloc(current->text, old + context->current_text.len + 1);
         if (!text) return false;
@@ -265,6 +293,32 @@ static int enter_span(MD_SPANTYPE type, void *detail, void *userdata) {
         case MD_SPAN_EM: element = tinta_element_create(TINTA_ELEMENT_EMPHASIS); break;
         case MD_SPAN_STRONG: element = tinta_element_create(TINTA_ELEMENT_STRONG); break;
         case MD_SPAN_CODE: element = tinta_element_create(TINTA_ELEMENT_CODE); break;
+        case MD_SPAN_LATEXMATH:
+        case MD_SPAN_LATEXMATH_DISPLAY: {
+            size_t i;
+            bool display = type == MD_SPAN_LATEXMATH_DISPLAY;
+            element = tinta_element_create(display ?
+                TINTA_ELEMENT_MATH_DISPLAY : TINTA_ELEMENT_MATH_INLINE);
+            for (i = context->next_math_delimiter;
+                 element && i < context->math_delimiters.len; i++) {
+                const MathDelimiter *delimiter = TINTA_VEC_PTR(
+                    MathDelimiter, context->math_delimiters, i);
+                if (delimiter->normalized_start < context->span_cursor ||
+                    delimiter->display != display)
+                    continue;
+                if (!replace_string(&element->raw,
+                        context->original_start + delimiter->original_start,
+                        delimiter->original_length)) goto failed;
+                if (!replace_string(&element->text,
+                        context->original_start +
+                            delimiter->original_content_start,
+                        delimiter->original_content_length)) goto failed;
+                element->source_offset = delimiter->original_start;
+                context->next_math_delimiter = i + 1;
+                break;
+            }
+            break;
+        }
         case MD_SPAN_A: {
             MD_SPAN_A_DETAIL *a = (MD_SPAN_A_DETAIL *)detail;
             element = tinta_element_create(TINTA_ELEMENT_LINK);
@@ -295,6 +349,7 @@ static int leave_span(MD_SPANTYPE type, void *detail, void *userdata) {
     if (!context_flush_text(context)) { context->failed = true; return 1; }
     switch (type) {
         case MD_SPAN_EM: case MD_SPAN_STRONG: case MD_SPAN_CODE:
+        case MD_SPAN_LATEXMATH: case MD_SPAN_LATEXMATH_DISPLAY:
         case MD_SPAN_A: case MD_SPAN_IMG: context_pop(context); break;
         default: break;
     }
@@ -383,7 +438,9 @@ static int text_callback(MD_TEXTTYPE type, const MD_CHAR *text, MD_SIZE size, vo
     ParserContext *context = (ParserContext *)userdata;
     TintaElement *current = context_current(context);
     if (context->input_start && current && current->source_offset == SIZE_MAX)
-        current->source_offset = (size_t)(text - context->input_start);
+        current->source_offset = context_source_offset(context, text);
+    if (context->input_start && text >= context->input_start)
+        context->span_cursor = (size_t)(text - context->input_start) + size;
     switch (type) {
         case MD_TEXT_HTML:
             if (current && current->type != TINTA_ELEMENT_HTML_BLOCK && is_br_tag(text, size)) {
@@ -426,6 +483,11 @@ static int text_callback(MD_TEXTTYPE type, const MD_CHAR *text, MD_SIZE size, vo
         case MD_TEXT_CODE:
             if (!context->suppress_rp_text &&
                 !tinta_str8_append(&context->current_text, text, size)) goto failed;
+            break;
+        case MD_TEXT_LATEXMATH:
+            /* The exact body was copied from the original source when the
+               span opened. The parser-only buffer may normalize display
+               newlines, so never append its contents here. */
             break;
         case MD_TEXT_SOFTBR:
             if (!context_flush_text(context) || !context_add_leaf(context, TINTA_ELEMENT_SOFT_BREAK)) goto failed;
@@ -605,6 +667,270 @@ static void detect_alerts(TintaElement *parent) {
     if (!paragraph->child_count) remove_children(parent, 0, 1);
 }
 
+static bool byte_is_escaped(const char *text, size_t position) {
+    size_t slashes = 0;
+    while (position && text[position - 1] == '\\') {
+        slashes++;
+        position--;
+    }
+    return (slashes & 1u) != 0;
+}
+
+static bool append_normalized(TintaStr8 *output, TintaVec *offsets,
+                              const char *text, size_t length,
+                              size_t original_start,
+                              size_t original_length) {
+    size_t i;
+    if (!tinta_str8_append(output, text, length)) return false;
+    for (i = 0; i < length; i++) {
+        size_t mapped = original_start;
+        if (original_length)
+            mapped += i < original_length ? i : original_length - 1;
+        if (!tinta_vec_push(offsets, &mapped)) return false;
+    }
+    return true;
+}
+
+static bool append_math_content(TintaStr8 *output, TintaVec *offsets,
+                                const char *text, size_t length,
+                                size_t original_start, bool display) {
+    size_t i;
+    if (!display)
+        return append_normalized(output, offsets, text, length,
+                                 original_start, length);
+    for (i = 0; i < length; i++) {
+        char value = text[i] == '\r' || text[i] == '\n' ? ' ' : text[i];
+        if (!append_normalized(output, offsets, &value, 1,
+                               original_start + i, 1)) return false;
+    }
+    return true;
+}
+
+static bool append_literal_dollars(TintaStr8 *output, TintaVec *offsets,
+                                   size_t original_start, size_t count) {
+    size_t i;
+    for (i = 0; i < count; i++)
+        if (!append_normalized(output, offsets, "\\$", 2,
+                               original_start + i, 1)) return false;
+    return true;
+}
+
+static size_t find_backtick_close(const char *text, size_t length,
+                                  size_t from, size_t ticks) {
+    size_t i = from;
+    while (i < length) {
+        size_t run = 0;
+        if (text[i] != '`') { i++; continue; }
+        while (i + run < length && text[i + run] == '`') run++;
+        if (run == ticks) return i;
+        i += run;
+    }
+    return SIZE_MAX;
+}
+
+static bool fence_at(const char *text, size_t length, size_t position,
+                     char *marker, size_t *run_length) {
+    size_t line_start = position;
+    size_t first;
+    size_t run = 0;
+    while (line_start && text[line_start - 1] != '\n' &&
+           text[line_start - 1] != '\r') line_start--;
+    first = line_start;
+    while (first < position && first - line_start < 3 &&
+           text[first] == ' ') first++;
+    if (first != position || (text[position] != '`' && text[position] != '~'))
+        return false;
+    while (position + run < length && text[position + run] == text[position])
+        run++;
+    if (run < 3) return false;
+    *marker = text[position];
+    *run_length = run;
+    return true;
+}
+
+static size_t find_fence_end(const char *text, size_t length, size_t from,
+                             char marker, size_t opening_length) {
+    size_t line = from;
+    while (line < length) {
+        size_t first = line;
+        size_t run = 0;
+        size_t tail;
+        while (first < length && first - line < 3 && text[first] == ' ')
+            first++;
+        while (first + run < length && text[first + run] == marker) run++;
+        tail = first + run;
+        if (run >= opening_length) {
+            while (tail < length && text[tail] != '\r' && text[tail] != '\n' &&
+                   isspace((unsigned char)text[tail])) tail++;
+            if (tail == length || text[tail] == '\r' || text[tail] == '\n') {
+                while (tail < length && text[tail] != '\n') tail++;
+                if (tail < length) tail++;
+                return tail;
+            }
+        }
+        while (line < length && text[line] != '\n') line++;
+        if (line < length) line++;
+    }
+    return length;
+}
+
+static size_t find_slash_math_close(const char *text, size_t length,
+                                    size_t from, char closing,
+                                    bool multiline) {
+    size_t i;
+    for (i = from; i + 1 < length; i++) {
+        if (!multiline && (text[i] == '\r' || text[i] == '\n'))
+            return SIZE_MAX;
+        if (text[i] == '\\' && text[i + 1] == closing &&
+            !byte_is_escaped(text, i)) return i;
+    }
+    return SIZE_MAX;
+}
+
+static size_t find_dollar_close(const char *text, size_t length,
+                                size_t from, size_t delimiter_length) {
+    size_t i;
+    for (i = from; i + delimiter_length <= length; i++) {
+        if (delimiter_length == 1 &&
+            (text[i] == '\r' || text[i] == '\n')) return SIZE_MAX;
+        if (text[i] != '$' || byte_is_escaped(text, i)) continue;
+        if (delimiter_length == 2) {
+            if (i + 1 < length && text[i + 1] == '$') return i;
+        } else if ((i == 0 || text[i - 1] != '$') &&
+                   (i + 1 == length || text[i + 1] != '$') &&
+                   i > from && !isspace((unsigned char)text[i - 1])) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static bool normalize_math_delimiters(const char *source, size_t length,
+                                      TintaStr8 *normalized,
+                                      TintaVec *offsets,
+                                      TintaVec *delimiters) {
+    size_t i = 0;
+    tinta_str8_init(normalized);
+    tinta_vec_init(offsets, sizeof(size_t));
+    tinta_vec_init(delimiters, sizeof(MathDelimiter));
+    while (i < length) {
+        if ((source[i] == '`' || source[i] == '~') &&
+            !byte_is_escaped(source, i)) {
+            char marker;
+            size_t fence_length;
+            if (fence_at(source, length, i, &marker, &fence_length)) {
+                size_t end = find_fence_end(
+                    source, length, i + fence_length,
+                    marker, fence_length);
+                if (!append_normalized(normalized, offsets, source + i,
+                        end - i, i, end - i)) return false;
+                i = end;
+                continue;
+            }
+        }
+        if (source[i] == '`' && !byte_is_escaped(source, i)) {
+            size_t ticks = 1;
+            size_t close;
+            while (i + ticks < length && source[i + ticks] == '`') ticks++;
+            close = find_backtick_close(source, length, i + ticks, ticks);
+            if (close == SIZE_MAX) {
+                if (!append_normalized(normalized, offsets, source + i,
+                        ticks, i, ticks)) return false;
+                i += ticks;
+                continue;
+            }
+            if (!append_normalized(normalized, offsets, source + i,
+                    close + ticks - i, i, close + ticks - i)) return false;
+            i = close + ticks;
+            continue;
+        }
+        if (source[i] == '\\' && i + 1 < length &&
+            (source[i + 1] == '(' || source[i + 1] == '[') &&
+            !byte_is_escaped(source, i)) {
+            bool display = source[i + 1] == '[';
+            char closing = display ? ']' : ')';
+            size_t close = find_slash_math_close(
+                source, length, i + 2, closing, display);
+            if (close != SIZE_MAX && close > i + 2) {
+                const char *delimiter = display ? "$$" : "$";
+                size_t delimiter_length = display ? 2 : 1;
+                MathDelimiter match;
+                match.normalized_start = normalized->len;
+                if (!append_normalized(normalized, offsets, delimiter,
+                        delimiter_length, i, 2)) return false;
+                match.normalized_content = normalized->len;
+                if (!append_math_content(normalized, offsets,
+                        source + i + 2, close - i - 2,
+                        i + 2, display) ||
+                    !append_normalized(normalized, offsets, delimiter,
+                        delimiter_length, close, 2)) return false;
+                match.original_start = i;
+                match.original_length = close + 2 - i;
+                match.original_content_start = i + 2;
+                match.original_content_length = close - i - 2;
+                match.display = display;
+                if (!tinta_vec_push(delimiters, &match)) return false;
+                i = close + 2;
+                continue;
+            }
+            {
+                char literal[3] = {'\\', '\\', source[i + 1]};
+                if (!append_normalized(normalized, offsets, literal, 3,
+                        i, 2)) return false;
+            }
+            i += 2;
+            continue;
+        }
+        if (source[i] == '$' && !byte_is_escaped(source, i)) {
+            size_t delimiter_length = i + 1 < length && source[i + 1] == '$' ? 2 : 1;
+            size_t close;
+            if (delimiter_length == 1 && i + 1 < length &&
+                isspace((unsigned char)source[i + 1])) {
+                if (!append_literal_dollars(
+                        normalized, offsets, i, 1)) return false;
+                i++;
+                continue;
+            }
+            close = find_dollar_close(
+                source, length, i + delimiter_length, delimiter_length);
+            if (close != SIZE_MAX && close > i + delimiter_length) {
+                MathDelimiter match;
+                match.normalized_start = normalized->len;
+                match.normalized_content = normalized->len + delimiter_length;
+                match.original_start = i;
+                match.original_length = close + delimiter_length - i;
+                match.original_content_start = i + delimiter_length;
+                match.original_content_length =
+                    close - i - delimiter_length;
+                match.display = delimiter_length == 2;
+                if (!append_normalized(normalized, offsets, source + i,
+                        delimiter_length, i, delimiter_length) ||
+                    !append_math_content(normalized, offsets,
+                        source + match.original_content_start,
+                        match.original_content_length,
+                        match.original_content_start, match.display) ||
+                    !append_normalized(normalized, offsets, source + close,
+                        delimiter_length, close, delimiter_length) ||
+                    !tinta_vec_push(delimiters, &match)) return false;
+                i += match.original_length;
+                continue;
+            }
+            if (!append_literal_dollars(normalized, offsets, i,
+                    delimiter_length)) return false;
+            i += delimiter_length;
+            continue;
+        }
+        if (!append_normalized(normalized, offsets, source + i, 1, i, 1))
+            return false;
+        i++;
+    }
+    {
+        size_t end = length;
+        if (!tinta_vec_push(offsets, &end)) return false;
+    }
+    return true;
+}
+
 TintaMarkdownOptions tinta_markdown_default_options(void) {
     TintaMarkdownOptions options;
     options.tab_width = 4;
@@ -624,23 +950,32 @@ TintaParseResult tinta_markdown_parse(const char *markdown, size_t length,
     ParserContext context;
     MD_PARSER parser;
     unsigned flags = MD_FLAG_NOINDENTEDCODEBLOCKS;
+    TintaStr8 normalized;
+    TintaVec offsets;
     uint64_t start;
     int status;
     memset(&result, 0, sizeof(result));
     memset(&context, 0, sizeof(context));
+    memset(&normalized, 0, sizeof(normalized));
+    memset(&offsets, 0, sizeof(offsets));
     if (!markdown && length) { result.error = tinta_str8_dup("Invalid markdown", 16); return result; }
+    if (!normalize_math_delimiters(markdown ? markdown : "", length,
+            &normalized, &offsets, &context.math_delimiters)) goto failed;
     current_node_limit = options.max_nodes;
     current_node_count = 0;
     context.max_depth = options.max_depth;
     context.root = tinta_element_create(TINTA_ELEMENT_DOCUMENT);
     tinta_vec_init(&context.stack, sizeof(TintaElement *));
     tinta_str8_init(&context.current_text);
-    context.input_start = markdown ? markdown : "";
+    context.input_start = normalized.data ? normalized.data : "";
+    context.original_start = markdown ? markdown : "";
+    context.offset_map = (const size_t *)offsets.data;
     if (!context.root || !tinta_vec_push(&context.stack, &context.root)) goto failed;
     if (options.tables) flags |= MD_FLAG_TABLES;
     if (options.permissive_auto_links) flags |= MD_FLAG_PERMISSIVEAUTOLINKS;
     if (options.permissive_urls) flags |= MD_FLAG_PERMISSIVEURLAUTOLINKS;
     if (options.task_lists) flags |= MD_FLAG_TASKLISTS;
+    flags |= MD_FLAG_LATEXMATHSPANS;
     memset(&parser, 0, sizeof(parser));
     parser.flags = flags;
     parser.enter_block = enter_block;
@@ -649,7 +984,8 @@ TintaParseResult tinta_markdown_parse(const char *markdown, size_t length,
     parser.leave_span = leave_span;
     parser.text = text_callback;
     start = markdown_time_us();
-    status = md_parse(context.input_start, (MD_SIZE)length, &parser, &context);
+    status = md_parse(context.input_start, (MD_SIZE)normalized.len,
+                      &parser, &context);
     {
         uint64_t elapsed = markdown_time_us() - start;
         result.parse_time_us = elapsed > (uint64_t)SIZE_MAX ?
@@ -662,14 +998,20 @@ TintaParseResult tinta_markdown_parse(const char *markdown, size_t length,
     result.root = context.root;
     result.success = true;
     tinta_vec_destroy(&context.stack);
+    tinta_vec_destroy(&context.math_delimiters);
     tinta_str8_destroy(&context.current_text);
+    tinta_str8_destroy(&normalized);
+    tinta_vec_destroy(&offsets);
     current_node_limit = 0;
     current_node_count = 0;
     return result;
 failed:
     tinta_element_destroy(context.root);
     tinta_vec_destroy(&context.stack);
+    tinta_vec_destroy(&context.math_delimiters);
     tinta_str8_destroy(&context.current_text);
+    tinta_str8_destroy(&normalized);
+    tinta_vec_destroy(&offsets);
     result.error = tinta_str8_dup("Failed to parse markdown", 24);
     current_node_limit = 0;
     current_node_count = 0;
@@ -709,7 +1051,7 @@ void tinta_parse_result_destroy(TintaParseResult *result) {
 const char *tinta_element_type_name(TintaElementType type) {
     static const char *names[] = {"Document", "Paragraph", "Heading", "CodeBlock", "MermaidDiagram",
         "BlockQuote", "List", "ListItem", "HorizontalRule", "Table", "TableRow", "TableCell",
-        "HtmlBlock", "Text", "Code", "Emphasis", "Strong", "Link", "Image", "SoftBreak",
+        "HtmlBlock", "Text", "Code", "MathInline", "MathDisplay", "Emphasis", "Strong", "Link", "Image", "SoftBreak",
         "HardBreak", "Ruby", "RubyText", "Highlight", "Superscript", "Subscript", "Strikethrough",
         "Details", "Summary", "DetailsEnd"};
     return (unsigned)type < sizeof(names) / sizeof(names[0]) ? names[type] : "Unknown";

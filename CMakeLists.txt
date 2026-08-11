@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TintaCore VERSION 1.1.0 LANGUAGES C)
+project(TintaCore VERSION 1.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -22,6 +22,7 @@ option(TINTA_ENABLE_SYNTAX "Enable code-block syntax highlighting" ON)
 option(TINTA_ENABLE_REMOTE_IMAGES "Enable remote image downloads" ON)
 option(TINTA_ENABLE_LOCAL_IMAGES "Enable local image decoding" ON)
 option(TINTA_ENABLE_SVG "Enable Direct2D SVG rendering" ON)
+option(TINTA_ENABLE_MATH "Enable native TeX math layout and rendering" ON)
 
 set(TINTA_CORE_SOURCES
     vendor/md4c/src/md4c.c
@@ -37,6 +38,11 @@ set(TINTA_CORE_SOURCES
     src/stream_async.c
     src/themes.c
     src/win32_utils.c)
+
+if(TINTA_ENABLE_MATH)
+    list(APPEND TINTA_CORE_SOURCES
+        src/math.c src/math_layout.c src/math_opentype.c)
+endif()
 
 if(TINTA_ENABLE_MERMAID)
     list(APPEND TINTA_CORE_SOURCES src/mermaid.c)
@@ -81,7 +87,8 @@ target_compile_definitions(tinta_core PRIVATE UNICODE _UNICODE TINTA_CORE_BUILD
     TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
     TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
     TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
-    TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
+    TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
+    TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
 if(BUILD_SHARED_LIBS)
     target_compile_definitions(tinta_core PUBLIC TINTA_CORE_SHARED)
 endif()
@@ -122,6 +129,10 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
     endif()
     set(TINTA_TEST_SUPPORT_SOURCES
         vendor/md4c/src/md4c.c src/core.c src/document.c src/markdown.c)
+    if(TINTA_ENABLE_MATH)
+        list(APPEND TINTA_TEST_SUPPORT_SOURCES
+            src/math.c src/math_layout.c src/math_opentype.c)
+    endif()
     if(TINTA_ENABLE_MERMAID)
         list(APPEND TINTA_TEST_SUPPORT_SOURCES src/mermaid.c)
     endif()
@@ -138,7 +149,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         _CRT_SECURE_NO_WARNINGS
         TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
         TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
-        TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
+        TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
+        TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
     if(MSVC)
         target_compile_options(tinta_test_support PRIVATE /utf-8 /W4)
         set_source_files_properties(vendor/md4c/src/md4c.c PROPERTIES
@@ -161,7 +173,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
                 TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
                 TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
                 TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
-                TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
+                TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
+                TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
             target_link_libraries(tinta_layout_test_support PRIVATE
                 d2d1 dwrite advapi32 shell32 shlwapi)
             if(TINTA_ENABLE_REMOTE_IMAGES OR TINTA_ENABLE_LOCAL_IMAGES)
@@ -187,6 +200,9 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             tests/test_harness.cpp
             tests/core_tests.cpp
             tests/document_tests.cpp)
+        if(TINTA_ENABLE_MATH)
+            list(APPEND TINTA_UNIT_TEST_SOURCES tests/math_tests.cpp)
+        endif()
         if(TINTA_ENABLE_SVG)
             list(APPEND TINTA_UNIT_TEST_SOURCES tests/svg_tests.cpp)
         endif()
@@ -202,7 +218,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         target_compile_definitions(tinta_unit_tests PRIVATE
             TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
             TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
-            TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
+            TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
+            TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
         add_test(NAME unit COMMAND tinta_unit_tests)
         set_tests_properties(unit PROPERTIES LABELS unit)
 
@@ -212,7 +229,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         target_compile_definitions(layout_tests PRIVATE
             TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
             TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
-            TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>)
+            TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
+            TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
         add_test(NAME renderer_layout COMMAND layout_tests)
         set_tests_properties(renderer_layout PROPERTIES LABELS layout)
 
@@ -226,7 +244,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             TINTA_ENABLE_UIA=$<BOOL:${TINTA_ENABLE_UIA}>
             TINTA_ENABLE_REMOTE_IMAGES=$<BOOL:${TINTA_ENABLE_REMOTE_IMAGES}>
             TINTA_ENABLE_LOCAL_IMAGES=$<BOOL:${TINTA_ENABLE_LOCAL_IMAGES}>
-            TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>)
+            TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
+            TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
         add_test(NAME markdown_control COMMAND control_tests)
         set_tests_properties(markdown_control PROPERTIES LABELS control)
         if(TINTA_ENABLE_UIA)
@@ -245,6 +264,12 @@ if(TINTA_BUILD_FUZZERS)
     target_include_directories(tinta_markdown_fuzzer PRIVATE
         src/internal vendor/md4c/src)
     target_link_libraries(tinta_markdown_fuzzer PRIVATE tinta_test_support)
+
+    if(TINTA_ENABLE_MATH)
+        add_executable(tinta_math_fuzzer fuzz/math_fuzzer.c)
+        target_include_directories(tinta_math_fuzzer PRIVATE src/internal)
+        target_link_libraries(tinta_math_fuzzer PRIVATE tinta_test_support)
+    endif()
 endif()
 
 if(TINTA_BUILD_BENCHMARKS)

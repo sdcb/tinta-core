@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.0
+
+- Added native inline and display Markdown math for `$...$`, `$$...$$`,
+  `\\(...\\)` and `\\[...\\]`, preserving the original source delimiters,
+  offsets, selection, search, copy and UI Automation text.
+- Added a bounded pure-C TeX AST and box-layout engine for fractions, roots,
+  scripts, scalable delimiters, large operators, accents, common symbols,
+  styles, matrices, cases and aligned environments. Unsupported or malformed
+  formulas fall back atomically to their original LaTeX.
+- Added Cambria Math rendering through DirectWrite, with safe big-endian
+  OpenType `MATH` table validation, glyph variant/assembly readers and a
+  runtime fallback when a usable system math font is unavailable.
+- Added baseline-aware inline formula placement and block-local horizontal
+  scrolling for overwide display formulas.
+- Added the default-on `TINTA_ENABLE_MATH` build option and
+  `TINTA_CAPABILITY_MATH`; math-disabled builds retain delimiter recognition
+  and render the original LaTeX source.
+- Added TeX parser fuzzing and Markdown, OpenType, layout and interaction
+  regression coverage for math.
+
 ## 1.1.0
 
 - Added an opt-in Copy button at the document's top-right that scrolls with

@@ -219,7 +219,7 @@ int main() {
     capabilities.cb_size = sizeof(capabilities);
     if (!SendMessageW(view, TMM_GETVERSION, 0,
                       reinterpret_cast<LPARAM>(&version)) ||
-        version.major != 1 || version.minor != 1 ||
+        version.major != 1 || version.minor != 2 ||
         !SendMessageW(view, TMM_GETCAPABILITIES, 0,
                       reinterpret_cast<LPARAM>(&capabilities)) ||
         !(capabilities.flags & TINTA_CAPABILITY_STREAMING) ||
@@ -238,6 +238,17 @@ int main() {
 #else
     if (capabilities.flags & TINTA_CAPABILITY_SVG) {
         std::cerr << "trimmed SVG capability was reported\n";
+        return 1;
+    }
+#endif
+#if TINTA_ENABLE_MATH
+    if (!(capabilities.flags & TINTA_CAPABILITY_MATH)) {
+        std::cerr << "math capability missing\n";
+        return 1;
+    }
+#else
+    if (capabilities.flags & TINTA_CAPABILITY_MATH) {
+        std::cerr << "trimmed math capability was reported\n";
         return 1;
     }
 #endif
@@ -1127,6 +1138,22 @@ int main() {
         !SendMessageW(view, TMM_GETFINDSTATE, 0, reinterpret_cast<LPARAM>(&state)) ||
         state.match_count != 1) {
         std::cerr << "find API failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(
+                     L"before $\\frac{alpha}{beta}$ after"));
+    SendMessageW(view, WM_PAINT, 0, 0);
+    find.text = L"\\frac{alpha}";
+    find.text_length = 12;
+    state = {};
+    state.cb_size = sizeof(state);
+    if (!SendMessageW(view, TMM_FIND, 0,
+                      reinterpret_cast<LPARAM>(&find)) ||
+        !SendMessageW(view, TMM_GETFINDSTATE, 0,
+                      reinterpret_cast<LPARAM>(&state)) ||
+        state.match_count != 1) {
+        std::cerr << "math source was not searchable\n";
         return 1;
     }
     SendMessageW(view, TMM_SELECTALL, 0, 0);

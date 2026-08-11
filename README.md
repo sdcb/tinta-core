@@ -1,6 +1,6 @@
 # Tinta Core [![GitHub](https://img.shields.io/badge/GitHub-sdcb%2Ftinta--core-181717?logo=github)](https://github.com/sdcb/tinta-core) [![QQ](https://img.shields.io/badge/QQ_Group-495782587-52B6EF?style=social&logo=tencent-qq&logoColor=000&logoWidth=20)](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=mma4msRKd372Z6dWpmBp4JZ9RL4Jrf8X&authKey=gccTx0h0RaH5b8B8jtuPJocU7MgFRUznqbV%2FLgsKdsK8RqZE%2BOhnETQ7nYVTp1W0&noverify=0&group_code=495782587)
 
-Tinta Core is a C11 Win32 Markdown and Mermaid viewing control. It exposes the
+Tinta Core is a C11 Win32 Markdown, math, and Mermaid viewing control. It exposes the
 window class `Tinta.MarkdownView`, supports normal `CreateWindowExW` hosting,
 and uses window messages and `WM_NOTIFY` for integration.
 
@@ -32,7 +32,8 @@ cmake -S . -B build-mini -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DTINTA_ENABLE_SYNTAX=OFF ^
   -DTINTA_ENABLE_REMOTE_IMAGES=OFF ^
   -DTINTA_ENABLE_LOCAL_IMAGES=OFF ^
-  -DTINTA_ENABLE_SVG=OFF
+  -DTINTA_ENABLE_SVG=OFF ^
+  -DTINTA_ENABLE_MATH=OFF
 cmake --build build-mini --target tinta_minimal
 ```
 
@@ -42,7 +43,8 @@ Mermaid source falls back to a normal code block, code blocks use plain
 monospace text without syntax coloring, and unavailable images fall back to a
 clickable link. The link uses the alt text when present and the source URI
 otherwise. `TMM_GETOPTIONS` does not report image capabilities that were
-compiled out.
+compiled out. Math delimiters remain recognized when native math is disabled,
+but formulas are displayed as their original LaTeX source.
 
 The examples include `tinta_minimal`, the feature-oriented `tinta_demo`, and
 `tinta_chat_demo`. The chat demo hosts one Markdown control per message,
@@ -109,6 +111,15 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   and interaction, and punctuation after a code pill has no synthetic space.
 - Inline and block HTML `<sub>`/`<sup>` map to native script text while
   preserving nested emphasis, links, code, selection, search, and copy.
+- Inline `$...$` and `\\(...\\)` formulas participate in text flow with
+  baseline-aware ascent and descent. Display `$$...$$` and `\\[...\\]`
+  formulas occupy their own centered line, may span source lines, and receive
+  block-local horizontal scrolling when wider than the viewport.
+- Native math uses the system `Cambria Math` face and validates its OpenType
+  `MATH` table before use. Fractions, roots, scripts, scalable delimiters,
+  large operators, accents, common symbols and matrix/alignment environments
+  are supported. Unknown commands, invalid structures, exhausted AST limits,
+  or a missing/invalid math font fall back to the exact original LaTeX.
 - GitHub-style `<details>`/`<summary>` can wrap Markdown blocks, including
   nested Details, Code, Mermaid, images, and SVG. Summary rows toggle with an
   animated chevron; `open` controls the initial state, and search or UIA
@@ -155,7 +166,9 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
   the loaded build and current document without relying on compile-time
   assumptions. `TINTA_CAPABILITY_SVG` reports that SVG support was compiled
   in; rendering can still fall back when the current Windows version does not
-  expose `ID2D1DeviceContext5`.
+  expose `ID2D1DeviceContext5`. `TINTA_CAPABILITY_MATH` reports that native
+  math layout was compiled in; formulas still fall back when no usable
+  Cambria Math `MATH` table is installed.
 
 `Tinta.MarkdownView` exposes the UI Automation Document, Text and Scroll
 patterns. Headings and links appear as semantic children, and links implement

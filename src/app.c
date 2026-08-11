@@ -5,6 +5,21 @@
 #include "svg.h"
 #endif
 
+#if TINTA_ENABLE_MATH
+void tinta_app_clear_math_cache(TintaApp *app) {
+    size_t i;
+    if (!app) return;
+    for (i = 0; i < app->math_cache.len; i++) {
+        TintaMathCacheEntry *entry = TINTA_VEC_PTR(
+            TintaMathCacheEntry, app->math_cache, i);
+        tinta_math_node_destroy(entry->parsed.root);
+        tinta_math_layout_destroy(&entry->layout);
+    }
+    tinta_vec_clear(&app->math_cache);
+    app->math_ast_nodes_used = 0;
+}
+#endif
+
 #include <commdlg.h>
 #include <limits.h>
 #include <math.h>
@@ -803,6 +818,9 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
 #if TINTA_ENABLE_MERMAID
     tinta_vec_init(&app->mermaid_cache, sizeof(TintaMermaidCacheEntry));
 #endif
+#if TINTA_ENABLE_MATH
+    tinta_vec_init(&app->math_cache, sizeof(TintaMathCacheEntry));
+#endif
     tinta_vec_init(&app->viewer_search_matches, sizeof(TintaSearchMatch));
     app->viewer_search_index = -1;
 #if TINTA_ENABLE_REMOTE_IMAGES
@@ -844,11 +862,17 @@ void tinta_app_destroy(TintaApp *app) {
 #if TINTA_ENABLE_MERMAID
     tinta_app_clear_mermaid_cache(app);
 #endif
+#if TINTA_ENABLE_MATH
+    tinta_app_clear_math_cache(app);
+#endif
     tinta_layout_clear(app);
     tinta_parse_result_destroy(&app->document);
     tinta_vec_destroy(&app->image_resources);
 #if TINTA_ENABLE_MERMAID
     tinta_vec_destroy(&app->mermaid_cache);
+#endif
+#if TINTA_ENABLE_MATH
+    tinta_vec_destroy(&app->math_cache);
 #endif
     tinta_vec_destroy(&app->viewer_search_matches);
     tinta_str8_destroy(&app->source);
@@ -1449,6 +1473,9 @@ void tinta_app_commit_prepared_source(TintaApp *app,
     if (!app || !prepared || !prepared->document.success) return;
 #if TINTA_ENABLE_MERMAID
     tinta_app_clear_mermaid_cache(app);
+#endif
+#if TINTA_ENABLE_MATH
+    tinta_app_clear_math_cache(app);
 #endif
     tinta_parse_result_destroy(&app->document);
     app->document = prepared->document;
