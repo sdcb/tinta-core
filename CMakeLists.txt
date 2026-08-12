@@ -113,7 +113,7 @@ if(TINTA_BUILD_EXAMPLES)
     target_compile_definitions(tinta_minimal PRIVATE UNICODE _UNICODE)
 
     add_executable(tinta_demo WIN32 examples/demo.c)
-    target_link_libraries(tinta_demo PRIVATE Tinta::Core comdlg32)
+    target_link_libraries(tinta_demo PRIVATE Tinta::Core comctl32 comdlg32)
     target_compile_definitions(tinta_demo PRIVATE UNICODE _UNICODE)
 
     add_executable(tinta_chat_demo WIN32 examples/chat_demo.c)

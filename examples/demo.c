@@ -1,5 +1,6 @@
 #include "tinta_core.h"
 
+#include <commctrl.h>
 #include <commdlg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -7,15 +8,27 @@
 #include <string.h>
 #include <windows.h>
 
+#ifdef _MSC_VER
+#pragma comment(linker, \
+    "\"/manifestdependency:type='win32' " \
+    "name='Microsoft.Windows.Common-Controls' version='6.0.0.0' " \
+    "processorArchitecture='*' publicKeyToken='6595b64144ccf1df' " \
+    "language='*'\"")
+#endif
+
 enum {
     ID_OPEN = 100, ID_SEARCH = 101, ID_NEXT = 102, ID_THEME = 103,
-    ID_CUSTOM = 104, ID_TOC = 105, ID_VIEW = 200, ID_STATUS = 201
+    ID_CUSTOM = 104, ID_TOC = 105, ID_VIEW = 200, ID_STATUS = 201,
+    ID_TOOLBAR = 202
 };
 
 static HWND g_view;
 static HWND g_search;
 static HWND g_toc;
 static HWND g_status;
+static HWND g_toolbar;
+static HFONT g_ui_font;
+static bool g_ui_font_owned;
 static int g_theme;
 
 static const char DEFAULT_MARKDOWN[] =
@@ -108,18 +121,23 @@ static const char DEFAULT_MARKDOWN[] =
     "Markdown file with **Open** when you want to try your own content.";
 
 static void set_status(const wchar_t *text) {
-    if (g_status) SetWindowTextW(g_status, text ? text : L"");
+    if (g_status)
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(text ? text : L""));
 }
 
 static void populate_toc(void) {
     LRESULT count;
     size_t index;
-    SendMessageW(g_toc, LB_RESETCONTENT, 0, 0);
+    HTREEITEM parents[6] = {0};
+    TreeView_DeleteAllItems(g_toc);
     count = SendMessageW(g_view, TMM_GETHEADINGCOUNT, 0, 0);
     for (index = 0; index < (size_t)count; index++) {
         wchar_t text[256];
         wchar_t anchor[256];
         TintaHeadingInfo info;
+        TVINSERTSTRUCTW insert;
+        HTREEITEM item;
+        unsigned int level;
         memset(&info, 0, sizeof(info));
         info.cb_size = sizeof(info);
         info.index = index;
@@ -127,9 +145,102 @@ static void populate_toc(void) {
         info.text_capacity = _countof(text);
         info.anchor = anchor;
         info.anchor_capacity = _countof(anchor);
-        if (SendMessageW(g_view, TMM_GETHEADING, 0, (LPARAM)&info))
-            SendMessageW(g_toc, LB_ADDSTRING, 0, (LPARAM)text);
+        if (!SendMessageW(g_view, TMM_GETHEADING, 0, (LPARAM)&info))
+            continue;
+        level = info.level >= 1 && info.level <= 6 ? info.level : 1;
+        memset(&insert, 0, sizeof(insert));
+        insert.hParent = level > 1 && parents[level - 2] ?
+            parents[level - 2] : TVI_ROOT;
+        insert.hInsertAfter = TVI_LAST;
+        insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+        insert.item.pszText = text;
+        insert.item.lParam = (LPARAM)index;
+        item = TreeView_InsertItem(g_toc, &insert);
+        if (item) {
+            unsigned int deeper;
+            parents[level - 1] = item;
+            for (deeper = level; deeper < _countof(parents); deeper++)
+                parents[deeper] = NULL;
+            if (insert.hParent != TVI_ROOT)
+                TreeView_Expand(g_toc, insert.hParent, TVE_EXPAND);
+        }
     }
+}
+
+static bool create_toolbar(HWND parent) {
+    TBBUTTON buttons[5];
+    UINT dpi = GetDpiForWindow(parent);
+    size_t index;
+    static const int commands[] = {
+        ID_OPEN, ID_SEARCH, ID_NEXT, ID_THEME, ID_CUSTOM
+    };
+    static const wchar_t *labels[] = {
+        L"Open", NULL, L"Find", L"Theme", L"Custom"
+    };
+    g_toolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, NULL,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN |
+        TBSTYLE_FLAT | TBSTYLE_TOOLTIPS |
+        CCS_TOP | CCS_NODIVIDER,
+        0, 0, 0, 0, parent, (HMENU)ID_TOOLBAR, GetModuleHandleW(NULL), NULL);
+    if (!g_toolbar) return false;
+    SendMessageW(g_toolbar, WM_SETFONT, (WPARAM)g_ui_font, FALSE);
+    SendMessageW(g_toolbar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    SendMessageW(g_toolbar, TB_SETEXTENDEDSTYLE, 0,
+                 TBSTYLE_EX_MIXEDBUTTONS | TBSTYLE_EX_DOUBLEBUFFER);
+    SendMessageW(g_toolbar, TB_SETBUTTONSIZE, 0,
+                 MAKELPARAM(MulDiv(24, dpi, 96), MulDiv(28, dpi, 96)));
+    memset(buttons, 0, sizeof(buttons));
+    for (index = 0; index < _countof(buttons); index++) {
+        buttons[index].iBitmap = index == 1 ? MulDiv(220, dpi, 96) :
+                                             I_IMAGENONE;
+        buttons[index].idCommand = commands[index];
+        buttons[index].fsState = TBSTATE_ENABLED;
+        buttons[index].fsStyle = index == 1 ? BTNS_SEP :
+            BTNS_BUTTON | BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+        buttons[index].iString = (INT_PTR)labels[index];
+    }
+    if (!SendMessageW(g_toolbar, TB_ADDBUTTONS, _countof(buttons),
+                      (LPARAM)buttons))
+        return false;
+    SendMessageW(g_toolbar, TB_AUTOSIZE, 0, 0);
+    return true;
+}
+
+static int child_height(HWND child) {
+    RECT rect;
+    if (!child || !GetWindowRect(child, &rect)) return 0;
+    return rect.bottom - rect.top;
+}
+
+static void layout_children(HWND hwnd) {
+    RECT client;
+    RECT search_rect;
+    int toolbar_height;
+    int status_height;
+    int content_top;
+    int content_height;
+    int toc_width;
+    GetClientRect(hwnd, &client);
+    if (g_toolbar) SendMessageW(g_toolbar, TB_AUTOSIZE, 0, 0);
+    if (g_status) SendMessageW(g_status, WM_SIZE, 0, 0);
+    toolbar_height = child_height(g_toolbar);
+    status_height = child_height(g_status);
+    content_top = toolbar_height;
+    content_height = max(1, client.bottom - toolbar_height - status_height);
+    toc_width = MulDiv(220, GetDpiForWindow(hwnd), 96);
+    if (g_search && g_toolbar &&
+        SendMessageW(g_toolbar, TB_GETRECT, ID_SEARCH,
+                     (LPARAM)&search_rect)) {
+        SetWindowPos(g_search, HWND_TOP, search_rect.left + 4,
+            search_rect.top + 3, max(1, search_rect.right - search_rect.left - 8),
+            max(1, search_rect.bottom - search_rect.top - 6),
+            SWP_NOACTIVATE);
+    }
+    if (g_toc)
+        MoveWindow(g_toc, 0, content_top, toc_width, content_height, TRUE);
+    if (g_view)
+        MoveWindow(g_view, toc_width, content_top,
+            max(1, client.right - toc_width), content_height, TRUE);
 }
 
 static void apply_custom_theme(void) {
@@ -239,38 +350,33 @@ static void run_search(void) {
 static LRESULT CALLBACK demo_proc(HWND hwnd, UINT message,
                                   WPARAM wparam, LPARAM lparam) {
     switch (message) {
-        case WM_CREATE:
-            CreateWindowW(L"BUTTON", L"Open", WS_CHILD | WS_VISIBLE,
-                8, 8, 64, 26, hwnd, (HMENU)ID_OPEN, GetModuleHandleW(NULL), NULL);
+        case WM_CREATE: {
+            if (!create_toolbar(hwnd)) return -1;
             g_search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 80, 8, 220, 26,
-                hwnd, (HMENU)ID_SEARCH, GetModuleHandleW(NULL), NULL);
-            CreateWindowW(L"BUTTON", L"Find", WS_CHILD | WS_VISIBLE,
-                308, 8, 64, 26, hwnd, (HMENU)ID_NEXT, GetModuleHandleW(NULL), NULL);
-            CreateWindowW(L"BUTTON", L"Theme", WS_CHILD | WS_VISIBLE,
-                380, 8, 70, 26, hwnd, (HMENU)ID_THEME, GetModuleHandleW(NULL), NULL);
-            CreateWindowW(L"BUTTON", L"Custom", WS_CHILD | WS_VISIBLE,
-                458, 8, 72, 26, hwnd, (HMENU)ID_CUSTOM, GetModuleHandleW(NULL), NULL);
-            g_toc = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-                WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL,
-                0, 42, 220, 1, hwnd, (HMENU)ID_TOC, GetModuleHandleW(NULL), NULL);
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 1, 1,
+                g_toolbar, (HMENU)ID_SEARCH, GetModuleHandleW(NULL), NULL);
+            g_toc = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASBUTTONS |
+                TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS,
+                0, 0, 1, 1, hwnd, (HMENU)ID_TOC, GetModuleHandleW(NULL), NULL);
             g_view = CreateWindowExW(0, TINTA_MARKDOWN_VIEW_CLASSW,
                 L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP, 220, 42, 1, 1,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 1, 1,
                 hwnd, (HMENU)ID_VIEW, GetModuleHandleW(NULL), NULL);
-            g_status = CreateWindowW(L"STATIC", L"Ready",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 8, 1, 1, 22,
+            g_status = CreateWindowExW(0, STATUSCLASSNAMEW, L"Ready",
+                WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 1, 1,
                 hwnd, (HMENU)ID_STATUS, GetModuleHandleW(NULL), NULL);
-            if (g_view) load_default_document();
+            if (!g_search || !g_toc || !g_view || !g_status) return -1;
+            SendMessageW(g_search, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            SendMessageW(g_toc, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            SendMessageW(g_status, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            load_default_document();
             populate_toc();
-            return g_view ? 0 : -1;
+            layout_children(hwnd);
+            return 0;
+        }
         case WM_SIZE:
-            if (g_toc) MoveWindow(g_toc, 0, 42, 220,
-                max(1, HIWORD(lparam) - 66), TRUE);
-            if (g_view) MoveWindow(g_view, 220, 42,
-                max(1, LOWORD(lparam) - 220), max(1, HIWORD(lparam) - 66), TRUE);
-            if (g_status) MoveWindow(g_status, 8, max(42, HIWORD(lparam) - 22),
-                max(1, LOWORD(lparam) - 16), 20, TRUE);
+            layout_children(hwnd);
             return 0;
         case WM_COMMAND:
             if (LOWORD(wparam) == ID_OPEN) open_document(hwnd);
@@ -282,15 +388,17 @@ static LRESULT CALLBACK demo_proc(HWND hwnd, UINT message,
             } else if (LOWORD(wparam) == ID_CUSTOM) {
                 apply_custom_theme();
                 set_status(L"Applied custom host theme");
-            } else if (LOWORD(wparam) == ID_TOC &&
-                       HIWORD(wparam) == LBN_SELCHANGE) {
-                LRESULT selected = SendMessageW(g_toc, LB_GETCURSEL, 0, 0);
-                if (selected != LB_ERR)
-                    SendMessageW(g_view, TMM_SCROLLTOHEADING, selected, 0);
             }
             return 0;
         case WM_NOTIFY: {
             NMHDR *header = (NMHDR *)lparam;
+            if (header && header->hwndFrom == g_toc &&
+                header->code == TVN_SELCHANGEDW) {
+                const NMTREEVIEWW *tree = (const NMTREEVIEWW *)header;
+                SendMessageW(g_view, TMM_SCROLLTOHEADING,
+                             (WPARAM)tree->itemNew.lParam, 0);
+                return TRUE;
+            }
             if (header && header->code == TMN_REQUESTFIND) {
                 SetFocus(g_search);
                 SendMessageW(g_search, EM_SETSEL, 0, -1);
@@ -319,6 +427,11 @@ static LRESULT CALLBACK demo_proc(HWND hwnd, UINT message,
             break;
         }
         case WM_DESTROY:
+            if (g_ui_font_owned) {
+                DeleteObject(g_ui_font);
+            }
+            g_ui_font = NULL;
+            g_ui_font_owned = false;
             PostQuitMessage(0);
             return 0;
     }
@@ -327,12 +440,25 @@ static LRESULT CALLBACK demo_proc(HWND hwnd, UINT message,
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous,
                     PWSTR command_line, int show) {
+    INITCOMMONCONTROLSEX common;
+    NONCLIENTMETRICSW metrics;
     WNDCLASSW window_class = {0};
     HWND window;
     MSG message;
     (void)previous;
     (void)command_line;
     SetProcessDPIAware();
+    memset(&common, 0, sizeof(common));
+    common.dwSize = sizeof(common);
+    common.dwICC = ICC_BAR_CLASSES | ICC_TREEVIEW_CLASSES;
+    if (!InitCommonControlsEx(&common)) return 1;
+    memset(&metrics, 0, sizeof(metrics));
+    metrics.cbSize = sizeof(metrics);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
+                              &metrics, 0))
+        g_ui_font = CreateFontIndirectW(&metrics.lfMessageFont);
+    g_ui_font_owned = g_ui_font != NULL;
+    if (!g_ui_font) g_ui_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     if (FAILED(TintaCoreInitialize())) return 1;
     window_class.lpfnWndProc = demo_proc;
     window_class.hInstance = instance;
