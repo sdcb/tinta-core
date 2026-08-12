@@ -68,6 +68,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous,
     MSG message;
     (void)previous;
     (void)command_line;
+    SetProcessDPIAware();
     if (FAILED(TintaCoreInitialize())) return 1;
     ZeroMemory(&window_class, sizeof(window_class));
     window_class.lpfnWndProc = window_proc;
