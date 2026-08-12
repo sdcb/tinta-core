@@ -60,6 +60,7 @@ jobs:
             $flags += '-DTINTA_ENABLE_REMOTE_IMAGES=OFF'
             $flags += '-DTINTA_ENABLE_LOCAL_IMAGES=OFF'
             $flags += '-DTINTA_ENABLE_SVG=OFF'
+            $flags += '-DTINTA_ENABLE_MATH=OFF'
           }
           cmake -S . -B build -G "Visual Studio 18 2026" -A ${{ matrix.architecture.platform }} `
             -DBUILD_SHARED_LIBS=${{ matrix.shared }} `

@@ -1,15 +1,15 @@
 # Tinta Core [![GitHub](https://img.shields.io/badge/GitHub-sdcb%2Ftinta--core-181717?logo=github)](https://github.com/sdcb/tinta-core) [![QQ](https://img.shields.io/badge/QQ_Group-495782587-52B6EF?style=social&logo=tencent-qq&logoColor=000&logoWidth=20)](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=mma4msRKd372Z6dWpmBp4JZ9RL4Jrf8X&authKey=gccTx0h0RaH5b8B8jtuPJocU7MgFRUznqbV%2FLgsKdsK8RqZE%2BOhnETQ7nYVTp1W0&noverify=0&group_code=495782587)
 
-Tinta Core is a C11 Win32 Markdown, math, and Mermaid viewing control. It exposes the
-window class `Tinta.MarkdownView`, supports normal `CreateWindowExW` hosting,
-and uses window messages and `WM_NOTIFY` for integration.
+Tinta Core is a C11 Win32 control library. It exposes the read-only
+`Tinta.MarkdownView` Markdown/math/Mermaid viewer and the independent editable
+`Tinta.TextEditor` multiline text control. Both support normal
+`CreateWindowExW` hosting and use ordinary Win32 messages and notifications.
 
 Tinta Core is sdcb's reusable-control rewrite of Tinta C. Tinta C is itself
 sdcb's pure C rewrite of the original Tinta project.
 
 The original `tintac.exe` application is not part of this repository. This
-repository contains the reusable read-only control, a minimal host, and a
-larger demonstration host.
+repository contains the reusable controls and example hosts.
 
 ## Build
 
@@ -46,8 +46,10 @@ otherwise. `TMM_GETOPTIONS` does not report image capabilities that were
 compiled out. Math delimiters remain recognized when native math is disabled,
 but formulas are displayed as their original LaTeX source.
 
-The examples include `tinta_minimal`, the feature-oriented `tinta_demo`, and
-`tinta_chat_demo`. The chat demo hosts one Markdown control per message,
+The examples include `tinta_minimal`, the feature-oriented `tinta_demo`,
+`tinta_chat_demo`, and `tinta_editor_demo`. The editor demo shows LF text,
+word-wrap, read-only mode and system/Tinta theme switching. The chat demo hosts
+one Markdown control per message,
 provides a scrolling left/right conversation layout, and sends 128 simulated
 SSE deltas through the streaming API. Its first response also demonstrates a
 cached local image and an optional remote image.
@@ -55,6 +57,9 @@ cached local image and an optional remote image.
 For parser hardening and performance work, configure
 `TINTA_BUILD_FUZZERS=ON` and/or `TINTA_BUILD_BENCHMARKS=ON`. These targets are
 off by default and do not add C++ to a normal library build.
+`TINTA_BUILD_LARGE_TESTS=ON` adds the separately labeled `editor_large`
+100-MiB/million-line stress test; the default CI-sized editor tests use the
+same document and edit paths with smaller inputs.
 
 ## Minimal use
 
@@ -67,6 +72,48 @@ HWND view = CreateWindowExW(0, TINTA_MARKDOWN_VIEW_CLASSW, L"# Hello",
 
 For UTF-8 input, document origins, Mermaid documents, themes, search, TOC and
 notifications, include `tinta_core.h` and use the `TMM_*` message API.
+
+## Editable text control
+
+```c
+TintaCoreInitialize();
+HWND editor = CreateWindowExW(WS_EX_CLIENTEDGE,
+    TINTA_TEXT_EDITOR_CLASSW, L"first\nsecond",
+    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_WANTRETURN,
+    x, y, width, height, parent, (HMENU)101, instance, NULL);
+```
+
+`Tinta.TextEditor` is independent of the Markdown viewer: it neither parses
+Markdown nor maintains a preview connection. Text is UTF-16 and always uses a
+single LF (`\n`) newline. `WM_SETTEXT`, paste, IME commits and the explicit
+length `TEM_SETTEXTEX` message normalize CRLF and lone CR to LF; `WM_GETTEXT`,
+`TEM_GETTEXTRANGE`, UI Automation and `CF_UNICODETEXT` copy return LF unchanged.
+
+The editor uses a chunked AVL rope and a paged line index, so local edits and
+position/line lookup do not copy or scan the complete document. DirectWrite
+layout is measured incrementally, with the visible region rendered before the
+rest of a large document. Direct2D drawing enables system color-font emoji.
+Thin overlay scrollbars appear only when content overflows and the matching
+`WS_VSCROLL`/`WS_HSCROLL` style permits them; wheel scrolling and caret reveal
+continue to work when an overlay is hidden.
+
+Common multiline EDIT messages are supported, including text, selection,
+replace, line lookup, scrolling, font, margins, tab stops, read-only, modified,
+text-limit and undo operations. `TEM_*` messages use `size_t` ranges for large
+documents, preserve selection direction, configure wrap and the default
+64-MiB undo budget, provide redo, expose content/scroll size, and select system,
+built-in or custom Tinta themes. Standard `EN_*` notifications are sent through
+`WM_COMMAND`.
+
+Double-click selects a word. Triple-click uses the system multi-click time and
+distance and selects the complete logical line: non-final lines include their
+terminating LF, while a final line ends at the document end. Dragging after the
+third click extends the selection by logical lines and preserves forward or
+backward anchor/caret direction. The editor also provides an Undo/Cut/Copy/
+Paste/Delete/Select All context menu, IME positioning, color emoji and basic
+Edit Text/Value/Scroll UI Automation patterns. Version 1.3 does not include
+syntax highlighting, OLE drag/drop, multiple selections or Markdown preview
+linkage.
 
 ## Control contract
 
@@ -174,3 +221,7 @@ notifications, include `tinta_core.h` and use the `TMM_*` message API.
 patterns. Headings and links appear as semantic children, and links implement
 the Invoke pattern. Text ranges carry their source revision and become
 unavailable after the document is replaced instead of reading unrelated text.
+
+`Tinta.TextEditor` exposes the UI Automation Edit control type with Text,
+Value and Scroll patterns. Its ranges and values contain LF text, selection
+changes are writable, and Value/selection mutation respects read-only state.

@@ -199,7 +199,10 @@ typedef struct TintaIDWriteTextFormatVtbl {
     HRESULT (STDMETHODCALLTYPE *SetTextAlignment)(IDWriteTextFormat *, TintaDWriteTextAlignment);
     HRESULT (STDMETHODCALLTYPE *SetParagraphAlignment)(IDWriteTextFormat *, TintaDWriteParagraphAlignment);
     HRESULT (STDMETHODCALLTYPE *SetWordWrapping)(IDWriteTextFormat *, TintaDWriteWordWrapping);
-    TintaComMethod unused_before_font_weight[16];
+    TintaComMethod SetReadingDirection;
+    TintaComMethod SetFlowDirection;
+    HRESULT (STDMETHODCALLTYPE *SetIncrementalTabStop)(IDWriteTextFormat *, FLOAT);
+    TintaComMethod unused_before_font_weight[13];
     TintaDWriteFontWeight (STDMETHODCALLTYPE *GetFontWeight)(IDWriteTextFormat *);
     TintaDWriteFontStyle (STDMETHODCALLTYPE *GetFontStyle)(IDWriteTextFormat *);
     TintaComMethod GetFontStretch;
@@ -217,7 +220,10 @@ typedef struct TintaIDWriteTextLayoutVtbl {
     HRESULT (STDMETHODCALLTYPE *SetTextAlignment)(IDWriteTextLayout *, TintaDWriteTextAlignment);
     HRESULT (STDMETHODCALLTYPE *SetParagraphAlignment)(IDWriteTextLayout *, TintaDWriteParagraphAlignment);
     HRESULT (STDMETHODCALLTYPE *SetWordWrapping)(IDWriteTextLayout *, TintaDWriteWordWrapping);
-    TintaComMethod unused_format_before_font_weight[16];
+    TintaComMethod SetReadingDirection;
+    TintaComMethod SetFlowDirection;
+    HRESULT (STDMETHODCALLTYPE *SetIncrementalTabStop)(IDWriteTextLayout *, FLOAT);
+    TintaComMethod unused_format_before_font_weight[13];
     TintaDWriteFontWeight (STDMETHODCALLTYPE *GetFontWeight)(IDWriteTextLayout *);
     TintaDWriteFontStyle (STDMETHODCALLTYPE *GetFontStyle)(IDWriteTextLayout *);
     TintaComMethod GetFontStretch;

@@ -20,11 +20,12 @@ extern "C" {
 #endif
 
 #define TINTA_CORE_VERSION_MAJOR 1
-#define TINTA_CORE_VERSION_MINOR 2
+#define TINTA_CORE_VERSION_MINOR 3
 #define TINTA_CORE_VERSION_PATCH 0
 
 /* Register this class with TintaCoreInitialize before calling CreateWindowExW. */
 #define TINTA_MARKDOWN_VIEW_CLASSW L"Tinta.MarkdownView"
+#define TINTA_TEXT_EDITOR_CLASSW L"Tinta.TextEditor"
 
 /*
  * Public ABI conventions
@@ -198,6 +199,34 @@ typedef struct TintaSelection {
     size_t end;                   /* Exclusive UTF-16 offset. */
 } TintaSelection;
 
+/* UTF-16 editor text. Input is copied before the message returns. */
+typedef struct TintaEditorText {
+    UINT cb_size;
+    const wchar_t *text;
+    size_t text_length;
+    DWORD flags;                  /* Reserved; set to zero. */
+} TintaEditorText;
+
+typedef struct TintaEditorTextRange {
+    UINT cb_size;
+    size_t start;
+    size_t end;                   /* Exclusive. */
+    wchar_t *text;                /* Optional caller-owned output buffer. */
+    size_t text_capacity;         /* UTF-16 units, including trailing NUL. */
+} TintaEditorTextRange;
+
+typedef struct TintaEditorSelection {
+    UINT cb_size;
+    size_t anchor;                /* Fixed end; may be after caret. */
+    size_t caret;                 /* Active end; direction is preserved. */
+} TintaEditorSelection;
+
+typedef enum TintaEditorWrapMode {
+    TINTA_EDITOR_WRAP_STYLE = 0,
+    TINTA_EDITOR_WRAP_ON = 1,
+    TINTA_EDITOR_WRAP_OFF = 2
+} TintaEditorWrapMode;
+
 typedef struct TintaScrollPosition {
     UINT cb_size;
     float x;
@@ -291,7 +320,8 @@ enum {
     TINTA_CAPABILITY_LOCAL_IMAGES = 0x0010,
     TINTA_CAPABILITY_STREAMING = 0x0020,
     TINTA_CAPABILITY_SVG = 0x0040,
-    TINTA_CAPABILITY_MATH = 0x0080
+    TINTA_CAPABILITY_MATH = 0x0080,
+    TINTA_CAPABILITY_TEXT_EDITOR = 0x0100
 };
 
 typedef struct TintaVersionInfo {
@@ -393,6 +423,32 @@ typedef struct TintaStats {
 #define TMM_GETSTATS              (TMM_FIRST + 33)
 #define TMM_SETPAGEMARGINS        (TMM_FIRST + 34)
 #define TMM_GETPAGEMARGINS        (TMM_FIRST + 35)
+
+/*
+ * Tinta.TextEditor messages. Text and positions use UTF-16 code units.
+ * TEM_SETTEXTEX rejects embedded NUL and normalizes CRLF/CR to LF.
+ * TEM_GETTEXTRANGE returns the required range length, excluding the NUL;
+ * a short buffer is NUL-terminated after the copied prefix. Set text to NULL
+ * and text_capacity to zero to query the required length without copying.
+ * Selection and range endpoints never split a UTF-16 surrogate pair.
+ */
+#define TEM_FIRST                 (WM_USER + 0x600)
+#define TEM_SETTEXTEX             (TEM_FIRST + 0)  /* lParam = const TintaEditorText *. */
+#define TEM_GETTEXTRANGE          (TEM_FIRST + 1)  /* lParam = TintaEditorTextRange *. */
+#define TEM_SETSELECTION          (TEM_FIRST + 2)  /* lParam = const TintaEditorSelection *. */
+#define TEM_GETSELECTION          (TEM_FIRST + 3)  /* lParam = TintaEditorSelection *. */
+#define TEM_SETWORDWRAP           (TEM_FIRST + 4)  /* wParam = TintaEditorWrapMode. */
+#define TEM_GETWORDWRAP           (TEM_FIRST + 5)
+#define TEM_SETUNDOLIMIT          (TEM_FIRST + 6)  /* lParam points to size_t bytes. */
+#define TEM_GETUNDOLIMIT          (TEM_FIRST + 7)  /* lParam points to size_t bytes. */
+#define TEM_CANREDO               (TEM_FIRST + 8)
+#define TEM_REDO                  (TEM_FIRST + 9)
+#define TEM_SETBUILTINTHEME       (TEM_FIRST + 10) /* wParam = TintaBuiltinTheme. */
+#define TEM_SETCUSTOMTHEME        (TEM_FIRST + 11) /* lParam = const TintaThemeSpec *. */
+#define TEM_SETSCROLLPOS          (TEM_FIRST + 12) /* lParam = const TintaScrollPosition *. */
+#define TEM_GETSCROLLPOS          (TEM_FIRST + 13) /* lParam = TintaScrollPosition *. */
+#define TEM_GETCONTENTSIZE        (TEM_FIRST + 14) /* lParam = TintaContentSize *. */
+#define TEM_LAST                  TEM_GETCONTENTSIZE
 
 /*
  * WM_NOTIFY codes sent synchronously to the parent window.

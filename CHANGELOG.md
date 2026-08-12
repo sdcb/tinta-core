@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.0
+
+- Added the independent `Tinta.TextEditor` editable Win32 control without
+  Markdown parsing or viewer coupling.
+- Added LF-only UTF-16 text handling across Win32 messages, explicit-length
+  `TEM_*` APIs, IME input, paste, copy and UI Automation; CRLF and lone CR are
+  normalized on input and explicit-length input rejects embedded NUL.
+- Added a persistent chunked AVL rope, paged line index and bounded undo/redo
+  history for large documents, with `size_t` text ranges and directional
+  selections for documents beyond legacy EDIT message widths.
+- Added incremental DirectWrite layout, Direct2D color-font emoji rendering,
+  system EDIT colors/fonts, optional Tinta themes and overflow-only overlay
+  scrollbars.
+- Added multiline EDIT-compatible text, selection, line, scrolling, font,
+  margin, tab-stop, read-only, modified, limit and undo messages plus standard
+  `EN_*` command notifications and a built-in editing context menu.
+- Added keyboard/IME editing, surrogate-safe navigation, double-click word
+  selection and system-threshold triple-click logical-line selection. A
+  non-final selected line includes its LF, and third-click dragging extends by
+  complete logical lines while preserving selection direction.
+- Added an editor-specific UI Automation provider with Edit control type and
+  Text, Value and Scroll patterns, including LF ranges, selection, visible
+  ranges, point lookup, bounding rectangles and read-only enforcement.
+- Added editor document differential tests, HWND/message and clipboard tests,
+  triple-click regression coverage, cross-thread UIA smoke coverage, an editor
+  example and installed-package consumer validation.
+- Bumped the public API and package version to 1.3.0 and added
+  `TINTA_CAPABILITY_TEXT_EDITOR`. `TintaCoreInitialize` now registers both
+  Tinta window classes atomically while retaining shared graphics and lifetime
+  accounting.
+
 ## 1.2.0
 
 - Refactored the vendored md4c into a Tinta-specific parser fork with named

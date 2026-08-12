@@ -219,10 +219,11 @@ int main() {
     capabilities.cb_size = sizeof(capabilities);
     if (!SendMessageW(view, TMM_GETVERSION, 0,
                       reinterpret_cast<LPARAM>(&version)) ||
-        version.major != 1 || version.minor != 2 ||
+        version.major != 1 || version.minor != 3 ||
         !SendMessageW(view, TMM_GETCAPABILITIES, 0,
                       reinterpret_cast<LPARAM>(&capabilities)) ||
         !(capabilities.flags & TINTA_CAPABILITY_STREAMING) ||
+        !(capabilities.flags & TINTA_CAPABILITY_TEXT_EDITOR) ||
         !(capabilities.option_flags & TINTA_OPTION_DOCUMENT_COPY_BUTTON) ||
         (capabilities.option_flags & (0x0008u | 0x0100u)) ||
         (compiled_options.flags & (0x0008u | 0x0100u)) ||

@@ -454,6 +454,9 @@ bool tinta_app_init(TintaApp *app, HINSTANCE instance, const TintaSettings *sett
 void tinta_app_destroy(TintaApp *app);
 bool tinta_shared_graphics_initialize(void);
 void tinta_shared_graphics_uninitialize(void);
+bool tinta_shared_graphics_acquire(ID2D1Factory **d2d_factory,
+                                   IDWriteFactory **dwrite_factory,
+                                   IDWriteFontFallback **font_fallback);
 bool tinta_app_create_device(TintaApp *app);
 void tinta_app_discard_device(TintaApp *app);
 bool tinta_app_update_formats(TintaApp *app);

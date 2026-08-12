@@ -498,21 +498,33 @@ void tinta_shared_graphics_uninitialize(void) {
     ReleaseSRWLockExclusive(&g_graphics_lock);
 }
 
-static bool acquire_shared_graphics(TintaApp *app) {
+bool tinta_shared_graphics_acquire(ID2D1Factory **d2d_factory,
+                                   IDWriteFactory **dwrite_factory,
+                                   IDWriteFontFallback **font_fallback) {
     bool result = false;
+    if (!d2d_factory || !dwrite_factory || !font_fallback) return false;
+    *d2d_factory = NULL;
+    *dwrite_factory = NULL;
+    *font_fallback = NULL;
     AcquireSRWLockShared(&g_graphics_lock);
     if (g_d2d_factory && g_dwrite_factory) {
         g_d2d_factory->lpVtbl->AddRef(g_d2d_factory);
         g_dwrite_factory->lpVtbl->AddRef(g_dwrite_factory);
         if (g_font_fallback)
             g_font_fallback->lpVtbl->AddRef(g_font_fallback);
-        app->d2d_factory = g_d2d_factory;
-        app->dwrite_factory = g_dwrite_factory;
-        app->font_fallback = g_font_fallback;
+        *d2d_factory = g_d2d_factory;
+        *dwrite_factory = g_dwrite_factory;
+        *font_fallback = g_font_fallback;
         result = true;
     }
     ReleaseSRWLockShared(&g_graphics_lock);
     return result;
+}
+
+static bool acquire_shared_graphics(TintaApp *app) {
+    return tinta_shared_graphics_acquire(&app->d2d_factory,
+                                         &app->dwrite_factory,
+                                         &app->font_fallback);
 }
 
 static void configure_text_rendering(TintaApp *app) {

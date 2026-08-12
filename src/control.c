@@ -1,4 +1,5 @@
 #include "internal/control.h"
+#include "internal/editor.h"
 #include "internal/uia_provider.h"
 
 #include <stdlib.h>
@@ -16,6 +17,26 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
 static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                                                 WPARAM wparam, LPARAM lparam);
 static void control_destroy_state(TintaControl *control);
+
+static void control_uninitialize_locked(void) {
+    if (!g_initialize_count && !g_live_controls && g_module) {
+        tinta_editor_unregister_class(g_module);
+        UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
+        g_module = NULL;
+        tinta_shared_graphics_uninitialize();
+    }
+}
+
+void tinta_control_window_created(void) {
+    InterlockedIncrement(&g_live_controls);
+}
+
+void tinta_control_window_destroyed(void) {
+    InterlockedDecrement(&g_live_controls);
+    AcquireSRWLockExclusive(&g_class_lock);
+    control_uninitialize_locked();
+    ReleaseSRWLockExclusive(&g_class_lock);
+}
 
 static void control_add_ref(TintaControl *control) {
     if (control) InterlockedIncrement(&control->references);
@@ -308,7 +329,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
                 free(created);
                 return FALSE;
             }
-            InterlockedIncrement(&g_live_controls);
+            tinta_control_window_created();
             return TRUE;
         }
         case WM_CREATE: {
@@ -427,15 +448,7 @@ static LRESULT CALLBACK tinta_control_proc_impl(HWND hwnd, UINT message,
             if (control) {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 tinta_uia_disconnect(&control->view);
-                if (!InterlockedDecrement(&g_live_controls)) {
-                    AcquireSRWLockExclusive(&g_class_lock);
-                    if (!g_initialize_count && g_module) {
-                        UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
-                        g_module = NULL;
-                        tinta_shared_graphics_uninitialize();
-                    }
-                    ReleaseSRWLockExclusive(&g_class_lock);
-                }
+                tinta_control_window_destroyed();
                 control_release(control);
             }
             break;
@@ -461,6 +474,8 @@ static LRESULT CALLBACK tinta_control_proc(HWND hwnd, UINT message,
 HRESULT TintaCoreInitialize(void) {
     WNDCLASSEXW window_class;
     HRESULT result = S_OK;
+    HRESULT editor_result;
+    bool markdown_registered = false;
     AcquireSRWLockExclusive(&g_class_lock);
     if (g_initialize_count > 0) {
         g_initialize_count++;
@@ -495,9 +510,17 @@ HRESULT TintaCoreInitialize(void) {
         } else {
             result = HRESULT_FROM_WIN32(error);
         }
+    } else {
+        markdown_registered = true;
     }
+    editor_result = SUCCEEDED(result) ?
+        tinta_editor_register_class(g_module) : result;
+    if (FAILED(editor_result)) result = editor_result;
+    else if (result == S_OK && editor_result == S_FALSE) result = S_FALSE;
     if (SUCCEEDED(result)) g_initialize_count = 1;
     else {
+        if (markdown_registered)
+            UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
         tinta_shared_graphics_uninitialize();
         g_module = NULL;
     }
@@ -508,10 +531,6 @@ HRESULT TintaCoreInitialize(void) {
 void TintaCoreUninitialize(void) {
     AcquireSRWLockExclusive(&g_class_lock);
     if (g_initialize_count > 0) g_initialize_count--;
-    if (!g_initialize_count && !g_live_controls && g_module) {
-        UnregisterClassW(TINTA_MARKDOWN_VIEW_CLASSW, g_module);
-        g_module = NULL;
-        tinta_shared_graphics_uninitialize();
-    }
+    control_uninitialize_locked();
     ReleaseSRWLockExclusive(&g_class_lock);
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TintaCore VERSION 1.2.0 LANGUAGES C)
+project(TintaCore VERSION 1.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ option(TINTA_BUILD_EXAMPLES "Build Tinta Core examples" ${TINTA_DEVELOPER_BUILD}
 option(BUILD_TESTING "Build Tinta Core tests" ${TINTA_DEVELOPER_BUILD})
 option(TINTA_BUILD_FUZZERS "Build parser fuzz targets" OFF)
 option(TINTA_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
+option(TINTA_BUILD_LARGE_TESTS "Build 100 MiB editor stress tests" OFF)
 option(TINTA_ENABLE_UIA "Enable the UI Automation provider" ON)
 option(TINTA_ENABLE_MERMAID "Enable Mermaid parsing and rendering" ON)
 option(TINTA_ENABLE_SYNTAX "Enable code-block syntax highlighting" ON)
@@ -34,6 +35,8 @@ set(TINTA_CORE_SOURCES
     src/control_input.c
     src/core.c
     src/document.c
+    src/editor.c
+    src/editor_document.c
     src/markdown.c
     src/renderer.c
     src/stream_async.c
@@ -59,7 +62,7 @@ if(TINTA_ENABLE_SVG)
 endif()
 if(TINTA_ENABLE_UIA)
     list(APPEND TINTA_CORE_SOURCES
-        src/uia_provider.c src/uia_semantics.c src/uia_text.c)
+        src/editor_uia.c src/uia_provider.c src/uia_semantics.c src/uia_text.c)
 else()
     list(APPEND TINTA_CORE_SOURCES src/uia_stub.c)
 endif()
@@ -71,7 +74,7 @@ target_include_directories(tinta_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(tinta_core PRIVATE
-    d2d1 dwrite advapi32 shell32 shlwapi)
+    d2d1 dwrite imm32 advapi32 shell32 shlwapi)
 if(TINTA_ENABLE_REMOTE_IMAGES OR TINTA_ENABLE_LOCAL_IMAGES)
     target_link_libraries(tinta_core PRIVATE windowscodecs ole32)
 endif()
@@ -119,6 +122,13 @@ if(TINTA_BUILD_EXAMPLES)
     if(MSVC)
         target_compile_options(tinta_chat_demo PRIVATE /utf-8 /W4 /WX)
     endif()
+
+    add_executable(tinta_editor_demo WIN32 examples/editor.c)
+    target_link_libraries(tinta_editor_demo PRIVATE Tinta::Core)
+    target_compile_definitions(tinta_editor_demo PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+        target_compile_options(tinta_editor_demo PRIVATE /utf-8 /W4 /WX)
+    endif()
 endif()
 
 if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
@@ -131,7 +141,7 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
     set(TINTA_TEST_SUPPORT_SOURCES
         vendor/md4c/src/md4c.c vendor/md4c/src/entity.c
         vendor/md4c/src/md4c-test.c
-        src/core.c src/document.c src/markdown.c)
+        src/core.c src/document.c src/editor_document.c src/markdown.c)
     if(TINTA_ENABLE_MATH)
         list(APPEND TINTA_TEST_SUPPORT_SOURCES
             src/math.c src/math_layout.c src/math_opentype.c)
@@ -150,6 +160,7 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         src/internal vendor/md4c/src)
     target_compile_definitions(tinta_test_support PRIVATE
         _CRT_SECURE_NO_WARNINGS MD4C_TEST_ALLOCATOR
+        TINTA_EDITOR_TEST_ALLOCATOR
         TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
         TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
         TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
@@ -179,7 +190,7 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
                 TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
                 TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
             target_link_libraries(tinta_layout_test_support PRIVATE
-                d2d1 dwrite advapi32 shell32 shlwapi)
+                d2d1 dwrite imm32 advapi32 shell32 shlwapi)
             if(TINTA_ENABLE_REMOTE_IMAGES OR TINTA_ENABLE_LOCAL_IMAGES)
                 target_link_libraries(tinta_layout_test_support PRIVATE
                     windowscodecs ole32)
@@ -203,6 +214,7 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             tests/test_harness.cpp
             tests/core_tests.cpp
             tests/document_tests.cpp
+            tests/editor_document_tests.cpp
             tests/md4c_tests.cpp)
         if(TINTA_ENABLE_MATH)
             list(APPEND TINTA_UNIT_TEST_SOURCES tests/math_tests.cpp)
@@ -221,12 +233,33 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             src/internal vendor/md4c/src)
         target_link_libraries(tinta_unit_tests PRIVATE tinta_test_support)
         target_compile_definitions(tinta_unit_tests PRIVATE
+            TINTA_EDITOR_TEST_ALLOCATOR
             TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
             TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
             TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
             TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
         add_test(NAME unit COMMAND tinta_unit_tests)
         set_tests_properties(unit PROPERTIES LABELS unit)
+
+        if(TINTA_BUILD_LARGE_TESTS)
+            add_executable(editor_large_tests tests/editor_large_tests.cpp)
+            target_include_directories(editor_large_tests PRIVATE src/internal)
+            target_link_libraries(editor_large_tests PRIVATE tinta_test_support)
+            target_compile_definitions(editor_large_tests PRIVATE
+                TINTA_EDITOR_TEST_ALLOCATOR)
+            add_test(NAME editor_large COMMAND editor_large_tests)
+            set_tests_properties(editor_large PROPERTIES LABELS "editor;large")
+
+            add_executable(editor_large_control_tests
+                tests/editor_large_control_tests.cpp)
+            target_link_libraries(editor_large_control_tests PRIVATE Tinta::Core)
+            target_compile_definitions(editor_large_control_tests PRIVATE
+                UNICODE _UNICODE)
+            add_test(NAME editor_large_control
+                COMMAND editor_large_control_tests)
+            set_tests_properties(editor_large_control PROPERTIES
+                LABELS "editor;large")
+        endif()
 
         add_executable(layout_tests tests/layout_tests.cpp)
         target_include_directories(layout_tests PRIVATE src/internal)
@@ -253,6 +286,13 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             TINTA_ENABLE_MATH=$<BOOL:${TINTA_ENABLE_MATH}>)
         add_test(NAME markdown_control COMMAND control_tests)
         set_tests_properties(markdown_control PROPERTIES LABELS control)
+
+        add_executable(editor_control_tests tests/editor_control_tests.cpp)
+        target_link_libraries(editor_control_tests PRIVATE Tinta::Core)
+        target_compile_definitions(editor_control_tests PRIVATE
+            UNICODE _UNICODE)
+        add_test(NAME editor_control COMMAND editor_control_tests)
+        set_tests_properties(editor_control PROPERTIES LABELS editor)
         if(TINTA_ENABLE_UIA)
             add_executable(uia_tests tests/uia_tests.cpp)
             target_link_libraries(uia_tests PRIVATE Tinta::Core
@@ -260,6 +300,15 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             target_compile_definitions(uia_tests PRIVATE UNICODE _UNICODE)
             add_test(NAME uia_provider COMMAND uia_tests)
             set_tests_properties(uia_provider PROPERTIES LABELS uia)
+
+            add_executable(editor_uia_tests tests/editor_uia_tests.cpp)
+            target_link_libraries(editor_uia_tests PRIVATE Tinta::Core
+                ole32 oleaut32 uiautomationcore)
+            target_compile_definitions(editor_uia_tests PRIVATE
+                UNICODE _UNICODE)
+            add_test(NAME editor_uia_provider COMMAND editor_uia_tests)
+            set_tests_properties(editor_uia_provider PROPERTIES
+                LABELS "editor;uia")
         endif()
     endif()
 endif()

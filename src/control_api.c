@@ -326,7 +326,8 @@ LRESULT tinta_control_dispatch_api(TintaControl *control, UINT message,
         }
         case TMM_GETCAPABILITIES: {
             TintaCapabilities *capabilities = (TintaCapabilities *)lparam;
-            DWORD flags = TINTA_CAPABILITY_STREAMING;
+            DWORD flags = TINTA_CAPABILITY_STREAMING |
+                          TINTA_CAPABILITY_TEXT_EDITOR;
             if (!capabilities || capabilities->cb_size < sizeof(*capabilities))
                 return FALSE;
 #if TINTA_ENABLE_UIA
