@@ -609,9 +609,9 @@ bool tinta_app_update_formats(TintaApp *app) {
     ui = create_format(app, app->theme->font_family, 14,
                        TINTA_DWRITE_FONT_WEIGHT_NORMAL,
                        TINTA_DWRITE_FONT_STYLE_NORMAL);
-    chrome = create_scaled_format(app, app->theme->font_family, 12,
-                                  TINTA_DWRITE_FONT_WEIGHT_NORMAL,
-                                  TINTA_DWRITE_FONT_STYLE_NORMAL, 1.0f);
+    chrome = create_format(app, app->theme->font_family, 12,
+                           TINTA_DWRITE_FONT_WEIGHT_NORMAL,
+                           TINTA_DWRITE_FONT_STYLE_NORMAL);
     if (!body || !bold || !italic || !bold_italic || !small_text ||
         !small_bold || !small_italic || !small_bold_italic || !small_code ||
         !small_code_bold || !small_code_italic || !small_code_bold_italic || !code ||

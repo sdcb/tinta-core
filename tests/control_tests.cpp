@@ -717,6 +717,33 @@ int main() {
         std::cerr << "document copy button did not preserve Markdown source\n";
         return 1;
     }
+    float copy_zoom = 2.0f;
+    if (!SendMessageW(view, TMM_SETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&copy_zoom))) {
+        std::cerr << "document copy zoom setup failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    int zoomed_document_copy_x = code_client.right -
+        static_cast<int>(170.0f * dpi_scale);
+    int zoomed_document_copy_y = static_cast<int>(52.0f * dpi_scale);
+    document_copy_target = copy_notifications + 1;
+    SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(zoomed_document_copy_x,
+                            zoomed_document_copy_y));
+    if (!read_clipboard_text(view, &copied_text) ||
+        copied_text != document_markdown ||
+        copy_notifications != document_copy_target) {
+        std::cerr << "document copy button did not respect zoom\n";
+        return 1;
+    }
+    copy_zoom = 1.0f;
+    if (!SendMessageW(view, TMM_SETZOOM, 0,
+                      reinterpret_cast<LPARAM>(&copy_zoom))) {
+        std::cerr << "document copy zoom reset failed\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
     const wchar_t *overlap_markdown = L"```text\ncode only\n```";
     SendMessageW(view, WM_SETTEXT, 0,
                  reinterpret_cast<LPARAM>(overlap_markdown));

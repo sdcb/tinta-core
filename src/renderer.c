@@ -3283,8 +3283,8 @@ bool tinta_layout_continue(TintaApp *app) {
 }
 
 static RECT code_button_rect(const TintaApp *app, const TintaCodeBlock *block) {
-    LONG width = (LONG)ui_scale(app, 78);
-    LONG height = (LONG)ui_scale(app, 28);
+    LONG width = (LONG)scale(app, 78);
+    LONG height = (LONG)scale(app, 28);
     LONG padding = (LONG)scale(app, 8);
     LONG visible_right = (LONG)(app->scroll_x + viewport_width(app));
     LONG header_height = (LONG)code_header_height(app);
@@ -3298,8 +3298,8 @@ static RECT code_button_rect(const TintaApp *app, const TintaCodeBlock *block) {
 
 static RECT mermaid_button_rect(const TintaApp *app,
                                 const TintaMermaidBlock *block) {
-    LONG width = (LONG)ui_scale(app, 78);
-    LONG height = (LONG)ui_scale(app, 28);
+    LONG width = (LONG)scale(app, 78);
+    LONG height = (LONG)scale(app, 28);
     LONG padding = (LONG)scale(app, 8);
     LONG header_height = (LONG)code_header_height(app);
     LONG visible_right = (LONG)(app->scroll_x + viewport_width(app));
@@ -3313,8 +3313,8 @@ static RECT mermaid_button_rect(const TintaApp *app,
 
 static RECT svg_button_rect(const TintaApp *app,
                             const TintaSvgBlock *block) {
-    LONG width = (LONG)ui_scale(app, 78);
-    LONG height = (LONG)ui_scale(app, 28);
+    LONG width = (LONG)scale(app, 78);
+    LONG height = (LONG)scale(app, 28);
     LONG padding = (LONG)scale(app, 8);
     LONG header_height = (LONG)code_header_height(app);
     LONG visible_right = (LONG)(app->scroll_x + viewport_width(app));
@@ -3327,11 +3327,11 @@ static RECT svg_button_rect(const TintaApp *app,
 }
 
 static RECT document_button_rect(const TintaApp *app) {
-    LONG width = (LONG)ui_scale(app, 78);
-    LONG height = (LONG)ui_scale(app, 28);
-    LONG right_padding = (LONG)ui_scale(
+    LONG width = (LONG)scale(app, 78);
+    LONG height = (LONG)scale(app, 28);
+    LONG right_padding = (LONG)scale(
         app, app->content_height > app->height ? 20.0f : 12.0f);
-    LONG top_padding = (LONG)ui_scale(app, 12);
+    LONG top_padding = (LONG)scale(app, 12);
     RECT result;
     result.right = (LONG)(app->scroll_x + viewport_width(app)) - right_padding;
     result.left = result.right - width;
@@ -4324,12 +4324,12 @@ static void draw_copy_button(TintaApp *app, D2D1_RECT_F rect,
                              bool copied, bool hovered) {
     const wchar_t *button_text = copied ? L"Copied" : L"Copy";
     size_t button_text_length = copied ? 6 : 4;
-    D2D1_ROUNDED_RECT button = {rect, ui_scale(app, 4), ui_scale(app, 4)};
+    D2D1_ROUNDED_RECT button = {rect, scale(app, 4), scale(app, 4)};
     IDWriteTextLayout *label = NULL;
-    float icon_size = ui_scale(app, 12);
-    float icon_left = rect.left + ui_scale(app, 7);
+    float icon_size = scale(app, 12);
+    float icon_left = rect.left + scale(app, 7);
     float icon_top = rect.top + (rect.bottom - rect.top - icon_size) * 0.5f;
-    float text_left = icon_left + icon_size + ui_scale(app, 7);
+    float text_left = icon_left + icon_size + scale(app, 7);
     uint32_t foreground = copied ? app->theme->accent :
                                    app->theme->syntax_comment;
     if (hovered || copied) {
@@ -4347,25 +4347,25 @@ static void draw_copy_button(TintaApp *app, D2D1_RECT_F rect,
                            icon_top + icon_size * 0.12f};
         app->render_target->lpVtbl->DrawLine(
             app->render_target, a, b, (ID2D1Brush *)app->brush,
-            ui_scale(app, 1.5f), NULL);
+            scale(app, 1.5f), NULL);
         app->render_target->lpVtbl->DrawLine(
             app->render_target, b, c, (ID2D1Brush *)app->brush,
-            ui_scale(app, 1.5f), NULL);
+            scale(app, 1.5f), NULL);
     } else {
-        D2D1_RECT_F back = {icon_left + ui_scale(app, 3), icon_top,
-            icon_left + icon_size, icon_top + icon_size - ui_scale(app, 3)};
-        D2D1_RECT_F front = {icon_left, icon_top + ui_scale(app, 3),
-            icon_left + icon_size - ui_scale(app, 3), icon_top + icon_size};
+        D2D1_RECT_F back = {icon_left + scale(app, 3), icon_top,
+            icon_left + icon_size, icon_top + icon_size - scale(app, 3)};
+        D2D1_RECT_F front = {icon_left, icon_top + scale(app, 3),
+            icon_left + icon_size - scale(app, 3), icon_top + icon_size};
         app->render_target->lpVtbl->DrawRectangle(
             app->render_target, &back, (ID2D1Brush *)app->brush,
-            ui_scale(app, 1.1f), NULL);
+            scale(app, 1.1f), NULL);
         app->render_target->lpVtbl->DrawRectangle(
             app->render_target, &front, (ID2D1Brush *)app->brush,
-            ui_scale(app, 1.1f), NULL);
+            scale(app, 1.1f), NULL);
     }
     if (SUCCEEDED(app->dwrite_factory->lpVtbl->CreateTextLayout(
             app->dwrite_factory, button_text, (UINT32)button_text_length,
-            app->chrome_format, rect.right - text_left - ui_scale(app, 4),
+            app->chrome_format, rect.right - text_left - scale(app, 4),
             rect.bottom - rect.top, &label))) {
         D2D1_POINT_2F origin = {text_left, rect.top};
         apply_font_fallback(app, label);

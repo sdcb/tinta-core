@@ -25,6 +25,8 @@
   runtime fallback when a usable system math font is unavailable.
 - Added baseline-aware inline formula placement and block-local horizontal
   scrolling for overwide display formulas.
+- Fixed the document, Code, Mermaid, and SVG Copy buttons to scale their
+  geometry, labels, icons, strokes, and hit targets with the document zoom.
 - Added the default-on `TINTA_ENABLE_MATH` build option and
   `TINTA_CAPABILITY_MATH`; math-disabled builds retain delimiter recognition
   and render the original LaTeX source.
