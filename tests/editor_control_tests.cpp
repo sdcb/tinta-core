@@ -150,6 +150,29 @@ int main() {
                     "redo failed");
 
         SendMessageW(editor, WM_SETTEXT, 0,
+                     reinterpret_cast<LPARAM>(L"shortcut text"));
+        SendMessageW(editor, EM_SETSEL, 0, -1);
+        SendMessageW(editor, WM_CHAR, 0x01, 0);
+        selected = selection(editor);
+        ok &= check(window_text(editor) == L"shortcut text" &&
+                    selected.anchor == 0 && selected.caret == 13,
+                    "Ctrl+A character cleared the selection");
+        SendMessageW(editor, EM_REPLACESEL, TRUE,
+                     reinterpret_cast<LPARAM>(L"replacement"));
+        ok &= check(SendMessageW(editor, WM_UNDO, 0, 0) != 0,
+                    "shortcut undo setup failed");
+        SendMessageW(editor, WM_CHAR, 0x1a, 0);
+        ok &= check(window_text(editor) == L"shortcut text" &&
+                    SendMessageW(editor, TEM_CANREDO, 0, 0) != 0,
+                    "Ctrl+Z character changed text or cleared redo");
+        ok &= check(SendMessageW(editor, TEM_REDO, 0, 0) != 0 &&
+                    window_text(editor) == L"replacement",
+                    "redo after Ctrl+Z character failed");
+        SendMessageW(editor, WM_CHAR, 0x19, 0);
+        ok &= check(window_text(editor) == L"replacement",
+                    "Ctrl+Y character changed text");
+
+        SendMessageW(editor, WM_SETTEXT, 0,
                      reinterpret_cast<LPARAM>(L"one\ntwo\nthree"));
         SendMessageW(editor, WM_PAINT, 0, 0);
         pump_messages();

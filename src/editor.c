@@ -1228,8 +1228,9 @@ static void editor_handle_char(TintaEditor *editor, wchar_t character) {
     unsigned int previous_group = editor->undo_group;
     editor->undo_group = 0;
     editor->click_count = 0;
-    if (editor->read_only || character == 8 || character == 9 ||
-        character == 27)
+    if (editor->read_only ||
+        (character < L' ' && character != L'\r' && character != L'\n') ||
+        character == 0x7f)
         return;
     if (character == L'\r') character = L'\n';
     if (is_high_surrogate(character)) {
@@ -1468,11 +1469,12 @@ static void editor_position_ime(TintaEditor *editor) {
     memset(&composition, 0, sizeof(composition));
     composition.dwStyle = CFS_POINT;
     composition.ptCurrentPos = point;
-    composition.ptCurrentPos.y += (LONG)editor->default_line_height;
     ImmSetCompositionWindow(context, &composition);
     memset(&candidate, 0, sizeof(candidate));
     candidate.dwStyle = CFS_CANDIDATEPOS;
-    candidate.ptCurrentPos = composition.ptCurrentPos;
+    candidate.ptCurrentPos = point;
+    candidate.ptCurrentPos.y += (LONG)lroundf(
+        editor->default_line_height);
     ImmSetCandidateWindow(context, &candidate);
     ImmReleaseContext(editor->hwnd, context);
 }
