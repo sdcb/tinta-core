@@ -4,6 +4,23 @@
 
 ## Next Version (Work in Progress)
 
+Tinta fork changes:
+
+  * Introduce named parser callback ABI 1 with half-open source ranges on all
+    block, span and text callbacks and decoded, range-bearing attributes.
+  * Decode HTML entities and replace NULL in the parser for UTF-8 and UTF-16.
+  * Recognize `$...$`, `$$...$$`, `\\(...\\)` and `\\[...\\]` with exact math
+    delimiter/content ranges and code/fence isolation.
+  * Add `MD_FLAG_TINTA_HTML`, structured details/summary/ruby events and the
+    Tinta HTML tag subset, including cross-block Markdown inside details.
+  * Resolve Tinta highlight, strikethrough, superscript and subscript syntax
+    directly in the inline analyzer, including structured HTML text, with
+    delimiter-bearing source ranges and code/pre isolation.
+  * Route all parser events through common range-aware callback helpers and add
+    test-only allocation fault injection for exhaustive OOM cleanup tests.
+  * Link the shared entity table through md4c so md4c-html does not define a
+    duplicate copy.
+
 New Features:
 
   * Add highlight span extension, enabled with the flag `MD_FLAG_HIGHLIGHT`.

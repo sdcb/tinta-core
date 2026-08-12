@@ -6,6 +6,7 @@ void test_core_string16(TintaTestContext &tests);
 void test_core_newlines(TintaTestContext &tests);
 void test_core_map(TintaTestContext &tests);
 void run_document_tests(TintaTestContext &tests);
+void run_md4c_tests(TintaTestContext &tests);
 #if TINTA_ENABLE_MATH
 void run_math_tests(TintaTestContext &tests);
 #endif
@@ -29,6 +30,7 @@ int main() {
         {"core.newlines", test_core_newlines},
         {"core.map", test_core_map},
         {"document", run_document_tests},
+        {"md4c", run_md4c_tests},
 #if TINTA_ENABLE_MATH
         {"math", run_math_tests},
 #endif

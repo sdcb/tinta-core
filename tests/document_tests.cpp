@@ -49,7 +49,9 @@ void run_document_tests(TintaTestContext &tests) {
     }
     tinta_parse_result_destroy(&mermaid);
 
-    auto ext = parse_doc("before ==mark 中文== mid x^2^ and H~2~O ~~gone~~ `==not this==`\n", "notes.md");
+    const char *extension_source =
+        "before ==mark 中文== mid x^2^ and H~2~O ~~gone~~ `==not this==`\n";
+    auto ext = parse_doc(extension_source, "notes.md");
     check(ext.success, "extensions parse");
     if (ext.success && ext.root->child_count) {
         int highlights = 0, supers = 0, subs = 0, strikes = 0, code = 0;
@@ -60,6 +62,26 @@ void run_document_tests(TintaTestContext &tests) {
             if (child->type == TINTA_ELEMENT_SUPERSCRIPT) supers++;
             if (child->type == TINTA_ELEMENT_SUBSCRIPT) subs++;
             if (child->type == TINTA_ELEMENT_STRIKETHROUGH) strikes++;
+            if (child->type == TINTA_ELEMENT_HIGHLIGHT ||
+                child->type == TINTA_ELEMENT_STRIKETHROUGH ||
+                child->type == TINTA_ELEMENT_SUPERSCRIPT ||
+                child->type == TINTA_ELEMENT_SUBSCRIPT) {
+                size_t delimiter =
+                    child->type == TINTA_ELEMENT_HIGHLIGHT ||
+                            child->type == TINTA_ELEMENT_STRIKETHROUGH
+                        ? 2
+                        : 1;
+                check(child->source_offset != SIZE_MAX &&
+                          child->child_count == 1 &&
+                          child->children[0]->source_offset ==
+                              child->source_offset + delimiter &&
+                          child->source_length ==
+                              child->children[0]->source_length +
+                                  delimiter * 2 &&
+                          child->source_offset + child->source_length <=
+                              std::strlen(extension_source),
+                      "extension AST preserves delimiter and content ranges");
+            }
             if (child->type == TINTA_ELEMENT_CODE) {
                 code++;
                 check(child->child_count && std::strcmp(child->children[0]->text, "==not this==") == 0, "code intact");
@@ -90,6 +112,8 @@ void run_document_tests(TintaTestContext &tests) {
                       "inline math preserves its original delimiters");
                 check(child->source_offset != SIZE_MAX,
                       "inline math maps back to its original source offset");
+                check(child->source_length == std::strlen(child->raw),
+                      "math source length matches its preserved raw text");
             }
         }
         check(inline_count == 2,

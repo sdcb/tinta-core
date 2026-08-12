@@ -1,6 +1,14 @@
 
 # MD4C Readme
 
+> **Tinta fork:** This vendored copy is a project-specific md4c fork. Its
+> callback ABI is version 1 and is intentionally not source/binary compatible
+> with upstream md4c. It adds source ranges, decoded attributes/text,
+> Tinta-compatible math delimiters, and the `MD_FLAG_TINTA_HTML` structured
+> HTML subset. Tinta highlight, strikethrough, superscript and subscript spans
+> are resolved by the parser rather than an application-side text pass. UTF-8,
+> UTF-16 and md4c-html remain supported build targets.
+
 * Home: https://github.com/mity/md4c
 * Wiki: https://github.com/mity/md4c/wiki
 * Issue tracker: https://github.com/mity/md4c/issues

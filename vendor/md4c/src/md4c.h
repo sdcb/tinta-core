@@ -47,6 +47,27 @@
 typedef unsigned MD_SIZE;
 typedef unsigned MD_OFFSET;
 
+/* Named version of the callback ABI implemented by this Tinta fork. */
+#define MD_PARSER_ABI_VERSION 1u
+
+/* Offset used when callback contents do not originate in the input. */
+#define MD_OFFSET_INVALID ((MD_OFFSET)-1)
+
+/* Range in the input Markdown source.
+ *
+ * Ranges are half-open intervals [begin, end). In UTF-8 builds, offsets count
+ * bytes; in UTF-16 builds, they count MD_CHAR units. Block and span ranges
+ * include their source delimiters, fences or tags, but exclude a separator
+ * newline following the node. Text ranges identify the source fragment which
+ * produced the callback.
+ *
+ * For synthesized contents, both members are MD_OFFSET_INVALID.
+ */
+typedef struct MD_SOURCE_RANGE {
+    MD_OFFSET begin;        /* Offset of the first source unit. */
+    MD_OFFSET end;          /* Offset one past the last source unit. */
+} MD_SOURCE_RANGE;
+
 
 /* Block represents a part of document hierarchy structure like a paragraph
  * or list item.
@@ -118,7 +139,16 @@ typedef enum MD_BLOCKTYPE {
     /* Adminition extension.
      * Detail MD_BLOCK_ADMONITION_DETAIL.
      * Note: Recognized only when MD_FLAG_ADMONITIONS is enabled. */
-    MD_BLOCK_ADMONITION
+    MD_BLOCK_ADMONITION,
+
+    /* <details>...</details>
+     * Detail: Structure MD_BLOCK_DETAILS_DETAIL.
+     * Note: Recognized only when MD_FLAG_TINTA_HTML is enabled. */
+    MD_BLOCK_DETAILS,
+
+    /* <summary>...</summary>
+     * Note: Recognized only when MD_FLAG_TINTA_HTML is enabled. */
+    MD_BLOCK_SUMMARY
 } MD_BLOCKTYPE;
 
 /* Span represents an in-line piece of a document which should be rendered with
@@ -147,14 +177,20 @@ typedef enum MD_SPANTYPE {
     MD_SPAN_CODE,
 
     /* <del>...</del>
+     * Syntax: ~~strikethrough~~
+     * The contents have to be non-empty and cannot cross a line break.
      * Note: Recognized only when MD_FLAG_STRIKETHROUGH is enabled.
      */
     MD_SPAN_DEL,
 
-    /* For recognizing inline ($) and display ($$) equations
-     * Note: Recognized only when MD_FLAG_LATEXMATHSPANS is enabled.
-     */
+    /* Inline equations delimited with $...$ or \(...\).
+     * Detail: Structure MD_SPAN_LATEXMATH_DETAIL.
+     * Note: Recognized only when MD_FLAG_LATEXMATHSPANS is enabled. */
     MD_SPAN_LATEXMATH,
+
+    /* Display equations delimited with $$...$$ or \[...\].
+     * Detail: Structure MD_SPAN_LATEXMATH_DETAIL.
+     * Note: Recognized only when MD_FLAG_LATEXMATHSPANS is enabled. */
     MD_SPAN_LATEXMATH_DISPLAY,
 
     /* Wiki links
@@ -173,11 +209,15 @@ typedef enum MD_SPANTYPE {
 
     /* <sup>...</sup>
      * Syntax: ^superscript^
+     * The contents have to be non-empty and cannot contain spaces, tabs or
+     * line breaks.
      * Note: Recognized only when MD_FLAG_SUPERSCRIPTS is enabled. */
     MD_SPAN_SUPERSCRIPT,
 
     /* <sub>...</sub>
      * Syntax: ~subscript~
+     * The contents have to be non-empty and cannot contain spaces, tabs or
+     * line breaks.
      * Note: Recognized only when MD_FLAG_SUBSCRIPTS is enabled. */
     MD_SPAN_SUBSCRIPT,
 
@@ -190,17 +230,28 @@ typedef enum MD_SPANTYPE {
 
     /* <mark>...</mark>
      * Syntax: ==highlight==
+     * The contents have to be non-empty and cannot cross a line break.
      * Note: Recognized only when MD_FLAG_HIGHLIGHT is enabled. */
-    MD_SPAN_MARK
+    MD_SPAN_MARK,
+
+    /* <ruby>...</ruby>
+     * Note: Recognized only when MD_FLAG_TINTA_HTML is enabled. */
+    MD_SPAN_RUBY,
+
+    /* <rt>...</rt>
+     * Note: Recognized only when MD_FLAG_TINTA_HTML is enabled. */
+    MD_SPAN_RUBY_TEXT
 } MD_SPANTYPE;
 
 /* Text is the actual textual contents of span. */
 typedef enum MD_TEXTTYPE {
-    /* Normal text. */
+    /* Normal text. Named and numerical entities are already decoded and NULL
+     * input characters are replaced with U+FFFD. */
     MD_TEXT_NORMAL = 0,
 
-    /* NULL character. CommonMark requires replacing NULL character with
-     * the replacement char U+FFFD, so this allows caller to do that easily. */
+    /* Reserved for source compatibility. Never emitted by ABI 1. NULL input
+     * characters are replaced with U+FFFD and emitted as the text type of the
+     * surrounding contents. */
     MD_TEXT_NULLCHAR,
 
     /* Line breaks.
@@ -209,31 +260,27 @@ typedef enum MD_TEXTTYPE {
     MD_TEXT_BR,         /* <br> (hard break) */
     MD_TEXT_SOFTBR,     /* '\n' in source text where it is not semantically meaningful (soft break) */
 
-    /* Entity.
-     * (a) Named entity, e.g. &nbsp; 
-     *     (Note MD4C does not have a list of known entities.
-     *     Anything matching the regexp /&[A-Za-z][A-Za-z0-9]{1,47};/ is
-     *     treated as a named entity.)
-     * (b) Numerical entity, e.g. &#1234;
-     * (c) Hexadecimal entity, e.g. &#x12AB;
-     *
-     * As MD4C is mostly encoding agnostic, application gets the verbatim
-     * entity text into the MD_PARSER::text_callback(). */
+    /* Reserved for source compatibility. Never emitted by ABI 1. Named,
+     * decimal and hexadecimal entities are decoded and emitted as
+     * MD_TEXT_NORMAL. Unknown named entities remain literal normal text. */
     MD_TEXT_ENTITY,
 
     /* Text in a code block (inside MD_BLOCK_CODE) or inlined code (`code`).
      * If it is inside MD_BLOCK_CODE, it includes spaces for indentation and
      * '\n' for new lines. MD_TEXT_BR and MD_TEXT_SOFTBR are not sent for this
-     * kind of text. */
+     * kind of text. Entities are kept verbatim, but NULL input characters are
+     * replaced with U+FFFD. */
     MD_TEXT_CODE,
 
     /* Text is a raw HTML. If it is contents of a raw HTML block (i.e. not
      * an inline raw HTML), then MD_TEXT_BR and MD_TEXT_SOFTBR are not used.
-     * The text contains verbatim '\n' for the new lines. */
+     * The text contains verbatim '\n' for the new lines. Entities are kept
+     * verbatim, but NULL input characters are replaced with U+FFFD. */
     MD_TEXT_HTML,
 
-    /* Text is inside an equation. This is processed the same way as inlined code
-     * spans (`code`). */
+    /* Text inside an equation. Entities are not decoded, but NULL input
+     * characters are replaced with U+FFFD. Display equations preserve source
+     * newlines as part of the text. */
     MD_TEXT_LATEXMATH
 } MD_TEXTTYPE;
 
@@ -247,38 +294,26 @@ typedef enum MD_ALIGN {
 } MD_ALIGN;
 
 
-/* String attribute.
+/* Decoded string attribute.
  *
- * This wraps strings which are outside of a normal text flow and which are
- * propagated within various detailed structures, but which still may contain
- * string portions of different types like e.g. entities.
+ * This wraps strings which are outside of normal text flow and are propagated
+ * within various detailed structures, such as link destinations, image
+ * titles, fenced code info strings and structured HTML attributes.
  *
- * So, for example, lets consider this image:
+ * Named, decimal and hexadecimal entities in the attribute are already
+ * decoded. Unknown named entities remain literal. NULL input characters and
+ * invalid numerical entities are represented by U+FFFD. The text is generally
+ * not zero-terminated and its storage remains valid only for the duration of
+ * the callback.
  *
- *     ![image alt text](http://example.org/image.png 'foo &quot; bar')
- *
- * The image alt text is propagated as a normal text via the MD_PARSER::text()
- * callback. However, the image title ('foo &quot; bar') is propagated as
- * MD_ATTRIBUTE in MD_SPAN_IMG_DETAIL::title.
- *
- * Then the attribute MD_SPAN_IMG_DETAIL::title shall provide the following:
- *  -- [0]: "foo "   (substr_types[0] == MD_TEXT_NORMAL; substr_offsets[0] == 0)
- *  -- [1]: "&quot;" (substr_types[1] == MD_TEXT_ENTITY; substr_offsets[1] == 4)
- *  -- [2]: " bar"   (substr_types[2] == MD_TEXT_NORMAL; substr_offsets[2] == 10)
- *  -- [3]: (n/a)    (n/a                              ; substr_offsets[3] == 14)
- *
- * Note that these invariants are always guaranteed:
- *  -- substr_offsets[0] == 0
- *  -- substr_offsets[LAST+1] == size
- *  -- Currently, only MD_TEXT_NORMAL, MD_TEXT_ENTITY, MD_TEXT_NULLCHAR
- *     substrings can appear. This could change only of the specification
- *     changes.
+ * The source range identifies the raw attribute value in the input, excluding
+ * any surrounding quotes. Synthesized or absent attributes use an invalid
+ * source range.
  */
 typedef struct MD_ATTRIBUTE {
-    const MD_CHAR* text;
-    MD_SIZE size;
-    const MD_TEXTTYPE* substr_types;
-    const MD_OFFSET* substr_offsets;
+    const MD_CHAR* text;        /* Decoded attribute text. */
+    MD_SIZE size;               /* Size of text in MD_CHAR units. */
+    MD_SOURCE_RANGE source;     /* Range of the raw value in the input. */
 } MD_ATTRIBUTE;
 
 
@@ -331,6 +366,27 @@ typedef struct MD_BLOCK_ADMONITION_DETAIL {
     MD_ATTRIBUTE type;          /* One of "note", "tip", "important", "warning", "caution" */
 } MD_BLOCK_ADMONITION_DETAIL;
 
+/* Detailed info for MD_BLOCK_DETAILS. */
+typedef struct MD_BLOCK_DETAILS_DETAIL {
+    int is_open;                /* Non-zero if the HTML open attribute is present. */
+} MD_BLOCK_DETAILS_DETAIL;
+
+/* Equation delimiter recognized for MD_SPAN_LATEXMATH and
+ * MD_SPAN_LATEXMATH_DISPLAY. */
+typedef enum MD_MATH_DELIMITER {
+    MD_MATH_DOLLAR_INLINE = 0,  /* $...$ */
+    MD_MATH_DOLLAR_DISPLAY,     /* $$...$$ */
+    MD_MATH_PAREN_INLINE,       /* \(...\) */
+    MD_MATH_BRACKET_DISPLAY     /* \[...\] */
+} MD_MATH_DELIMITER;
+
+/* Detailed info for MD_SPAN_LATEXMATH and MD_SPAN_LATEXMATH_DISPLAY. */
+typedef struct MD_SPAN_LATEXMATH_DETAIL {
+    MD_MATH_DELIMITER delimiter;    /* Kind of opening and closing delimiter. */
+    MD_SOURCE_RANGE content;        /* Equation contents without delimiters.
+                                     * The callback range includes them. */
+} MD_SPAN_LATEXMATH_DETAIL;
+
 /* Detailed info for MD_SPAN_A. */
 typedef struct MD_SPAN_A_DETAIL {
     MD_ATTRIBUTE href;
@@ -379,7 +435,7 @@ typedef struct MD_BLOCK_FOOTNOTE_DEF_DETAIL {
 #define MD_FLAG_STRIKETHROUGH               0x200   /* Enable strikethrough extension. */
 #define MD_FLAG_PERMISSIVEWWWAUTOLINKS      0x400   /* Enable WWW autolinks (even without any scheme prefix, if they begin with 'www.') */
 #define MD_FLAG_TASKLISTS                   0x800   /* Enable task list extension. */
-#define MD_FLAG_LATEXMATHSPANS              0x1000  /* Enable $ and $$ containing LaTeX equations. */
+#define MD_FLAG_LATEXMATHSPANS              0x1000  /* Enable $, $$, \( and \[ LaTeX equation spans. */
 #define MD_FLAG_WIKILINKS                   0x2000  /* Enable wiki links extension. */
 #define MD_FLAG_UNDERLINE                   0x4000  /* Enable underline extension (and disables '_' for normal emphasis). */
 #define MD_FLAG_HARD_SOFT_BREAKS            0x8000  /* Force all soft breaks to act as hard breaks. */
@@ -389,6 +445,7 @@ typedef struct MD_BLOCK_FOOTNOTE_DEF_DETAIL {
 #define MD_FLAG_ADMONITIONS                 0x80000 /* Enable admonitions extension. */
 #define MD_FLAG_FOOTNOTES                   0x100000 /* Enable [^label] footnote references. */
 #define MD_FLAG_HIGHLIGHT                   0x200000 /* Enable ==highlight== spans. */
+#define MD_FLAG_TINTA_HTML                  0x400000 /* Parse the supported Tinta HTML subset structurally. */
 
 #define MD_FLAG_PERMISSIVEAUTOLINKS         (MD_FLAG_PERMISSIVEEMAILAUTOLINKS | MD_FLAG_PERMISSIVEURLAUTOLINKS | MD_FLAG_PERMISSIVEWWWAUTOLINKS)
 #define MD_FLAG_NOHTML                      (MD_FLAG_NOHTMLBLOCKS | MD_FLAG_NOHTMLSPANS)
@@ -408,8 +465,7 @@ typedef struct MD_BLOCK_FOOTNOTE_DEF_DETAIL {
 /* Parser structure.
  */
 typedef struct MD_PARSER {
-    /* Reserved. Set to zero.
-     */
+    /* Named callback ABI version. Set to MD_PARSER_ABI_VERSION (currently 1). */
     unsigned abi_version;
 
     /* Dialect options. Bitmask of MD_FLAG_xxxx values.
@@ -427,17 +483,28 @@ typedef struct MD_PARSER {
      * Note any strings provided to the callbacks as their arguments or as
      * members of any detail structure are generally not zero-terminated.
      * Application has to take the respective size information into account.
+     * Their storage is valid only for the duration of the callback.
+     *
+     * The 'source' argument describes the input range represented by the
+     * callback. It follows the MD_SOURCE_RANGE rules documented above. The
+     * pointer is valid only for the duration of the callback; applications may
+     * copy the structure if the offsets are needed later.
      *
      * Any rendering callback may abort further parsing of the document by
      * returning non-zero.
      */
-    int (*enter_block)(MD_BLOCKTYPE /*type*/, void* /*detail*/, void* /*userdata*/);
-    int (*leave_block)(MD_BLOCKTYPE /*type*/, void* /*detail*/, void* /*userdata*/);
+    int (*enter_block)(MD_BLOCKTYPE /*type*/, void* /*detail*/,
+                       const MD_SOURCE_RANGE* /*source*/, void* /*userdata*/);
+    int (*leave_block)(MD_BLOCKTYPE /*type*/, void* /*detail*/,
+                       const MD_SOURCE_RANGE* /*source*/, void* /*userdata*/);
 
-    int (*enter_span)(MD_SPANTYPE /*type*/, void* /*detail*/, void* /*userdata*/);
-    int (*leave_span)(MD_SPANTYPE /*type*/, void* /*detail*/, void* /*userdata*/);
+    int (*enter_span)(MD_SPANTYPE /*type*/, void* /*detail*/,
+                      const MD_SOURCE_RANGE* /*source*/, void* /*userdata*/);
+    int (*leave_span)(MD_SPANTYPE /*type*/, void* /*detail*/,
+                      const MD_SOURCE_RANGE* /*source*/, void* /*userdata*/);
 
-    int (*text)(MD_TEXTTYPE /*type*/, const MD_CHAR* /*text*/, MD_SIZE /*size*/, void* /*userdata*/);
+    int (*text)(MD_TEXTTYPE /*type*/, const MD_CHAR* /*text*/, MD_SIZE /*size*/,
+                const MD_SOURCE_RANGE* /*source*/, void* /*userdata*/);
 
     /* Debug callback. Optional (may be NULL).
      *
@@ -464,9 +531,12 @@ typedef MD_PARSER MD_RENDERER;
  * caller can render the document on the screen or convert the Markdown
  * to another format.
  *
+ * MD_PARSER::abi_version has to be set to MD_PARSER_ABI_VERSION.
+ *
  * Zero is returned on success. If a runtime error occurs (e.g. a memory
- * fails), -1 is returned. If the processing is aborted due any callback
- * returning non-zero, the return value of the callback is returned.
+ * allocation fails), or an unsupported ABI version is requested, -1 is
+ * returned. If the processing is aborted due to any callback returning
+ * non-zero, the return value of the callback is returned.
  */
 int md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userdata);
 

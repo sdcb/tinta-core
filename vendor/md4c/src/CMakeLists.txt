@@ -8,7 +8,7 @@ join_paths(PKGCONFIG_LIBDIR "\${prefix}" "${CMAKE_INSTALL_LIBDIR}")
 # Build rules for MD4C parser library
 
 configure_file(md4c.pc.in md4c.pc @ONLY)
-add_library(md4c md4c.c md4c.h)
+add_library(md4c md4c.c md4c.h entity.c entity.h)
 target_include_directories(md4c PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
@@ -23,7 +23,7 @@ set_target_properties(md4c PROPERTIES
 # Build rules for HTML renderer library
 
 configure_file(md4c-html.pc.in md4c-html.pc @ONLY)
-add_library(md4c-html md4c-html.c md4c-html.h entity.c entity.h)
+add_library(md4c-html md4c-html.c md4c-html.h)
 target_include_directories(md4c-html PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"

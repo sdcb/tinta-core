@@ -2,6 +2,17 @@
 
 ## 1.2.0
 
+- Refactored the vendored md4c into a Tinta-specific parser fork with named
+  callback ABI 1 and exact source ranges on every block, span, and text event.
+- Moved math delimiter recognition, structured Tinta HTML, entity and NULL
+  decoding, highlights, strikethrough, superscripts, and subscripts into md4c,
+  removing the corresponding input rewriting and AST rescanning from
+  `src/markdown.c`.
+- Added native structured callbacks for `<details>`, `<summary>`, ruby and the
+  supported Tinta HTML subset, with unified callback abort and fallback paths.
+- Added table-driven parser event/range/fallback coverage, callback-abort tests,
+  exhaustive allocation-failure injection, and standalone UTF-8, UTF-16 and
+  md4c-html build tests for the fork.
 - Added native inline and display Markdown math for `$...$`, `$$...$$`,
   `\\(...\\)` and `\\[...\\]`, preserving the original source delimiters,
   offsets, selection, search, copy and UI Automation text.

@@ -63,6 +63,7 @@ struct TintaElement {
     bool open;
     bool html_unclosed;
     size_t source_offset;
+    size_t source_length;
     TintaElement **children;
     size_t child_count;
     size_t child_capacity;

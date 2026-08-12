@@ -26,6 +26,7 @@ option(TINTA_ENABLE_MATH "Enable native TeX math layout and rendering" ON)
 
 set(TINTA_CORE_SOURCES
     vendor/md4c/src/md4c.c
+    vendor/md4c/src/entity.c
     src/app.c
     src/control.c
     src/control_api.c
@@ -128,7 +129,9 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
         enable_testing()
     endif()
     set(TINTA_TEST_SUPPORT_SOURCES
-        vendor/md4c/src/md4c.c src/core.c src/document.c src/markdown.c)
+        vendor/md4c/src/md4c.c vendor/md4c/src/entity.c
+        vendor/md4c/src/md4c-test.c
+        src/core.c src/document.c src/markdown.c)
     if(TINTA_ENABLE_MATH)
         list(APPEND TINTA_TEST_SUPPORT_SOURCES
             src/math.c src/math_layout.c src/math_opentype.c)
@@ -146,7 +149,7 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
     target_include_directories(tinta_test_support PRIVATE
         src/internal vendor/md4c/src)
     target_compile_definitions(tinta_test_support PRIVATE
-        _CRT_SECURE_NO_WARNINGS
+        _CRT_SECURE_NO_WARNINGS MD4C_TEST_ALLOCATOR
         TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>
         TINTA_ENABLE_SYNTAX=$<BOOL:${TINTA_ENABLE_SYNTAX}>
         TINTA_ENABLE_SVG=$<BOOL:${TINTA_ENABLE_SVG}>
@@ -199,7 +202,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             tests/unit_tests.cpp
             tests/test_harness.cpp
             tests/core_tests.cpp
-            tests/document_tests.cpp)
+            tests/document_tests.cpp
+            tests/md4c_tests.cpp)
         if(TINTA_ENABLE_MATH)
             list(APPEND TINTA_UNIT_TEST_SOURCES tests/math_tests.cpp)
         endif()
@@ -213,7 +217,8 @@ if(BUILD_TESTING OR TINTA_BUILD_FUZZERS OR TINTA_BUILD_BENCHMARKS)
             list(APPEND TINTA_UNIT_TEST_SOURCES tests/syntax_tests.cpp)
         endif()
         add_executable(tinta_unit_tests ${TINTA_UNIT_TEST_SOURCES})
-        target_include_directories(tinta_unit_tests PRIVATE src/internal)
+        target_include_directories(tinta_unit_tests PRIVATE
+            src/internal vendor/md4c/src)
         target_link_libraries(tinta_unit_tests PRIVATE tinta_test_support)
         target_compile_definitions(tinta_unit_tests PRIVATE
             TINTA_ENABLE_MERMAID=$<BOOL:${TINTA_ENABLE_MERMAID}>

@@ -31,6 +31,14 @@
 #include <string.h>
 
 #include "md4c.h"
+#include "entity.h"
+
+#if defined MD4C_TEST_ALLOCATOR
+    #include "md4c-test.h"
+    #define malloc(size_)           md4c_test_malloc(size_)
+    #define realloc(pointer_, size_) md4c_test_realloc((pointer_), (size_))
+    #define free(pointer_)           md4c_test_free(pointer_)
+#endif
 
 
 /*****************************
@@ -128,6 +136,8 @@
  * pathologic case of too many openers, each of different length: Their
  * resolving would be then O(n^2). */
 #define CODESPAN_MARK_MAXLEN    32
+#define MD_MARK_MATH_PAREN      1
+#define MD_MARK_MATH_BRACKET    2
 
 
 /************************
@@ -144,6 +154,14 @@ typedef struct MD_BLOCK_tag MD_BLOCK;
 typedef struct MD_CONTAINER_tag MD_CONTAINER;
 typedef struct MD_REF_DEF_tag MD_REF_DEF;
 typedef struct MD_FOOTNOTE_DEF_tag MD_FOOTNOTE_DEF;
+
+typedef struct MD_TINTA_INLINE_FRAME_tag MD_TINTA_INLINE_FRAME;
+struct MD_TINTA_INLINE_FRAME_tag {
+    int kind;
+    MD_SOURCE_RANGE source;
+    OFF opener_begin;
+    OFF opener_end;
+};
 
 /* Forward declaration; full definition is below with MD_LINE_tag. */
 typedef struct MD_LINE_tag MD_LINE;
@@ -191,6 +209,7 @@ struct MD_CTX_tag {
     SZ size;
     MD_PARSER parser;
     void* userdata;
+    MD_SOURCE_RANGE callback_range;
 
     /* When this is true, it allows some optimizations. */
     int doc_ends_with_newline;
@@ -286,8 +305,14 @@ struct MD_CTX_tag {
     /* Contextual info for line analysis. */
     SZ code_fence_length;   /* For checking closing fence length. */
     int html_block_type;    /* For checking closing raw HTML condition. */
+    int math_block_kind;    /* '$' for $$...$$, ']' for \[...\]. */
     int last_line_has_list_loosening_effect;
     int last_list_item_starts_with_two_blank_lines;
+
+    MD_TINTA_INLINE_FRAME* tinta_inline_frames;
+    int n_tinta_inline_frames;
+    int alloc_tinta_inline_frames;
+    int tinta_suppress_rp;
 };
 
 enum MD_LINETYPE_tag {
@@ -312,6 +337,8 @@ struct MD_LINE_ANALYSIS_tag {
     int enforce_new_block;
     OFF beg;
     OFF end;
+    OFF source_begin;
+    OFF source_end;
     unsigned indent;        /* Indentation level. */
 };
 
@@ -406,34 +433,208 @@ md_ascii_eq(const CHAR* s1, const CHAR* s2, SZ n)
     return memcmp(s1, s2, n * sizeof(CHAR)) == 0;
 }
 
+static MD_SOURCE_RANGE md_source_range_for_text(
+    MD_CTX* ctx, const CHAR* text, SZ size);
+static int md_emit_text(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* text,
+                        SZ size, const MD_SOURCE_RANGE* source);
+
 static int
-md_text_with_null_replacement(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* str, SZ size)
+md_call_enter_block(MD_CTX* ctx, MD_BLOCKTYPE type, void* detail,
+                    const MD_SOURCE_RANGE* source)
 {
-    OFF off = 0;
-    int ret = 0;
+    int ret = ctx->parser.enter_block(type, detail, source, ctx->userdata);
+    if(ret != 0)
+        MD_LOG("Aborted from enter_block() callback.");
+    return ret;
+}
 
-    while(1) {
-        while(off < size  &&  str[off] != _T('\0'))
-            off++;
+static int
+md_call_leave_block(MD_CTX* ctx, MD_BLOCKTYPE type, void* detail,
+                    const MD_SOURCE_RANGE* source)
+{
+    int ret = ctx->parser.leave_block(type, detail, source, ctx->userdata);
+    if(ret != 0)
+        MD_LOG("Aborted from leave_block() callback.");
+    return ret;
+}
 
-        if(off > 0) {
-            ret = ctx->parser.text(type, str, off, ctx->userdata);
-            if(ret != 0)
-                return ret;
+static int
+md_call_enter_span(MD_CTX* ctx, MD_SPANTYPE type, void* detail,
+                   const MD_SOURCE_RANGE* source)
+{
+    int ret = ctx->parser.enter_span(type, detail, source, ctx->userdata);
+    if(ret != 0)
+        MD_LOG("Aborted from enter_span() callback.");
+    return ret;
+}
 
-            str += off;
-            size -= off;
-            off = 0;
-        }
+static int
+md_call_leave_span(MD_CTX* ctx, MD_SPANTYPE type, void* detail,
+                   const MD_SOURCE_RANGE* source)
+{
+    int ret = ctx->parser.leave_span(type, detail, source, ctx->userdata);
+    if(ret != 0)
+        MD_LOG("Aborted from leave_span() callback.");
+    return ret;
+}
 
-        if(off >= size)
-            return 0;
+static int
+md_call_text(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* text, SZ size,
+             const MD_SOURCE_RANGE* source)
+{
+    int ret = ctx->parser.text(type, text, size, source, ctx->userdata);
+    if(ret != 0)
+        MD_LOG("Aborted from text() callback.");
+    return ret;
+}
 
-        ret = ctx->parser.text(MD_TEXT_NULLCHAR, _T(""), 1, ctx->userdata);
-        if(ret != 0)
-            return ret;
-        off++;
+static int
+md_emit_codepoint(MD_CTX* ctx, MD_TEXTTYPE type, unsigned codepoint,
+                  const MD_SOURCE_RANGE* source)
+{
+    CHAR output[4];
+    SZ size;
+    if(codepoint == 0 || codepoint > 0x10ffff ||
+       (codepoint >= 0xd800 && codepoint <= 0xdfff))
+        codepoint = 0xfffd;
+#if defined MD4C_USE_UTF16
+    if(codepoint <= 0xffff) {
+        output[0] = (CHAR)codepoint;
+        size = 1;
+    } else {
+        codepoint -= 0x10000;
+        output[0] = (CHAR)(0xd800 + (codepoint >> 10));
+        output[1] = (CHAR)(0xdc00 + (codepoint & 0x3ff));
+        size = 2;
     }
+#else
+    if(codepoint <= 0x7f) {
+        output[0] = (CHAR)codepoint;
+        size = 1;
+    } else if(codepoint <= 0x7ff) {
+        output[0] = (CHAR)(0xc0 | (codepoint >> 6));
+        output[1] = (CHAR)(0x80 | (codepoint & 0x3f));
+        size = 2;
+    } else if(codepoint <= 0xffff) {
+        output[0] = (CHAR)(0xe0 | (codepoint >> 12));
+        output[1] = (CHAR)(0x80 | ((codepoint >> 6) & 0x3f));
+        output[2] = (CHAR)(0x80 | (codepoint & 0x3f));
+        size = 3;
+    } else {
+        output[0] = (CHAR)(0xf0 | (codepoint >> 18));
+        output[1] = (CHAR)(0x80 | ((codepoint >> 12) & 0x3f));
+        output[2] = (CHAR)(0x80 | ((codepoint >> 6) & 0x3f));
+        output[3] = (CHAR)(0x80 | (codepoint & 0x3f));
+        size = 4;
+    }
+#endif
+    return md_call_text(ctx, type, output, size, source);
+}
+
+static int
+md_decode_entity_codepoints(const CHAR* text, SZ size,
+                            unsigned codepoints[2])
+{
+    codepoints[0] = codepoints[1] = 0;
+    if(size > 3 && text[0] == _T('&') && text[1] == _T('#')) {
+        SZ i = 2;
+        unsigned base = 10;
+        unsigned value = 0;
+        if(i < size && (text[i] == _T('x') || text[i] == _T('X'))) {
+            base = 16;
+            i++;
+        }
+        for(; i + 1 < size; i++) {
+            unsigned digit;
+            CHAR ch = text[i];
+            if(ch >= _T('0') && ch <= _T('9')) digit = (unsigned)(ch - _T('0'));
+            else if(base == 16 && ch >= _T('a') && ch <= _T('f')) digit = 10u + (unsigned)(ch - _T('a'));
+            else if(base == 16 && ch >= _T('A') && ch <= _T('F')) digit = 10u + (unsigned)(ch - _T('A'));
+            else return FALSE;
+            if(value > (0x10ffffu - digit) / base) value = 0x110000u;
+            else value = value * base + digit;
+        }
+        codepoints[0] = value;
+        return TRUE;
+    } else if(size <= 64) {
+        char name[65];
+        SZ i;
+        const ENTITY* entity;
+        for(i = 0; i < size; i++) {
+            if((unsigned)text[i] > 0x7f) return FALSE;
+            name[i] = (char)text[i];
+        }
+        name[size] = '\0';
+        entity = entity_lookup(name, size);
+        if(entity == NULL) return FALSE;
+        codepoints[0] = entity->codepoints[0];
+        codepoints[1] = entity->codepoints[1];
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static int
+md_emit_text(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* text,
+             SZ size, const MD_SOURCE_RANGE* source)
+{
+    if(type == MD_TEXT_ENTITY) {
+        unsigned codepoints[2];
+        if(md_decode_entity_codepoints(text, size, codepoints)) {
+            int ret = md_emit_codepoint(ctx, MD_TEXT_NORMAL, codepoints[0], source);
+            if(ret == 0 && codepoints[1] != 0)
+                ret = md_emit_codepoint(ctx, MD_TEXT_NORMAL, codepoints[1], source);
+            return ret;
+        }
+        type = MD_TEXT_NORMAL;
+    }
+
+    {
+        SZ start = 0;
+        SZ i;
+        for(i = 0; i < size; i++) {
+            if(text[i] != _T('\0')) continue;
+            if(i > start) {
+                MD_SOURCE_RANGE part = *source;
+                if(part.begin != MD_OFFSET_INVALID) {
+                    part.begin += start;
+                    part.end = part.begin + (i - start);
+                }
+                int ret = md_call_text(ctx, type, text + start, i - start,
+                                       &part);
+                if(ret != 0)
+                    return ret;
+            }
+            {
+                MD_SOURCE_RANGE part = *source;
+                if(part.begin != MD_OFFSET_INVALID) {
+                    part.begin += i;
+                    part.end = part.begin + 1;
+                }
+                if(md_emit_codepoint(ctx, type, 0xfffd, &part) != 0)
+                    return 1;
+            }
+            start = i + 1;
+        }
+        if(start < size) {
+            MD_SOURCE_RANGE part = *source;
+            if(part.begin != MD_OFFSET_INVALID) {
+                part.begin += start;
+                part.end = part.begin + (size - start);
+            }
+            return md_call_text(ctx, type, text + start, size - start,
+                                &part);
+        }
+    }
+    return 0;
+}
+
+static int
+md_text_with_null_replacement(MD_CTX* ctx, MD_TEXTTYPE type,
+                              const CHAR* str, SZ size)
+{
+    MD_SOURCE_RANGE source = md_source_range_for_text(ctx, str, size);
+    return md_emit_text(ctx, type, str, size, &source);
 }
 
 
@@ -466,48 +667,82 @@ md_text_with_null_replacement(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* str, SZ
 
 #define MD_ENTER_BLOCK(type, arg)                                           \
     do {                                                                    \
-        ret = ctx->parser.enter_block((type), (arg), ctx->userdata);        \
-        if(ret != 0) {                                                      \
-            MD_LOG("Aborted from enter_block() callback.");                 \
+        ret = md_call_enter_block(ctx, (type), (arg),                       \
+                                  &ctx->callback_range);                    \
+        if(ret != 0)                                                        \
             goto abort;                                                     \
-        }                                                                   \
     } while(0)
 
 #define MD_LEAVE_BLOCK(type, arg)                                           \
     do {                                                                    \
-        ret = ctx->parser.leave_block((type), (arg), ctx->userdata);        \
-        if(ret != 0) {                                                      \
-            MD_LOG("Aborted from leave_block() callback.");                 \
+        ret = md_call_leave_block(ctx, (type), (arg),                       \
+                                  &ctx->callback_range);                    \
+        if(ret != 0)                                                        \
             goto abort;                                                     \
-        }                                                                   \
     } while(0)
 
 #define MD_ENTER_SPAN(type, arg)                                            \
     do {                                                                    \
-        ret = ctx->parser.enter_span((type), (arg), ctx->userdata);         \
-        if(ret != 0) {                                                      \
-            MD_LOG("Aborted from enter_span() callback.");                  \
+        ret = md_call_enter_span(ctx, (type), (arg),                        \
+                                 &ctx->callback_range);                     \
+        if(ret != 0)                                                        \
             goto abort;                                                     \
-        }                                                                   \
     } while(0)
 
 #define MD_LEAVE_SPAN(type, arg)                                            \
     do {                                                                    \
-        ret = ctx->parser.leave_span((type), (arg), ctx->userdata);         \
-        if(ret != 0) {                                                      \
-            MD_LOG("Aborted from leave_span() callback.");                  \
+        ret = md_call_leave_span(ctx, (type), (arg),                        \
+                                 &ctx->callback_range);                     \
+        if(ret != 0)                                                        \
             goto abort;                                                     \
-        }                                                                   \
     } while(0)
+
+#define MD_SET_RANGE(beg_, end_)                                            \
+    do {                                                                    \
+        ctx->callback_range.begin = (OFF)(beg_);                            \
+        ctx->callback_range.end = (OFF)(end_);                              \
+    } while(0)
+
+#define MD_SET_INVALID_RANGE()                                              \
+    MD_SET_RANGE(MD_OFFSET_INVALID, MD_OFFSET_INVALID)
+
+static MD_SOURCE_RANGE
+md_source_range_for_text(MD_CTX* ctx, const CHAR* text, SZ size)
+{
+    MD_SOURCE_RANGE range = { MD_OFFSET_INVALID, MD_OFFSET_INVALID };
+    if(text >= ctx->text  &&  text <= ctx->text + ctx->size) {
+        OFF off = (OFF)(text - ctx->text);
+        if(size <= ctx->size - off) {
+            range.begin = off;
+            range.end = off + size;
+        }
+    }
+    return range;
+}
+
+static int md_emit_text(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* text,
+                        SZ size, const MD_SOURCE_RANGE* source);
 
 #define MD_TEXT(type, str, size)                                            \
     do {                                                                    \
-        if(size > 0) {                                                      \
-            ret = ctx->parser.text((type), (str), (size), ctx->userdata);   \
-            if(ret != 0) {                                                  \
-                MD_LOG("Aborted from text() callback.");                    \
+        if((size) > 0) {                                                    \
+            MD_SOURCE_RANGE md_text_range__ =                               \
+                md_source_range_for_text(ctx, (str), (size));               \
+            ret = md_emit_text(ctx, (type), (str), (size),                  \
+                               &md_text_range__);                            \
+            if(ret != 0)                                                    \
                 goto abort;                                                 \
-            }                                                               \
+        }                                                                   \
+    } while(0)
+
+#define MD_TEXT_R(type, str, size, beg_, end_)                              \
+    do {                                                                    \
+        if((size) > 0) {                                                    \
+            MD_SOURCE_RANGE md_text_range__ = { (OFF)(beg_), (OFF)(end_) }; \
+            ret = md_emit_text(ctx, (type), (str), (size),                  \
+                               &md_text_range__);                            \
+            if(ret != 0)                                                    \
+                goto abort;                                                 \
         }                                                                   \
     } while(0)
 
@@ -515,10 +750,8 @@ md_text_with_null_replacement(MD_CTX* ctx, MD_TEXTTYPE type, const CHAR* str, SZ
     do {                                                                    \
         if(size > 0) {                                                      \
             ret = md_text_with_null_replacement(ctx, type, str, size);      \
-            if(ret != 0) {                                                  \
-                MD_LOG("Aborted from text() callback.");                    \
+            if(ret != 0)                                                    \
                 goto abort;                                                 \
-            }                                                               \
         }                                                                   \
     } while(0)
 
@@ -1446,63 +1679,71 @@ md_is_entity(MD_CTX* ctx, OFF beg, OFF max_end, OFF* p_end)
 typedef struct MD_ATTRIBUTE_BUILD_tag MD_ATTRIBUTE_BUILD;
 struct MD_ATTRIBUTE_BUILD_tag {
     CHAR* text;
-    MD_TEXTTYPE* substr_types;
-    OFF* substr_offsets;
-    SZ substr_count;
-    SZ substr_alloc;
-    MD_TEXTTYPE trivial_types[1];
-    OFF trivial_offsets[2];
+    int allocated;
 };
 
 
 #define MD_BUILD_ATTR_NO_ESCAPES    0x0001
 
-static int
-md_build_attr_append_substr(MD_CTX* ctx, MD_ATTRIBUTE_BUILD* build,
-                            MD_TEXTTYPE type, OFF off)
-{
-    if(build->substr_count >= build->substr_alloc) {
-        MD_TEXTTYPE* new_substr_types;
-        OFF* new_substr_offsets;
-        SZ new_alloc = (build->substr_alloc > 0
-                ? build->substr_alloc + build->substr_alloc / 2
-                : 8);
-
-        new_substr_types = (MD_TEXTTYPE*) realloc(build->substr_types,
-                                    new_alloc * sizeof(MD_TEXTTYPE));
-        if(new_substr_types == NULL) {
-            MD_LOG("realloc() failed.");
-            return -1;
-        }
-        build->substr_types = new_substr_types;
-
-        /* Note +1 to reserve space for final offset (== raw_size). */
-        new_substr_offsets = (OFF*) realloc(build->substr_offsets,
-                                    (new_alloc+1) * sizeof(OFF));
-        if(new_substr_offsets == NULL) {
-            MD_LOG("realloc() failed.");
-            return -1;
-        }
-        build->substr_offsets = new_substr_offsets;
-        build->substr_alloc = new_alloc;
-    }
-
-    build->substr_types[build->substr_count] = type;
-    build->substr_offsets[build->substr_count] = off;
-    build->substr_count++;
-    return 0;
-}
-
 static void
 md_free_attribute(MD_CTX* ctx, MD_ATTRIBUTE_BUILD* build)
 {
     MD_UNUSED(ctx);
+    if(build->allocated) free(build->text);
+}
 
-    if(build->substr_alloc > 0) {
-        free(build->text);
-        free(build->substr_types);
-        free(build->substr_offsets);
+/* If target is inside a resolved-looking backtick code span, return the end
+ * of that span so delimiter searches can continue after it. Otherwise return
+ * target. This mirrors the priority code spans have in the inline analyzer. */
+static OFF
+md_skip_code_span_covering(MD_CTX* ctx, OFF beg, OFF limit, OFF target)
+{
+    OFF off = beg;
+    while(off < target) {
+        OFF opener;
+        OFF opener_end;
+        OFF close;
+        SZ run;
+        SZ preceding = 0;
+
+        if(CH(off) != _T('`')) {
+            off++;
+            continue;
+        }
+        opener = off;
+        while(opener > beg && CH(opener - 1) == _T('\\')) {
+            preceding++;
+            opener--;
+        }
+        if(preceding & 1u) {
+            off++;
+            continue;
+        }
+        opener = off;
+        while(off < limit && CH(off) == _T('`'))
+            off++;
+        opener_end = off;
+        run = opener_end - opener;
+        close = opener_end;
+        while(close < limit) {
+            OFF close_end;
+            if(CH(close) != _T('`')) {
+                close++;
+                continue;
+            }
+            close_end = close;
+            while(close_end < limit && CH(close_end) == _T('`'))
+                close_end++;
+            if(close_end - close == run) {
+                if(target >= opener && target < close_end)
+                    return close_end;
+                off = close_end;
+                break;
+            }
+            close = close_end;
+        }
     }
+    return target;
 }
 
 static int
@@ -1527,29 +1768,30 @@ md_build_attribute(MD_CTX* ctx, const CHAR* raw_text, SZ raw_size,
 
     if(is_trivial) {
         build->text = (CHAR*) (raw_size ? raw_text : NULL);
-        build->substr_types = build->trivial_types;
-        build->substr_offsets = build->trivial_offsets;
-        build->substr_count = 1;
-        build->substr_alloc = 0;
-        build->trivial_types[0] = MD_TEXT_NORMAL;
-        build->trivial_offsets[0] = 0;
-        build->trivial_offsets[1] = raw_size;
         off = raw_size;
     } else {
-        build->text = (CHAR*) malloc(raw_size * sizeof(CHAR));
+        size_t capacity = raw_size > (SZ)(SIZE_MAX / (4 * sizeof(CHAR))) ?
+            0 : (size_t)raw_size * 4;
+        build->text = capacity ? (CHAR*) malloc(capacity * sizeof(CHAR)) : NULL;
         if(build->text == NULL) {
             MD_LOG("malloc() failed.");
             goto abort;
         }
+        build->allocated = TRUE;
 
         raw_off = 0;
         off = 0;
 
         while(raw_off < raw_size) {
             if(raw_text[raw_off] == _T('\0')) {
-                MD_CHECK(md_build_attr_append_substr(ctx, build, MD_TEXT_NULLCHAR, off));
-                memcpy(build->text + off, raw_text + raw_off, sizeof(CHAR));
-                off++;
+                unsigned codepoint = 0xfffd;
+#if defined MD4C_USE_UTF16
+                build->text[off++] = (CHAR)codepoint;
+#else
+                build->text[off++] = (CHAR)0xef;
+                build->text[off++] = (CHAR)0xbf;
+                build->text[off++] = (CHAR)0xbd;
+#endif
                 raw_off++;
                 continue;
             }
@@ -1558,16 +1800,48 @@ md_build_attribute(MD_CTX* ctx, const CHAR* raw_text, SZ raw_size,
                 OFF ent_end;
 
                 if(md_is_entity_str(ctx, raw_text, raw_off, raw_size, &ent_end)) {
-                    MD_CHECK(md_build_attr_append_substr(ctx, build, MD_TEXT_ENTITY, off));
-                    memcpy(build->text + off, raw_text + raw_off, (ent_end - raw_off) * sizeof(CHAR));
-                    off += ent_end - raw_off;
+                    unsigned codepoints[2];
+                    if(md_decode_entity_codepoints(raw_text + raw_off,
+                                                   ent_end - raw_off,
+                                                   codepoints)) {
+                        unsigned k;
+                        for(k = 0; k < 2 && codepoints[k] != 0; k++) {
+                            unsigned cp = codepoints[k];
+                            if(cp == 0 || cp > 0x10ffff ||
+                               (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
+#if defined MD4C_USE_UTF16
+                            if(cp <= 0xffff) build->text[off++] = (CHAR)cp;
+                            else {
+                                cp -= 0x10000;
+                                build->text[off++] = (CHAR)(0xd800 + (cp >> 10));
+                                build->text[off++] = (CHAR)(0xdc00 + (cp & 0x3ff));
+                            }
+#else
+                            if(cp <= 0x7f) build->text[off++] = (CHAR)cp;
+                            else if(cp <= 0x7ff) {
+                                build->text[off++] = (CHAR)(0xc0 | (cp >> 6));
+                                build->text[off++] = (CHAR)(0x80 | (cp & 0x3f));
+                            } else if(cp <= 0xffff) {
+                                build->text[off++] = (CHAR)(0xe0 | (cp >> 12));
+                                build->text[off++] = (CHAR)(0x80 | ((cp >> 6) & 0x3f));
+                                build->text[off++] = (CHAR)(0x80 | (cp & 0x3f));
+                            } else {
+                                build->text[off++] = (CHAR)(0xf0 | (cp >> 18));
+                                build->text[off++] = (CHAR)(0x80 | ((cp >> 12) & 0x3f));
+                                build->text[off++] = (CHAR)(0x80 | ((cp >> 6) & 0x3f));
+                                build->text[off++] = (CHAR)(0x80 | (cp & 0x3f));
+                            }
+#endif
+                        }
+                    } else {
+                        memcpy(build->text + off, raw_text + raw_off,
+                               (ent_end - raw_off) * sizeof(CHAR));
+                        off += ent_end - raw_off;
+                    }
                     raw_off = ent_end;
                     continue;
                 }
             }
-
-            if(build->substr_count == 0  ||  build->substr_types[build->substr_count-1] != MD_TEXT_NORMAL)
-                MD_CHECK(md_build_attr_append_substr(ctx, build, MD_TEXT_NORMAL, off));
 
             if(!(flags & MD_BUILD_ATTR_NO_ESCAPES)  &&
                raw_text[raw_off] == _T('\\')  &&  raw_off+1 < raw_size  &&
@@ -1576,13 +1850,11 @@ md_build_attribute(MD_CTX* ctx, const CHAR* raw_text, SZ raw_size,
 
             build->text[off++] = raw_text[raw_off++];
         }
-        build->substr_offsets[build->substr_count] = off;
     }
 
     attr->text = build->text;
     attr->size = off;
-    attr->substr_offsets = build->substr_offsets;
-    attr->substr_types = build->substr_types;
+    attr->source = md_source_range_for_text(ctx, raw_text, raw_size);
     return 0;
 
 abort:
@@ -2016,6 +2288,8 @@ struct MD_FOOTNOTE_DEF_tag {
     unsigned int ref_count;     /* Number of references to this footnote. */
     MD_LINE* content_lines;     /* always heap-allocated; freed by md_free_footnote_defs */
     MD_SIZE n_content_lines;
+    OFF source_begin;
+    OFF source_end;
 };
 
 /* Returns 0 if not a footnote definition.
@@ -2116,6 +2390,8 @@ md_is_footnote_definition(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
     }
     def->content_lines = content_lines;
     def->n_content_lines = n_content_lines;
+    def->source_begin = lines[0].beg;
+    def->source_end = lines[n - 1].end;
 
     return (int) n;
 
@@ -3267,6 +3543,74 @@ md_collect_marks(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines, int table_m
 
             ch = CH(off);
 
+            if(ch == _T('\\') && (ctx->parser.flags & MD_FLAG_LATEXMATHSPANS) &&
+               off + 1 < line->end &&
+               (CH(off + 1) == _T('(') || CH(off + 1) == _T('['))) {
+                int display = CH(off + 1) == _T('[');
+                CHAR closing = display ? _T(']') : _T(')');
+                OFF close = off + 2;
+                OFF limit = lines[n_lines - 1].end;
+                while(close + 1 < limit) {
+                    OFF slash_count = 0;
+                    OFF before;
+                    if(!display && ISNEWLINE(close)) break;
+                    if(CH(close) != _T('\\') || CH(close + 1) != closing) {
+                        close++;
+                        continue;
+                    }
+                    before = close;
+                    while(before > off + 2 && CH(before - 1) == _T('\\')) {
+                        slash_count++;
+                        before--;
+                    }
+                    if((slash_count & 1u) == 0) break;
+                    close += 2;
+                }
+                if(close + 1 < limit) {
+                    OFF code_end = md_skip_code_span_covering(
+                        ctx, off + 2, limit, close);
+                    if(code_end != close) {
+                        close = code_end;
+                        while(close + 1 < limit) {
+                            OFF slash_count = 0;
+                            OFF before;
+                            if(!display && ISNEWLINE(close)) break;
+                            if(CH(close) != _T('\\') ||
+                               CH(close + 1) != closing) {
+                                close++;
+                                continue;
+                            }
+                            before = close;
+                            while(before > off + 2 &&
+                                  CH(before - 1) == _T('\\')) {
+                                slash_count++;
+                                before--;
+                            }
+                            if((slash_count & 1u) == 0) break;
+                            close += 2;
+                        }
+                    }
+                }
+                if(close + 1 < limit && close > off + 2 &&
+                   CH(close) == _T('\\') && CH(close + 1) == closing) {
+                    int opener_index = ctx->n_marks;
+                    int closer_index;
+                    int sentinel = display ? MD_MARK_MATH_BRACKET : MD_MARK_MATH_PAREN;
+                    ADD_MARK(sentinel, off, off + 2,
+                             MD_MARK_OPENER | MD_MARK_RESOLVED);
+                    closer_index = ctx->n_marks;
+                    ADD_MARK(sentinel, close, close + 2,
+                             MD_MARK_CLOSER | MD_MARK_RESOLVED);
+                    ctx->marks[opener_index].next = closer_index;
+                    ctx->marks[closer_index].prev = opener_index;
+                    off = close + 2;
+                    if(off > line->end)
+                        line = md_lookup_line(off, lines, n_lines,
+                                              &line_index);
+                    continue;
+                }
+            }
+
             /* A backslash escape.
              * It can go beyond line->end as it may involve escaped new
              * line to form a hard break. */
@@ -3549,17 +3893,9 @@ md_collect_marks(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines, int table_m
                     tmp++;
 
                 /* Only a single caret is a superscript delimiter; longer runs are literal. */
-                if(tmp - off == 1) {
-                    unsigned flags = MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER;
-
-                    /* Cannot open before whitespace; cannot close after whitespace. */
-                    if(off + 1 >= line->end  ||  ISUNICODEWHITESPACE(off + 1))
-                        flags &= ~MD_MARK_POTENTIAL_OPENER;
-                    if(off == line->beg  ||  ISUNICODEWHITESPACEBEFORE(off))
-                        flags &= ~MD_MARK_POTENTIAL_CLOSER;
-                    if(flags != 0)
-                        ADD_MARK(ch, off, off + 1, flags);
-                }
+                if(tmp - off == 1)
+                    ADD_MARK(ch, off, off + 1,
+                             MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER);
 
                 off = tmp;
                 continue;
@@ -3573,17 +3909,9 @@ md_collect_marks(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines, int table_m
                     tmp++;
 
                 /* Only exactly two equals signs form a highlight delimiter. */
-                if(tmp - off == 2) {
-                    unsigned flags = MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER;
-
-                    /* Cannot open before whitespace; cannot close after whitespace. */
-                    if(tmp >= line->end  ||  ISUNICODEWHITESPACE(tmp))
-                        flags &= ~MD_MARK_POTENTIAL_OPENER;
-                    if(off == line->beg  ||  ISUNICODEWHITESPACEBEFORE(off))
-                        flags &= ~MD_MARK_POTENTIAL_CLOSER;
-                    if(flags != 0)
-                        ADD_MARK(ch, off, tmp, flags);
-                }
+                if(tmp - off == 2)
+                    ADD_MARK(ch, off, tmp,
+                             MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER);
 
                 off = tmp;
                 continue;
@@ -3597,48 +3925,84 @@ md_collect_marks(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines, int table_m
                     tmp++;
 
                 if(tmp - off == 1  &&  (ctx->parser.flags & MD_FLAG_SUBSCRIPTS)) {
-                    /* Subscript: can open after any non-whitespace, cannot open
-                     * before whitespace; cannot close after whitespace. */
-                    unsigned flags = MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER;
-
-                    if(off + 1 >= line->end  ||  ISUNICODEWHITESPACE(off + 1))
-                        flags &= ~MD_MARK_POTENTIAL_OPENER;
-                    if(off == line->beg  ||  ISUNICODEWHITESPACEBEFORE(off))
-                        flags &= ~MD_MARK_POTENTIAL_CLOSER;
-                    if(flags != 0)
-                        ADD_MARK(ch, off, off + 1, flags);
-                } else if(tmp - off <= 2  &&  (ctx->parser.flags & MD_FLAG_STRIKETHROUGH)) {
-                    /* Strikethrough: standard GFM left/right-flanking rules. */
-                    unsigned flags = MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER;
-
-                    if(off > line->beg  &&  !ISUNICODEWHITESPACEBEFORE(off)  &&  !ISUNICODEPUNCTBEFORE(off))
-                        flags &= ~MD_MARK_POTENTIAL_OPENER;
-                    if(tmp < line->end  &&  !ISUNICODEWHITESPACE(tmp)  &&  !ISUNICODEPUNCT(tmp))
-                        flags &= ~MD_MARK_POTENTIAL_CLOSER;
-                    if(flags != 0)
-                        ADD_MARK(ch, off, tmp, flags);
+                    ADD_MARK(ch, off, off + 1,
+                             MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER);
+                } else if(tmp - off == 2  &&  (ctx->parser.flags & MD_FLAG_STRIKETHROUGH)) {
+                    ADD_MARK(ch, off, tmp,
+                             MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER);
                 }
 
                 off = tmp;
                 continue;
             }
 
-            /* A potential equation start/end. */
+            /* A potential equation. Tinta's math rules deliberately resolve
+             * the complete delimiter pair here. This keeps math isolated
+             * from emphasis-style flanking and lets code-span resolution
+             * continue to take precedence. */
             if(ch == _T('$')) {
                 OFF tmp = off + 1;
+                OFF close;
+                OFF limit = lines[n_lines - 1].end;
+                SZ delimiter_size;
 
                 while(tmp < line->end && CH(tmp) == _T('$'))
                     tmp++;
 
-                if(tmp - off <= 2) {
-                    unsigned flags = MD_MARK_POTENTIAL_OPENER | MD_MARK_POTENTIAL_CLOSER;
-
-                    if(off > line->beg  &&  !ISUNICODEWHITESPACEBEFORE(off)  &&  !ISUNICODEPUNCTBEFORE(off))
-                        flags &= ~MD_MARK_POTENTIAL_OPENER;
-                    if(tmp < line->end  &&  !ISUNICODEWHITESPACE(tmp)  &&  !ISUNICODEPUNCT(tmp))
-                        flags &= ~MD_MARK_POTENTIAL_CLOSER;
-                    if(flags != 0)
-                        ADD_MARK(ch, off, tmp, flags);
+                delimiter_size = tmp - off;
+                if(delimiter_size <= 2 &&
+                   !(delimiter_size == 1 &&
+                     (tmp >= limit || ISUNICODEWHITESPACE(tmp)))) {
+                    close = tmp;
+                    while(close + delimiter_size <= limit) {
+                        if(delimiter_size == 1 && ISNEWLINE(close))
+                            break;
+                        if(CH(close) != _T('$')) {
+                            close++;
+                            continue;
+                        }
+                        if(delimiter_size == 2) {
+                            if(CH(close + 1) == _T('$')) {
+                                OFF code_end = md_skip_code_span_covering(
+                                    ctx, tmp, limit, close);
+                                if(code_end != close) {
+                                    close = code_end;
+                                    continue;
+                                }
+                                break;
+                            }
+                        } else if((close == 0 || CH(close - 1) != _T('$')) &&
+                                  (close + 1 >= limit || CH(close + 1) != _T('$')) &&
+                                  close > tmp &&
+                                  !ISUNICODEWHITESPACEBEFORE(close)) {
+                            OFF code_end = md_skip_code_span_covering(
+                                ctx, tmp, limit, close);
+                            if(code_end != close) {
+                                close = code_end;
+                                continue;
+                            }
+                            break;
+                        }
+                        close++;
+                    }
+                    if(close > tmp && close + delimiter_size <= limit &&
+                       CH(close) == _T('$') &&
+                       (delimiter_size == 1 || CH(close + 1) == _T('$'))) {
+                        int opener_index = ctx->n_marks;
+                        int closer_index;
+                        ADD_MARK(ch, off, off + delimiter_size,
+                                 MD_MARK_OPENER | MD_MARK_RESOLVED);
+                        closer_index = ctx->n_marks;
+                        ADD_MARK(ch, close, close + delimiter_size,
+                                 MD_MARK_CLOSER | MD_MARK_RESOLVED);
+                        ctx->marks[opener_index].next = closer_index;
+                        ctx->marks[closer_index].prev = opener_index;
+                        off = close + delimiter_size;
+                        if(off > line->end)
+                            line = md_lookup_line(off, lines, n_lines,
+                                                  &line_index);
+                        continue;
+                    }
                 }
 
                 off = tmp;
@@ -4235,10 +4599,23 @@ md_analyze_tilde(MD_CTX* ctx, int mark_index)
 
     if((mark->flags & MD_MARK_POTENTIAL_CLOSER)  &&  stack->top >= 0) {
         int opener_index = stack->top;
+        MD_MARK* opener = &ctx->marks[opener_index];
+        OFF off;
+        int invalid = (opener->end >= mark->beg);
 
-        md_pop_openers(ctx, opener_index);
-        md_resolve_range(ctx, opener_index, mark_index);
-        return;
+        for(off = opener->end; !invalid && off < mark->beg; off++) {
+            if((mark->end - mark->beg == 1 &&
+                (CH(off) == _T(' ') || CH(off) == _T('\t') ||
+                 CH(off) == _T('\r') || CH(off) == _T('\n'))) ||
+               (mark->end - mark->beg == 2 && ISNEWLINE(off)))
+                invalid = TRUE;
+        }
+
+        if(!invalid) {
+            md_pop_openers(ctx, opener_index);
+            md_resolve_range(ctx, opener_index, mark_index);
+            return;
+        }
     }
 
     if(mark->flags & MD_MARK_POTENTIAL_OPENER)
@@ -4252,10 +4629,21 @@ md_analyze_caret(MD_CTX* ctx, int mark_index)
 
     if((mark->flags & MD_MARK_POTENTIAL_CLOSER)  &&  CARET_OPENERS.top >= 0) {
         int opener_index = CARET_OPENERS.top;
+        MD_MARK* opener = &ctx->marks[opener_index];
+        OFF off;
+        int invalid = (opener->end >= mark->beg);
 
-        md_pop_openers(ctx, opener_index);
-        md_resolve_range(ctx, opener_index, mark_index);
-        return;
+        for(off = opener->end; !invalid && off < mark->beg; off++) {
+            if(CH(off) == _T(' ') || CH(off) == _T('\t') ||
+               CH(off) == _T('\r') || CH(off) == _T('\n'))
+                invalid = TRUE;
+        }
+
+        if(!invalid) {
+            md_pop_openers(ctx, opener_index);
+            md_resolve_range(ctx, opener_index, mark_index);
+            return;
+        }
     }
 
     if(mark->flags & MD_MARK_POTENTIAL_OPENER)
@@ -4323,10 +4711,20 @@ md_analyze_highlight(MD_CTX* ctx, int mark_index)
 
     if((mark->flags & MD_MARK_POTENTIAL_CLOSER)  &&  EQUAL_OPENERS.top >= 0) {
         int opener_index = EQUAL_OPENERS.top;
+        MD_MARK* opener = &ctx->marks[opener_index];
+        OFF off;
+        int invalid = (opener->end >= mark->beg);
 
-        md_pop_openers(ctx, opener_index);
-        md_resolve_range(ctx, opener_index, mark_index);
-        return;
+        for(off = opener->end; !invalid && off < mark->beg; off++) {
+            if(ISNEWLINE(off))
+                invalid = TRUE;
+        }
+
+        if(!invalid) {
+            md_pop_openers(ctx, opener_index);
+            md_resolve_range(ctx, opener_index, mark_index);
+            return;
+        }
     }
 
     if(mark->flags & MD_MARK_POTENTIAL_OPENER)
@@ -4769,6 +5167,10 @@ abort:
     return ret;
 }
 
+static int md_process_tinta_inline_html_tag(MD_CTX* ctx, OFF beg, OFF end,
+                                             MD_TEXTTYPE* text_type,
+                                             int* handled);
+
 
 /* Render the output, accordingly to the analyzed ctx->marks. */
 static int
@@ -4798,22 +5200,38 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
         /* Process the text up to the next mark or end-of-line. */
         tmp = (line->end < mark->beg ? line->end : mark->beg);
         if(tmp > off) {
-            MD_TEXT(text_type, STR(off), tmp - off);
+            if(!ctx->tinta_suppress_rp)
+                MD_TEXT(text_type, STR(off), tmp - off);
             off = tmp;
         }
 
         /* If reached the mark, process it and move to next one. */
         if(off >= mark->beg) {
+            if((mark->flags & MD_MARK_OPENER) && mark->next >= 0)
+                MD_SET_RANGE(mark->beg, ctx->marks[mark->next].end);
+            else if((mark->flags & MD_MARK_CLOSER) && mark->prev >= 0)
+                MD_SET_RANGE(ctx->marks[mark->prev].beg, mark->end);
+            else
+                MD_SET_RANGE(mark->beg, mark->end);
+            if(ctx->tinta_suppress_rp && mark->ch != '<' && mark->ch != '>') {
+                off = mark->end;
+                mark++;
+                while(!(mark->flags & MD_MARK_RESOLVED) || mark->beg < off)
+                    mark++;
+                continue;
+            }
             switch(mark->ch) {
                 case '\\':      /* Backslash escape. */
                     if(ISNEWLINE(mark->beg+1))
                         enforce_hardbreak = 1;
                     else
-                        MD_TEXT(text_type, STR(mark->beg+1), 1);
+                        MD_TEXT_R(text_type, STR(mark->beg+1), 1,
+                                  mark->beg, mark->end);
                     break;
 
                 case ' ':       /* Non-trivial space. */
-                    MD_TEXT(text_type, _T(" "), 1);
+                    MD_TEXT_R(text_type, _T(" "), 1,
+                              mark->beg, mark->end);
                     break;
 
                 case '`':       /* Code span. */
@@ -4905,14 +5323,38 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                     break;
 
                 case '$':
+                case MD_MARK_MATH_PAREN:
+                case MD_MARK_MATH_BRACKET:
+                {
+                    const MD_MARK* opener = (mark->flags & MD_MARK_OPENER) ?
+                        mark : &ctx->marks[mark->prev];
+                    const MD_MARK* closer = &ctx->marks[opener->next];
+                    MD_SPAN_LATEXMATH_DETAIL detail;
+                    MD_SPANTYPE span_type;
+                    detail.content.begin = opener->end;
+                    detail.content.end = closer->beg;
+                    if(mark->ch == '$') {
+                        int display = opener->end - opener->beg == 2;
+                        detail.delimiter = display ? MD_MATH_DOLLAR_DISPLAY :
+                                                     MD_MATH_DOLLAR_INLINE;
+                        span_type = display ? MD_SPAN_LATEXMATH_DISPLAY :
+                                              MD_SPAN_LATEXMATH;
+                    } else if(mark->ch == MD_MARK_MATH_BRACKET) {
+                        detail.delimiter = MD_MATH_BRACKET_DISPLAY;
+                        span_type = MD_SPAN_LATEXMATH_DISPLAY;
+                    } else {
+                        detail.delimiter = MD_MATH_PAREN_INLINE;
+                        span_type = MD_SPAN_LATEXMATH;
+                    }
                     if(mark->flags & MD_MARK_OPENER) {
-                        MD_ENTER_SPAN((mark->end - off) % 2 ? MD_SPAN_LATEXMATH : MD_SPAN_LATEXMATH_DISPLAY, NULL);
+                        MD_ENTER_SPAN(span_type, &detail);
                         text_type = MD_TEXT_LATEXMATH;
                     } else {
-                        MD_LEAVE_SPAN((mark->end - off) % 2 ? MD_SPAN_LATEXMATH : MD_SPAN_LATEXMATH_DISPLAY, NULL);
+                        MD_LEAVE_SPAN(span_type, &detail);
                         text_type = MD_TEXT_NORMAL;
                     }
                     break;
+                }
 
                 case '[':       /* Footnote reference, link, wiki link, or image. */
                 case '!':
@@ -4983,6 +5425,18 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                 case '<':
                 case '>':       /* Autolink or raw HTML. */
                     if(!(mark->flags & MD_MARK_AUTOLINK)) {
+                        if((ctx->parser.flags & MD_FLAG_TINTA_HTML) &&
+                           (mark->flags & MD_MARK_OPENER) && mark->next >= 0) {
+                            MD_MARK* closer = &ctx->marks[mark->next];
+                            int handled = FALSE;
+                            MD_CHECK(md_process_tinta_inline_html_tag(
+                                ctx, mark->beg, closer->beg, &text_type,
+                                &handled));
+                            if(handled) {
+                                mark->end = closer->end;
+                                break;
+                            }
+                        }
                         /* Raw HTML. */
                         if(mark->flags & MD_MARK_OPENER)
                             text_type = MD_TEXT_HTML;
@@ -5034,7 +5488,8 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                     break;
 
                 case '\0':
-                    MD_TEXT(MD_TEXT_NULLCHAR, _T(""), 1);
+                    MD_TEXT_R(MD_TEXT_NORMAL, _T(""), 1,
+                              mark->beg, mark->end);
                     break;
 
                 case 127:
@@ -5056,10 +5511,10 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
             if(off >= end)
                 break;
 
-            if(text_type == MD_TEXT_CODE || text_type == MD_TEXT_LATEXMATH) {
+            if(text_type == MD_TEXT_CODE) {
                 MD_ASSERT(prev_mark != NULL);
-                MD_ASSERT(ISANYOF2_(prev_mark->ch, '`', '$')  &&  (prev_mark->flags & MD_MARK_OPENER));
-                MD_ASSERT(ISANYOF2_(mark->ch, '`', '$')  &&  (mark->flags & MD_MARK_CLOSER));
+                MD_ASSERT(prev_mark->ch == '`' && (prev_mark->flags & MD_MARK_OPENER));
+                MD_ASSERT(mark->ch == '`' && (mark->flags & MD_MARK_CLOSER));
 
                 /* Inside a code span, trailing line whitespace has to be
                  * outputted. */
@@ -5077,6 +5532,11 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                  * (CommonMark code-span examples 335, 337, 640). */
                 if(off < mark->beg  &&  ISNEWLINE(off))
                     MD_TEXT(text_type, _T(" "), 1);
+            } else if(text_type == MD_TEXT_LATEXMATH) {
+                OFF next = (line + 1)->beg;
+                if(next > off && next <= mark->beg)
+                    MD_TEXT_R(MD_TEXT_LATEXMATH, STR(off), next - off,
+                              off, next);
             } else if(text_type == MD_TEXT_HTML) {
                 /* Inside raw HTML, we output the new line verbatim, including
                  * any trailing spaces. */
@@ -5101,7 +5561,10 @@ md_process_inlines(MD_CTX* ctx, const MD_LINE* lines, MD_SIZE n_lines)
                     }
                 }
 
-                MD_TEXT(break_type, _T("\n"), 1);
+                {
+                    OFF next = (line + 1)->beg;
+                    MD_TEXT_R(break_type, _T("\n"), 1, off, next);
+                }
             }
 
             /* Move to the next line. */
@@ -5154,8 +5617,11 @@ md_process_table_cell(MD_CTX* ctx, MD_BLOCKTYPE cell_type, MD_ALIGN align, OFF b
 {
     MD_LINE line;
     MD_BLOCK_TD_DETAIL det;
+    MD_SOURCE_RANGE source;
     int ret = 0;
 
+    source.begin = (beg == 0 && end == 0) ? MD_OFFSET_INVALID : beg;
+    source.end = (beg == 0 && end == 0) ? MD_OFFSET_INVALID : end;
     while(beg < end  &&  ISWHITESPACE(beg))
         beg++;
     while(end > beg  &&  ISWHITESPACE(end-1))
@@ -5165,8 +5631,10 @@ md_process_table_cell(MD_CTX* ctx, MD_BLOCKTYPE cell_type, MD_ALIGN align, OFF b
     line.beg = beg;
     line.end = end;
 
+    ctx->callback_range = source;
     MD_ENTER_BLOCK(cell_type, &det);
     MD_CHECK(md_process_normal_block_contents(ctx, &line, 1));
+    ctx->callback_range = source;
     MD_LEAVE_BLOCK(cell_type, &det);
 
 abort:
@@ -5207,6 +5675,7 @@ md_process_table_row(MD_CTX* ctx, MD_BLOCKTYPE cell_type, OFF beg, OFF end,
     pipe_offs[j++] = end+1;
 
     /* Process cells. */
+    MD_SET_RANGE(beg, end);
     MD_ENTER_BLOCK(MD_BLOCK_TR, NULL);
     k = 0;
     for(i = 0; i < j-1  &&  k < col_count; i++) {
@@ -5217,6 +5686,7 @@ md_process_table_row(MD_CTX* ctx, MD_BLOCKTYPE cell_type, OFF beg, OFF end,
      * too few of them. */
     while(k < col_count)
         MD_CHECK(md_process_table_cell(ctx, cell_type, align[k++], 0, 0));
+    MD_SET_RANGE(beg, end);
     MD_LEAVE_BLOCK(MD_BLOCK_TR, NULL);
 
 abort:
@@ -5248,17 +5718,21 @@ md_process_table_block_contents(MD_CTX* ctx, int col_count, const MD_LINE* lines
 
     md_analyze_table_alignment(ctx, lines[1].beg, lines[1].end, align, col_count);
 
+    MD_SET_RANGE(lines[0].beg, lines[0].end);
     MD_ENTER_BLOCK(MD_BLOCK_THEAD, NULL);
     MD_CHECK(md_process_table_row(ctx, MD_BLOCK_TH,
                         lines[0].beg, lines[0].end, align, col_count));
+    MD_SET_RANGE(lines[0].beg, lines[0].end);
     MD_LEAVE_BLOCK(MD_BLOCK_THEAD, NULL);
 
     if(n_lines > 2) {
+        MD_SET_RANGE(lines[2].beg, lines[n_lines-1].end);
         MD_ENTER_BLOCK(MD_BLOCK_TBODY, NULL);
         for(line_index = 2; line_index < n_lines; line_index++) {
             MD_CHECK(md_process_table_row(ctx, MD_BLOCK_TD,
                      lines[line_index].beg, lines[line_index].end, align, col_count));
         }
+        MD_SET_RANGE(lines[2].beg, lines[n_lines-1].end);
         MD_LEAVE_BLOCK(MD_BLOCK_TBODY, NULL);
     }
 
@@ -5295,6 +5769,8 @@ struct MD_BLOCK_tag {
      * MD_BLOCK_OL:     Start item number.
      */
     MD_SIZE n_lines;
+    OFF source_begin;
+    OFF source_end;
 };
 
 struct MD_CONTAINER_tag {
@@ -5308,6 +5784,8 @@ struct MD_CONTAINER_tag {
     unsigned contents_indent;
     OFF block_byte_off;
     OFF task_mark_off;
+    OFF source_begin;
+    OFF source_end;
 };
 
 
@@ -5355,8 +5833,19 @@ md_process_verbatim_block_contents(MD_CTX* ctx, MD_TEXTTYPE text_type, const MD_
         /* Output the code line itself. */
         MD_TEXT_INSECURE(text_type, STR(line->beg), line->end - line->beg);
 
-        /* Enforce end-of-line. */
-        MD_TEXT(text_type, _T("\n"), 1);
+        /* Enforce end-of-line while retaining the source range of the
+         * original LF or CRLF sequence. */
+        {
+            OFF eol_end = line->end;
+            if(eol_end < ctx->size && CH(eol_end) == _T('\r'))
+                eol_end++;
+            if(eol_end < ctx->size && CH(eol_end) == _T('\n'))
+                eol_end++;
+            if(eol_end > line->end)
+                MD_TEXT_R(text_type, _T("\n"), 1, line->end, eol_end);
+            else
+                MD_TEXT(text_type, _T("\n"), 1);
+        }
     }
 
 abort:
@@ -5423,6 +5912,785 @@ md_setup_fenced_code_detail(MD_CTX* ctx, const MD_BLOCK* block, MD_BLOCK_CODE_DE
 
 abort:
     return ret;
+}
+
+typedef enum MD_TINTA_TAG_KIND_tag {
+    MD_TINTA_TAG_UNKNOWN = 0,
+    MD_TINTA_TAG_COMMENT,
+    MD_TINTA_TAG_DETAILS,
+    MD_TINTA_TAG_SUMMARY,
+    MD_TINTA_TAG_SUB,
+    MD_TINTA_TAG_SUP,
+    MD_TINTA_TAG_RUBY,
+    MD_TINTA_TAG_RT,
+    MD_TINTA_TAG_RP,
+    MD_TINTA_TAG_BR,
+    MD_TINTA_TAG_HR,
+    MD_TINTA_TAG_UL,
+    MD_TINTA_TAG_OL,
+    MD_TINTA_TAG_LI,
+    MD_TINTA_TAG_A,
+    MD_TINTA_TAG_STRONG,
+    MD_TINTA_TAG_EM,
+    MD_TINTA_TAG_CODE,
+    MD_TINTA_TAG_PRE,
+    MD_TINTA_TAG_P,
+    MD_TINTA_TAG_H,
+    MD_TINTA_TAG_BLOCKQUOTE
+} MD_TINTA_TAG_KIND;
+
+typedef struct MD_TINTA_TAG_tag {
+    MD_TINTA_TAG_KIND kind;
+    OFF begin;
+    OFF end;
+    OFF name_begin;
+    OFF name_end;
+    OFF href_begin;
+    OFF href_end;
+    OFF title_begin;
+    OFF title_end;
+    unsigned heading_level;
+    unsigned ordered_start;
+    int closing;
+    int self_closing;
+    int is_open;
+} MD_TINTA_TAG;
+
+typedef struct MD_TINTA_DETAILS_tag {
+    MD_SOURCE_RANGE source;
+    OFF close_begin;
+    OFF close_end;
+    OFF summary_begin;
+    OFF summary_end;
+} MD_TINTA_DETAILS;
+
+typedef struct MD_TINTA_HTML_STATE_tag {
+    MD_TINTA_DETAILS* details;
+    int n_details;
+    int alloc_details;
+} MD_TINTA_HTML_STATE;
+
+static int
+md_tinta_name_eq(MD_CTX* ctx, const MD_TINTA_TAG* tag, const CHAR* name)
+{
+    SZ size = md_strlen(name);
+    return tag->name_end - tag->name_begin == size &&
+           md_ascii_case_eq(STR(tag->name_begin), name, size);
+}
+
+static MD_TINTA_TAG_KIND
+md_tinta_tag_kind(MD_CTX* ctx, MD_TINTA_TAG* tag)
+{
+    if(md_tinta_name_eq(ctx, tag, _T("details"))) return MD_TINTA_TAG_DETAILS;
+    if(md_tinta_name_eq(ctx, tag, _T("summary"))) return MD_TINTA_TAG_SUMMARY;
+    if(md_tinta_name_eq(ctx, tag, _T("sub"))) return MD_TINTA_TAG_SUB;
+    if(md_tinta_name_eq(ctx, tag, _T("sup"))) return MD_TINTA_TAG_SUP;
+    if(md_tinta_name_eq(ctx, tag, _T("ruby"))) return MD_TINTA_TAG_RUBY;
+    if(md_tinta_name_eq(ctx, tag, _T("rt"))) return MD_TINTA_TAG_RT;
+    if(md_tinta_name_eq(ctx, tag, _T("rp"))) return MD_TINTA_TAG_RP;
+    if(md_tinta_name_eq(ctx, tag, _T("br"))) return MD_TINTA_TAG_BR;
+    if(md_tinta_name_eq(ctx, tag, _T("hr"))) return MD_TINTA_TAG_HR;
+    if(md_tinta_name_eq(ctx, tag, _T("ul"))) return MD_TINTA_TAG_UL;
+    if(md_tinta_name_eq(ctx, tag, _T("ol"))) return MD_TINTA_TAG_OL;
+    if(md_tinta_name_eq(ctx, tag, _T("li"))) return MD_TINTA_TAG_LI;
+    if(md_tinta_name_eq(ctx, tag, _T("a"))) return MD_TINTA_TAG_A;
+    if(md_tinta_name_eq(ctx, tag, _T("strong")) ||
+       md_tinta_name_eq(ctx, tag, _T("b"))) return MD_TINTA_TAG_STRONG;
+    if(md_tinta_name_eq(ctx, tag, _T("em")) ||
+       md_tinta_name_eq(ctx, tag, _T("i"))) return MD_TINTA_TAG_EM;
+    if(md_tinta_name_eq(ctx, tag, _T("code"))) return MD_TINTA_TAG_CODE;
+    if(md_tinta_name_eq(ctx, tag, _T("pre"))) return MD_TINTA_TAG_PRE;
+    if(md_tinta_name_eq(ctx, tag, _T("p"))) return MD_TINTA_TAG_P;
+    if(md_tinta_name_eq(ctx, tag, _T("blockquote"))) return MD_TINTA_TAG_BLOCKQUOTE;
+    if(tag->name_end - tag->name_begin == 2 &&
+       (CH(tag->name_begin) == _T('h') || CH(tag->name_begin) == _T('H')) &&
+       CH(tag->name_begin + 1) >= _T('1') &&
+       CH(tag->name_begin + 1) <= _T('6')) {
+        tag->heading_level = (unsigned)(CH(tag->name_begin + 1) - _T('0'));
+        return MD_TINTA_TAG_H;
+    }
+    return MD_TINTA_TAG_UNKNOWN;
+}
+
+static int
+md_tinta_parse_tag(MD_CTX* ctx, OFF begin, OFF limit, MD_TINTA_TAG* tag)
+{
+    OFF off;
+    memset(tag, 0, sizeof(*tag));
+    tag->begin = begin;
+    tag->href_begin = tag->href_end = MD_OFFSET_INVALID;
+    tag->title_begin = tag->title_end = MD_OFFSET_INVALID;
+    tag->ordered_start = 1;
+    if(begin >= limit || CH(begin) != _T('<')) return FALSE;
+    if(begin + 3 < limit && md_ascii_eq(STR(begin), _T("<!--"), 4)) {
+        off = begin + 4;
+        while(off + 2 < limit && !md_ascii_eq(STR(off), _T("-->"), 3)) off++;
+        tag->kind = MD_TINTA_TAG_COMMENT;
+        tag->end = off + 2 < limit ? off + 3 : limit;
+        return TRUE;
+    }
+    off = begin + 1;
+    while(off < limit && ISWHITESPACE(off)) off++;
+    if(off < limit && CH(off) == _T('/')) {
+        tag->closing = TRUE;
+        off++;
+        while(off < limit && ISWHITESPACE(off)) off++;
+    }
+    tag->name_begin = off;
+    while(off < limit && (ISALNUM(off) || CH(off) == _T('-') ||
+                          CH(off) == _T(':'))) off++;
+    tag->name_end = off;
+    if(tag->name_begin == tag->name_end) return FALSE;
+    tag->kind = md_tinta_tag_kind(ctx, tag);
+
+    while(off < limit) {
+        OFF attr_begin;
+        OFF attr_end;
+        OFF value_begin = MD_OFFSET_INVALID;
+        OFF value_end = MD_OFFSET_INVALID;
+        CHAR quote = 0;
+        while(off < limit && ISWHITESPACE(off)) off++;
+        if(off >= limit) return FALSE;
+        if(CH(off) == _T('>')) {
+            tag->end = off + 1;
+            return TRUE;
+        }
+        if(CH(off) == _T('/') && off + 1 < limit && CH(off + 1) == _T('>')) {
+            tag->self_closing = TRUE;
+            tag->end = off + 2;
+            return TRUE;
+        }
+        attr_begin = off;
+        while(off < limit && (ISALNUM(off) || CH(off) == _T('-') ||
+                              CH(off) == _T('_') || CH(off) == _T(':'))) off++;
+        attr_end = off;
+        if(attr_begin == attr_end) { off++; continue; }
+        while(off < limit && ISWHITESPACE(off)) off++;
+        if(off < limit && CH(off) == _T('=')) {
+            off++;
+            while(off < limit && ISWHITESPACE(off)) off++;
+            if(off < limit && (CH(off) == _T('\'') || CH(off) == _T('"'))) {
+                quote = CH(off++);
+                value_begin = off;
+                while(off < limit && CH(off) != quote) off++;
+                value_end = off;
+                if(off < limit) off++;
+            } else if(!ctx->tinta_suppress_rp) {
+                value_begin = off;
+                while(off < limit && !ISWHITESPACE(off) && CH(off) != _T('>')) off++;
+                value_end = off;
+            }
+        }
+        if(attr_end - attr_begin == 4 &&
+           md_ascii_case_eq(STR(attr_begin), _T("open"), 4))
+            tag->is_open = TRUE;
+        else if(attr_end - attr_begin == 4 &&
+                md_ascii_case_eq(STR(attr_begin), _T("href"), 4)) {
+            tag->href_begin = value_begin;
+            tag->href_end = value_end;
+        } else if(attr_end - attr_begin == 5 &&
+                  md_ascii_case_eq(STR(attr_begin), _T("title"), 5)) {
+            tag->title_begin = value_begin;
+            tag->title_end = value_end;
+        } else if(attr_end - attr_begin == 5 &&
+                  md_ascii_case_eq(STR(attr_begin), _T("start"), 5) &&
+                  value_begin != MD_OFFSET_INVALID) {
+            unsigned value = 0;
+            OFF i;
+            for(i = value_begin; i < value_end && ISDIGIT(i); i++)
+                value = value * 10u + (unsigned)(CH(i) - _T('0'));
+            if(i == value_end && value != 0) tag->ordered_start = value;
+        }
+    }
+    return FALSE;
+}
+
+static int
+md_tinta_find_close(MD_CTX* ctx, const MD_TINTA_TAG* opener, OFF limit,
+                    MD_TINTA_TAG* closer)
+{
+    OFF off = opener->end;
+    unsigned depth = 1;
+    while(off < limit) {
+        MD_TINTA_TAG tag;
+        while(off < limit && CH(off) != _T('<')) off++;
+        if(off >= limit) break;
+        if(!md_tinta_parse_tag(ctx, off, limit, &tag)) { off++; continue; }
+        if(tag.kind == opener->kind && tag.kind != MD_TINTA_TAG_UNKNOWN) {
+            if(tag.closing) {
+                if(--depth == 0) { *closer = tag; return TRUE; }
+            } else if(!tag.self_closing) {
+                depth++;
+            }
+        }
+        off = tag.end;
+    }
+    return FALSE;
+}
+
+static int
+md_tinta_push_inline_frame(MD_CTX* ctx, int kind,
+                           const MD_SOURCE_RANGE* source,
+                           OFF opener_begin, OFF opener_end)
+{
+    if(ctx->n_tinta_inline_frames >= ctx->alloc_tinta_inline_frames) {
+        int capacity = ctx->alloc_tinta_inline_frames ?
+            ctx->alloc_tinta_inline_frames * 2 : 8;
+        MD_TINTA_INLINE_FRAME* frames = (MD_TINTA_INLINE_FRAME*)realloc(
+            ctx->tinta_inline_frames,
+            (size_t)capacity * sizeof(*frames));
+        if(frames == NULL) return -1;
+        ctx->tinta_inline_frames = frames;
+        ctx->alloc_tinta_inline_frames = capacity;
+    }
+    ctx->tinta_inline_frames[ctx->n_tinta_inline_frames].kind = kind;
+    ctx->tinta_inline_frames[ctx->n_tinta_inline_frames].source = *source;
+    ctx->tinta_inline_frames[ctx->n_tinta_inline_frames].opener_begin = opener_begin;
+    ctx->tinta_inline_frames[ctx->n_tinta_inline_frames].opener_end = opener_end;
+    ctx->n_tinta_inline_frames++;
+    return 0;
+}
+
+static int
+md_tinta_inline_span_callback(MD_CTX* ctx, const MD_TINTA_TAG* tag,
+                              MD_SPANTYPE type, int enter,
+                              const MD_SOURCE_RANGE* source)
+{
+    MD_SPAN_A_DETAIL det;
+    MD_ATTRIBUTE_BUILD href_build = { 0 };
+    MD_ATTRIBUTE_BUILD title_build = { 0 };
+    void* detail = NULL;
+    int ret = 0;
+    memset(&det, 0, sizeof(det));
+    if(type == MD_SPAN_A) {
+        MD_CHECK(md_build_attribute(ctx,
+            tag->href_begin == MD_OFFSET_INVALID ? NULL : STR(tag->href_begin),
+            tag->href_begin == MD_OFFSET_INVALID ? 0 : tag->href_end - tag->href_begin,
+            0, &det.href, &href_build));
+        MD_CHECK(md_build_attribute(ctx,
+            tag->title_begin == MD_OFFSET_INVALID ? NULL : STR(tag->title_begin),
+            tag->title_begin == MD_OFFSET_INVALID ? 0 : tag->title_end - tag->title_begin,
+            0, &det.title, &title_build));
+        detail = &det;
+    }
+    if(enter)
+        ret = md_call_enter_span(ctx, type, detail, source);
+    else
+        ret = md_call_leave_span(ctx, type, detail, source);
+abort:
+    md_free_attribute(ctx, &href_build);
+    md_free_attribute(ctx, &title_build);
+    return ret;
+}
+
+static int
+md_process_tinta_inline_html_tag(MD_CTX* ctx, OFF beg, OFF end,
+                                 MD_TEXTTYPE* text_type, int* handled)
+{
+    MD_TINTA_TAG tag;
+    MD_SPANTYPE span_type = MD_SPAN_EM;
+    int is_span = TRUE;
+    int ret;
+    *handled = FALSE;
+    if(!md_tinta_parse_tag(ctx, beg, end, &tag) || tag.end != end)
+        return 0;
+    switch(tag.kind) {
+        case MD_TINTA_TAG_SUB: span_type = MD_SPAN_SUBSCRIPT; break;
+        case MD_TINTA_TAG_SUP: span_type = MD_SPAN_SUPERSCRIPT; break;
+        case MD_TINTA_TAG_RUBY: span_type = MD_SPAN_RUBY; break;
+        case MD_TINTA_TAG_RT: span_type = MD_SPAN_RUBY_TEXT; break;
+        case MD_TINTA_TAG_STRONG: span_type = MD_SPAN_STRONG; break;
+        case MD_TINTA_TAG_EM: span_type = MD_SPAN_EM; break;
+        case MD_TINTA_TAG_CODE: span_type = MD_SPAN_CODE; break;
+        case MD_TINTA_TAG_A: span_type = MD_SPAN_A; break;
+        default: is_span = FALSE; break;
+    }
+    if(tag.kind == MD_TINTA_TAG_BR && !tag.closing) {
+        static const CHAR newline[] = _T("\n");
+        MD_SOURCE_RANGE source = { beg, end };
+        *handled = TRUE;
+        return md_emit_text(ctx, MD_TEXT_BR, newline, 1, &source);
+    }
+    if(tag.kind == MD_TINTA_TAG_RP) {
+        if(!tag.closing && !tag.self_closing) {
+            MD_TINTA_TAG closer;
+            if(!md_tinta_find_close(ctx, &tag, ctx->size, &closer))
+                return 0;
+        }
+        ctx->tinta_suppress_rp = !tag.closing;
+        *handled = TRUE;
+        return 0;
+    }
+    if(!is_span) return 0;
+
+    if(!tag.closing) {
+        MD_TINTA_TAG closer;
+        MD_SOURCE_RANGE source;
+        if(!tag.self_closing && !md_tinta_find_close(ctx, &tag, ctx->size, &closer))
+            return 0;
+        source.begin = tag.begin;
+        source.end = tag.self_closing ? tag.end : closer.end;
+        ret = md_tinta_inline_span_callback(ctx, &tag, span_type, TRUE, &source);
+        if(ret != 0) return ret;
+        if(tag.self_closing) {
+            ret = md_tinta_inline_span_callback(ctx, &tag, span_type, FALSE,
+                                                &source);
+        } else {
+            ret = md_tinta_push_inline_frame(ctx, tag.kind, &source,
+                                             tag.begin, tag.end);
+        }
+        if(ret != 0) return ret;
+        if(tag.kind == MD_TINTA_TAG_CODE) *text_type = MD_TEXT_CODE;
+        *handled = TRUE;
+        return 0;
+    }
+
+    if(ctx->n_tinta_inline_frames > 0 &&
+       ctx->tinta_inline_frames[ctx->n_tinta_inline_frames - 1].kind ==
+           (int)tag.kind) {
+        MD_TINTA_INLINE_FRAME frame =
+            ctx->tinta_inline_frames[ctx->n_tinta_inline_frames - 1];
+        MD_TINTA_TAG opener;
+        if(!md_tinta_parse_tag(ctx, frame.opener_begin, frame.opener_end,
+                               &opener)) return -1;
+        ret = md_tinta_inline_span_callback(ctx, &opener, span_type, FALSE,
+                                            &frame.source);
+        if(ret != 0) return ret;
+        ctx->n_tinta_inline_frames--;
+        if(tag.kind == MD_TINTA_TAG_CODE) *text_type = MD_TEXT_NORMAL;
+        *handled = TRUE;
+    }
+    return 0;
+}
+
+static int
+md_tinta_emit_decoded(MD_CTX* ctx, OFF beg, OFF end, MD_TEXTTYPE type,
+                      int decode_entities, int trim)
+{
+    OFF off;
+    if(trim) {
+        while(beg < end && (ISWHITESPACE(beg) || ISNEWLINE(beg))) beg++;
+        while(end > beg && (ISWHITESPACE(end - 1) || ISNEWLINE(end - 1))) end--;
+    }
+    off = beg;
+    while(off < end) {
+        OFF chunk = off;
+        while(off < end && CH(off) != _T('\0') &&
+              (!decode_entities || CH(off) != _T('&'))) off++;
+        if(off > chunk) {
+            MD_SOURCE_RANGE source = { chunk, off };
+            int ret = md_emit_text(ctx, type, STR(chunk), off - chunk, &source);
+            if(ret != 0) return ret;
+        }
+        if(off >= end) break;
+        if(CH(off) == _T('\0')) {
+            MD_SOURCE_RANGE source = { off, off + 1 };
+            int ret = md_emit_codepoint(ctx, type, 0xfffd, &source);
+            if(ret != 0) return ret;
+            off++;
+        } else {
+            OFF ent_end;
+            if(md_is_entity(ctx, off, end, &ent_end)) {
+                MD_SOURCE_RANGE source = { off, ent_end };
+                int ret = md_emit_text(ctx, MD_TEXT_ENTITY, STR(off),
+                                       ent_end - off, &source);
+                if(ret != 0) return ret;
+                off = ent_end;
+            } else {
+                MD_SOURCE_RANGE source = { off, off + 1 };
+                int ret = md_emit_text(ctx, type, STR(off), 1, &source);
+                if(ret != 0) return ret;
+                off++;
+            }
+        }
+    }
+    return 0;
+}
+
+static int md_tinta_process_fragment(MD_CTX*, MD_TINTA_HTML_STATE*, OFF, OFF, unsigned);
+
+typedef struct MD_TINTA_EXTENSION_tag {
+    MD_SPANTYPE type;
+    OFF begin;
+    OFF content_begin;
+    OFF content_end;
+    OFF end;
+} MD_TINTA_EXTENSION;
+
+static int
+md_tinta_find_extension(MD_CTX* ctx, OFF beg, OFF end,
+                        MD_TINTA_EXTENSION* match)
+{
+    OFF off;
+    for(off = beg; off < end; off++) {
+        CHAR ch = CH(off);
+        OFF delimiter_size = 0;
+        MD_SPANTYPE type = MD_SPAN_EM;
+        OFF close;
+
+        if(ch == _T('=') && (ctx->parser.flags & MD_FLAG_HIGHLIGHT) &&
+           off + 1 < end && CH(off + 1) == _T('=')) {
+            delimiter_size = 2;
+            type = MD_SPAN_MARK;
+        } else if(ch == _T('~') && off + 1 < end &&
+                  CH(off + 1) == _T('~') &&
+                  (ctx->parser.flags & MD_FLAG_STRIKETHROUGH)) {
+            delimiter_size = 2;
+            type = MD_SPAN_DEL;
+        } else if(ch == _T('^') &&
+                  (ctx->parser.flags & MD_FLAG_SUPERSCRIPTS)) {
+            delimiter_size = 1;
+            type = MD_SPAN_SUPERSCRIPT;
+        } else if(ch == _T('~') &&
+                  (ctx->parser.flags & MD_FLAG_SUBSCRIPTS)) {
+            delimiter_size = 1;
+            type = MD_SPAN_SUBSCRIPT;
+        } else {
+            continue;
+        }
+
+        close = off + delimiter_size;
+        while(close + delimiter_size <= end) {
+            OFF i;
+            int matches = TRUE;
+            if(ISNEWLINE(close))
+                break;
+            if(delimiter_size == 1 &&
+               (CH(close) == _T(' ') || CH(close) == _T('\t')))
+                break;
+            for(i = 0; i < delimiter_size; i++) {
+                if(CH(close + i) != ch) {
+                    matches = FALSE;
+                    break;
+                }
+            }
+            if(matches && close > off + delimiter_size) {
+                match->type = type;
+                match->begin = off;
+                match->content_begin = off + delimiter_size;
+                match->content_end = close;
+                match->end = close + delimiter_size;
+                return TRUE;
+            }
+            close++;
+        }
+    }
+    return FALSE;
+}
+
+static int
+md_tinta_emit_extension_text(MD_CTX* ctx, OFF beg, OFF end)
+{
+    OFF off = beg;
+    while(off < end) {
+        MD_TINTA_EXTENSION match;
+        MD_SOURCE_RANGE source;
+        int ret;
+        if(!md_tinta_find_extension(ctx, off, end, &match))
+            return md_tinta_emit_decoded(ctx, off, end,
+                                         MD_TEXT_NORMAL, TRUE, TRUE);
+        if(match.begin > off) {
+            ret = md_tinta_emit_decoded(ctx, off, match.begin,
+                                        MD_TEXT_NORMAL, TRUE, TRUE);
+            if(ret != 0) return ret;
+        }
+        source.begin = match.begin;
+        source.end = match.end;
+        ret = md_call_enter_span(ctx, match.type, NULL, &source);
+        if(ret != 0) return ret;
+        ret = md_tinta_emit_decoded(ctx, match.content_begin,
+                                    match.content_end,
+                                    MD_TEXT_NORMAL, TRUE, TRUE);
+        if(ret != 0) return ret;
+        ret = md_call_leave_span(ctx, match.type, NULL, &source);
+        if(ret != 0) return ret;
+        off = match.end;
+    }
+    return 0;
+}
+
+static int
+md_tinta_emit_container(MD_CTX* ctx, MD_TINTA_HTML_STATE* state,
+                        const MD_TINTA_TAG* tag, const MD_TINTA_TAG* closer,
+                        OFF content_begin, OFF content_end, unsigned depth)
+{
+    MD_SOURCE_RANGE source = { tag->begin, closer ? closer->end : content_end };
+    MD_BLOCK_H_DETAIL hdet;
+    MD_BLOCK_UL_DETAIL uldet = { TRUE, _T('-') };
+    MD_BLOCK_OL_DETAIL oldet = { 1, TRUE, _T('.') };
+    MD_BLOCK_LI_DETAIL lidet = { 0, 0, 0 };
+    MD_BLOCK_CODE_DETAIL codedet;
+    MD_SPAN_A_DETAIL adet;
+    MD_ATTRIBUTE_BUILD href_build = { 0 };
+    MD_ATTRIBUTE_BUILD title_build = { 0 };
+    MD_BLOCKTYPE block_type = MD_BLOCK_DOC;
+    MD_SPANTYPE span_type = MD_SPAN_EM;
+    int is_block = FALSE;
+    int is_span = FALSE;
+    int ret = 0;
+
+    memset(&codedet, 0, sizeof(codedet));
+    memset(&adet, 0, sizeof(adet));
+    switch(tag->kind) {
+        case MD_TINTA_TAG_SUMMARY: block_type = MD_BLOCK_P; is_block = TRUE; break;
+        case MD_TINTA_TAG_UL: block_type = MD_BLOCK_UL; is_block = TRUE; break;
+        case MD_TINTA_TAG_OL:
+            block_type = MD_BLOCK_OL; is_block = TRUE;
+            oldet.start = tag->ordered_start; break;
+        case MD_TINTA_TAG_LI: block_type = MD_BLOCK_LI; is_block = TRUE; break;
+        case MD_TINTA_TAG_PRE: block_type = MD_BLOCK_CODE; is_block = TRUE; break;
+        case MD_TINTA_TAG_P: block_type = MD_BLOCK_P; is_block = TRUE; break;
+        case MD_TINTA_TAG_H:
+            block_type = MD_BLOCK_H; is_block = TRUE;
+            hdet.level = tag->heading_level; break;
+        case MD_TINTA_TAG_BLOCKQUOTE: block_type = MD_BLOCK_QUOTE; is_block = TRUE; break;
+        case MD_TINTA_TAG_SUB: span_type = MD_SPAN_SUBSCRIPT; is_span = TRUE; break;
+        case MD_TINTA_TAG_SUP: span_type = MD_SPAN_SUPERSCRIPT; is_span = TRUE; break;
+        case MD_TINTA_TAG_RUBY: span_type = MD_SPAN_RUBY; is_span = TRUE; break;
+        case MD_TINTA_TAG_RT: span_type = MD_SPAN_RUBY_TEXT; is_span = TRUE; break;
+        case MD_TINTA_TAG_STRONG: span_type = MD_SPAN_STRONG; is_span = TRUE; break;
+        case MD_TINTA_TAG_EM: span_type = MD_SPAN_EM; is_span = TRUE; break;
+        case MD_TINTA_TAG_CODE: span_type = MD_SPAN_CODE; is_span = TRUE; break;
+        case MD_TINTA_TAG_A:
+            span_type = MD_SPAN_A; is_span = TRUE;
+            MD_CHECK(md_build_attribute(ctx,
+                tag->href_begin == MD_OFFSET_INVALID ? NULL : STR(tag->href_begin),
+                tag->href_begin == MD_OFFSET_INVALID ? 0 : tag->href_end - tag->href_begin,
+                0, &adet.href, &href_build));
+            MD_CHECK(md_build_attribute(ctx,
+                tag->title_begin == MD_OFFSET_INVALID ? NULL : STR(tag->title_begin),
+                tag->title_begin == MD_OFFSET_INVALID ? 0 : tag->title_end - tag->title_begin,
+                0, &adet.title, &title_build));
+            break;
+        default: break;
+    }
+    ctx->callback_range = source;
+    if(is_block) {
+        void* det = block_type == MD_BLOCK_H ? (void*)&hdet :
+                    block_type == MD_BLOCK_UL ? (void*)&uldet :
+                    block_type == MD_BLOCK_OL ? (void*)&oldet :
+                    block_type == MD_BLOCK_LI ? (void*)&lidet :
+                    block_type == MD_BLOCK_CODE ? (void*)&codedet : NULL;
+        ret = md_call_enter_block(ctx, block_type, det, &source);
+        if(ret != 0) goto abort;
+        if(tag->kind == MD_TINTA_TAG_PRE)
+            ret = md_tinta_emit_decoded(ctx, content_begin, content_end,
+                                        MD_TEXT_CODE, FALSE, FALSE);
+        else
+            ret = md_tinta_process_fragment(ctx, state, content_begin,
+                                            content_end, depth + 1);
+        if(ret != 0) goto abort;
+        ret = md_call_leave_block(ctx, block_type, det, &source);
+    } else if(is_span) {
+        void* det = tag->kind == MD_TINTA_TAG_A ? (void*)&adet : NULL;
+        ret = md_call_enter_span(ctx, span_type, det, &source);
+        if(ret != 0) goto abort;
+        if(tag->kind == MD_TINTA_TAG_CODE)
+            ret = md_tinta_emit_decoded(ctx, content_begin, content_end,
+                                        MD_TEXT_CODE, FALSE, FALSE);
+        else
+            ret = md_tinta_process_fragment(ctx, state, content_begin,
+                                            content_end, depth + 1);
+        if(ret != 0) goto abort;
+        ret = md_call_leave_span(ctx, span_type, det, &source);
+    }
+abort:
+    md_free_attribute(ctx, &href_build);
+    md_free_attribute(ctx, &title_build);
+    return ret;
+}
+
+static int
+md_tinta_push_details(MD_TINTA_HTML_STATE* state,
+                      const MD_TINTA_DETAILS* details)
+{
+    if(state->n_details >= state->alloc_details) {
+        int capacity = state->alloc_details ? state->alloc_details * 2 : 8;
+        MD_TINTA_DETAILS* data = (MD_TINTA_DETAILS*)realloc(
+            state->details, (size_t)capacity * sizeof(*data));
+        if(data == NULL) return -1;
+        state->details = data;
+        state->alloc_details = capacity;
+    }
+    state->details[state->n_details++] = *details;
+    return 0;
+}
+
+static int
+md_tinta_open_details(MD_CTX* ctx, MD_TINTA_HTML_STATE* state,
+                      const MD_TINTA_TAG* tag, unsigned depth)
+{
+    MD_TINTA_TAG closer;
+    MD_TINTA_TAG summary;
+    MD_TINTA_TAG summary_close;
+    MD_TINTA_DETAILS frame;
+    MD_BLOCK_DETAILS_DETAIL det;
+    MD_SOURCE_RANGE summary_source = { MD_OFFSET_INVALID, MD_OFFSET_INVALID };
+    OFF limit;
+    OFF off;
+    unsigned nested = 0;
+    int has_close;
+    int has_summary = FALSE;
+    int ret;
+
+    has_close = md_tinta_find_close(ctx, tag, ctx->size, &closer);
+    limit = has_close ? closer.begin : ctx->size;
+    memset(&frame, 0, sizeof(frame));
+    frame.source.begin = tag->begin;
+    frame.source.end = has_close ? closer.end : ctx->size;
+    frame.close_begin = has_close ? closer.begin : MD_OFFSET_INVALID;
+    frame.close_end = has_close ? closer.end : MD_OFFSET_INVALID;
+    frame.summary_begin = frame.summary_end = MD_OFFSET_INVALID;
+
+    off = tag->end;
+    while(off < limit) {
+        MD_TINTA_TAG candidate;
+        while(off < limit && CH(off) != _T('<')) off++;
+        if(off >= limit) break;
+        if(!md_tinta_parse_tag(ctx, off, limit, &candidate)) { off++; continue; }
+        if(candidate.kind == MD_TINTA_TAG_DETAILS) {
+            if(candidate.closing) { if(nested) nested--; }
+            else if(!candidate.self_closing) nested++;
+        } else if(candidate.kind == MD_TINTA_TAG_SUMMARY &&
+                  !candidate.closing && nested == 0 &&
+                  md_tinta_find_close(ctx, &candidate, limit, &summary_close)) {
+            summary = candidate;
+            has_summary = TRUE;
+            break;
+        }
+        off = candidate.end;
+    }
+    if(has_summary) {
+        frame.summary_begin = summary.begin;
+        frame.summary_end = summary_close.end;
+        summary_source.begin = summary.begin;
+        summary_source.end = summary_close.end;
+    }
+    if(md_tinta_push_details(state, &frame) != 0) return -1;
+
+    det.is_open = tag->is_open;
+    ret = md_call_enter_block(ctx, MD_BLOCK_DETAILS, &det, &frame.source);
+    if(ret != 0) return ret;
+    ret = md_call_enter_block(ctx, MD_BLOCK_SUMMARY, NULL, &summary_source);
+    if(ret != 0) return ret;
+    if(has_summary)
+        ret = md_tinta_process_fragment(ctx, state, summary.end,
+                                        summary_close.begin, depth + 1);
+    else {
+        static const CHAR label[] = _T("Details");
+        MD_SOURCE_RANGE invalid = { MD_OFFSET_INVALID, MD_OFFSET_INVALID };
+        ret = md_emit_text(ctx, MD_TEXT_NORMAL, label,
+                           SIZEOF_ARRAY(label) - 1, &invalid);
+    }
+    if(ret != 0) return ret;
+    return md_call_leave_block(ctx, MD_BLOCK_SUMMARY, NULL, &summary_source);
+}
+
+static int
+md_tinta_process_fragment(MD_CTX* ctx, MD_TINTA_HTML_STATE* state,
+                          OFF beg, OFF end, unsigned depth)
+{
+    OFF off = beg;
+    if(depth > 256)
+        return md_tinta_emit_decoded(ctx, beg, end, MD_TEXT_NORMAL, TRUE, TRUE);
+    while(off < end) {
+        MD_TINTA_TAG tag;
+        OFF text_end = off;
+        while(text_end < end && CH(text_end) != _T('<')) text_end++;
+        if(text_end > off) {
+            int ret = md_tinta_emit_extension_text(ctx, off, text_end);
+            if(ret != 0) return ret;
+            off = text_end;
+            continue;
+        }
+        if(state->n_details > 0) {
+            MD_TINTA_DETAILS* details = &state->details[state->n_details - 1];
+            if(details->summary_begin == off) {
+                off = details->summary_end;
+                continue;
+            }
+        }
+        if(!md_tinta_parse_tag(ctx, off, end, &tag)) {
+            int ret = md_tinta_emit_decoded(ctx, off, off + 1,
+                                            MD_TEXT_NORMAL, TRUE, FALSE);
+            if(ret != 0) return ret;
+            off++;
+            continue;
+        }
+        if(tag.kind == MD_TINTA_TAG_COMMENT) { off = tag.end; continue; }
+        if(tag.kind == MD_TINTA_TAG_DETAILS) {
+            if(tag.closing) {
+                if(state->n_details > 0) {
+                    MD_TINTA_DETAILS frame = state->details[state->n_details - 1];
+                    if(frame.close_begin == MD_OFFSET_INVALID ||
+                       frame.close_begin == tag.begin) {
+                        MD_BLOCK_DETAILS_DETAIL det = { 0 };
+                        int ret = md_call_leave_block(
+                            ctx, MD_BLOCK_DETAILS, &det, &frame.source);
+                        if(ret != 0) return ret;
+                        state->n_details--;
+                    }
+                }
+            } else if(!tag.self_closing) {
+                int ret = md_tinta_open_details(ctx, state, &tag, depth);
+                if(ret != 0) return ret;
+            }
+            off = tag.end;
+            continue;
+        }
+        if(tag.kind == MD_TINTA_TAG_BR && !tag.closing) {
+            static const CHAR newline[] = _T("\n");
+            MD_SOURCE_RANGE source = { tag.begin, tag.end };
+            int ret = md_emit_text(ctx, MD_TEXT_BR, newline, 1, &source);
+            if(ret != 0) return ret;
+            off = tag.end;
+            continue;
+        }
+        if(tag.kind == MD_TINTA_TAG_HR && !tag.closing) {
+            MD_SOURCE_RANGE source = { tag.begin, tag.end };
+            int ret = md_call_enter_block(ctx, MD_BLOCK_HR, NULL, &source);
+            if(ret == 0)
+                ret = md_call_leave_block(ctx, MD_BLOCK_HR, NULL, &source);
+            if(ret != 0) return ret;
+            off = tag.end;
+            continue;
+        }
+        if(tag.closing || tag.kind == MD_TINTA_TAG_UNKNOWN) {
+            off = tag.end;
+            continue;
+        }
+        {
+            MD_TINTA_TAG closer;
+            int has_close = !tag.self_closing &&
+                md_tinta_find_close(ctx, &tag, end, &closer);
+            OFF content_end = has_close ? closer.begin : tag.end;
+            if(tag.kind == MD_TINTA_TAG_RP) {
+                off = has_close ? closer.end : tag.end;
+                continue;
+            }
+            if(tag.self_closing) {
+                off = tag.end;
+                continue;
+            }
+            if(has_close) {
+                int ret = md_tinta_emit_container(ctx, state, &tag, &closer,
+                                                  tag.end, content_end, depth);
+                if(ret != 0) return ret;
+                off = closer.end;
+            } else {
+                off = tag.end;
+            }
+        }
+    }
+    return 0;
+}
+
+static int
+md_process_tinta_html_block(MD_CTX* ctx, MD_TINTA_HTML_STATE* state,
+                            const MD_BLOCK* block)
+{
+    return md_tinta_process_fragment(ctx, state, block->source_begin,
+                                     block->source_end, 0);
 }
 
 static int
@@ -5496,6 +6764,7 @@ md_process_leaf_block(MD_CTX* ctx, MD_BLOCK* block)
             break;
     }
 
+    MD_SET_RANGE(block->source_begin, block->source_end);
     if(!is_in_tight_list  ||  block->type != MD_BLOCK_P)
         MD_ENTER_BLOCK(block->type, (void*) &det);
 
@@ -5526,6 +6795,7 @@ md_process_leaf_block(MD_CTX* ctx, MD_BLOCK* block)
             break;
     }
 
+    MD_SET_RANGE(block->source_begin, block->source_end);
     if(!is_in_tight_list  ||  block->type != MD_BLOCK_P)
         MD_LEAVE_BLOCK(block->type, (void*) &det);
 
@@ -5540,18 +6810,71 @@ abort:
 static const MD_CHAR* MD_ADMONITION_TAGS[] = { _T("note"), _T("tip"), _T("important"), _T("warning"), _T("caution") };
 
 static int
+md_resolve_container_ranges(MD_CTX* ctx)
+{
+    int byte_off = 0;
+    int depth = 0;
+    int capacity = ctx->n_block_bytes / (int)sizeof(MD_BLOCK) + 1;
+    OFF last_end = 0;
+    MD_BLOCK** stack = capacity > 0 ?
+        (MD_BLOCK**)malloc((size_t)capacity * sizeof(*stack)) : NULL;
+
+    if(capacity > 0 && stack == NULL) {
+        MD_LOG("malloc() failed.");
+        return -1;
+    }
+
+    while(byte_off < ctx->n_block_bytes) {
+        MD_BLOCK* block = (MD_BLOCK*)((char*)ctx->block_bytes + byte_off);
+        if(block->flags & MD_BLOCK_CONTAINER) {
+            if(block->flags & MD_BLOCK_CONTAINER_CLOSER) {
+                MD_BLOCK* opener;
+                OFF end;
+                if(depth <= 0) {
+                    free(stack);
+                    return -1;
+                }
+                opener = stack[--depth];
+                end = MAX(last_end, opener->source_end);
+                opener->source_end = end;
+                block->source_begin = opener->source_begin;
+                block->source_end = end;
+                last_end = end;
+            }
+            if(block->flags & MD_BLOCK_CONTAINER_OPENER) {
+                stack[depth++] = block;
+                if(block->source_end != MD_OFFSET_INVALID)
+                    last_end = MAX(last_end, block->source_end);
+            }
+        } else {
+            last_end = block->source_end;
+            if(block->type == MD_BLOCK_CODE || block->type == MD_BLOCK_HTML)
+                byte_off += block->n_lines * sizeof(MD_VERBATIMLINE);
+            else
+                byte_off += block->n_lines * sizeof(MD_LINE);
+        }
+        byte_off += sizeof(MD_BLOCK);
+    }
+
+    free(stack);
+    return depth == 0 ? 0 : -1;
+}
+
+static int
 md_process_all_blocks(MD_CTX* ctx)
 {
-    MD_TEXTTYPE adm_substr_types[1] = { MD_TEXT_NORMAL };
-    MD_OFFSET adm_substr_offsets[2];
     int byte_off = 0;
     int ret = 0;
+    MD_TINTA_HTML_STATE html_state;
+
+    memset(&html_state, 0, sizeof(html_state));
 
     /* ctx->containers now is not needed for detection of lists and list items
      * so we reuse it for tracking what lists are loose or tight. We rely
      * on the fact the vector is large enough to hold the deepest nesting
      * level of lists. */
     ctx->n_containers = 0;
+    MD_CHECK(md_resolve_container_ranges(ctx));
 
     while(byte_off < ctx->n_block_bytes) {
         MD_BLOCK* block = (MD_BLOCK*)((char*)ctx->block_bytes + byte_off);
@@ -5581,13 +6904,10 @@ md_process_all_blocks(MD_CTX* ctx)
                 break;
 
             case MD_BLOCK_ADMONITION:
-                adm_substr_offsets[0] = 0;
-                adm_substr_offsets[1] = md_strlen(MD_ADMONITION_TAGS[block->data]);
-
                 det.adm.type.text = MD_ADMONITION_TAGS[block->data];
-                det.adm.type.size = adm_substr_offsets[1];
-                det.adm.type.substr_types = adm_substr_types;
-                det.adm.type.substr_offsets = adm_substr_offsets;
+                det.adm.type.size = md_strlen(MD_ADMONITION_TAGS[block->data]);
+                det.adm.type.source.begin = MD_OFFSET_INVALID;
+                det.adm.type.source.end = MD_OFFSET_INVALID;
                 break;
 
             default:
@@ -5596,6 +6916,7 @@ md_process_all_blocks(MD_CTX* ctx)
         }
 
         if(block->flags & MD_BLOCK_CONTAINER) {
+            MD_SET_RANGE(block->source_begin, block->source_end);
             if(block->flags & MD_BLOCK_CONTAINER_CLOSER) {
                 MD_LEAVE_BLOCK(block->type, &det);
 
@@ -5619,7 +6940,11 @@ md_process_all_blocks(MD_CTX* ctx)
                 }
             }
         } else {
-            MD_CHECK(md_process_leaf_block(ctx, block));
+            if(block->type == MD_BLOCK_HTML &&
+               (ctx->parser.flags & MD_FLAG_TINTA_HTML))
+                MD_CHECK(md_process_tinta_html_block(ctx, &html_state, block));
+            else
+                MD_CHECK(md_process_leaf_block(ctx, block));
 
             if(block->type == MD_BLOCK_CODE || block->type == MD_BLOCK_HTML)
                 byte_off += block->n_lines * sizeof(MD_VERBATIMLINE);
@@ -5630,9 +6955,18 @@ md_process_all_blocks(MD_CTX* ctx)
         byte_off += sizeof(MD_BLOCK);
     }
 
+    while(html_state.n_details > 0) {
+        MD_TINTA_DETAILS frame = html_state.details[html_state.n_details - 1];
+        MD_BLOCK_DETAILS_DETAIL det = { 0 };
+        MD_CHECK(md_call_leave_block(ctx, MD_BLOCK_DETAILS, &det,
+                                     &frame.source));
+        html_state.n_details--;
+    }
+
     ctx->n_block_bytes = 0;
 
 abort:
+    free(html_state.details);
     return ret;
 }
 
@@ -5717,6 +7051,8 @@ md_start_new_block(MD_CTX* ctx, const MD_LINE_ANALYSIS* line)
     block->flags = 0;
     block->data = line->data;
     block->n_lines = 0;
+    block->source_begin = line->source_begin;
+    block->source_end = line->source_end;
 
     ctx->current_block = block;
     return 0;
@@ -5829,6 +7165,8 @@ static int
 md_add_line_into_current_block(MD_CTX* ctx, const MD_LINE_ANALYSIS* analysis)
 {
     MD_ASSERT(ctx->current_block != NULL);
+    if(analysis->source_end > ctx->current_block->source_end)
+        ctx->current_block->source_end = analysis->source_end;
 
     if(ctx->current_block->type == MD_BLOCK_CODE || ctx->current_block->type == MD_BLOCK_HTML) {
         MD_VERBATIMLINE* line;
@@ -5857,7 +7195,8 @@ md_add_line_into_current_block(MD_CTX* ctx, const MD_LINE_ANALYSIS* analysis)
 
 static int
 md_push_container_bytes(MD_CTX* ctx, MD_BLOCKTYPE type, unsigned start,
-                        unsigned data, unsigned flags)
+                        unsigned data, OFF source_begin, OFF source_end,
+                        unsigned flags)
 {
     MD_BLOCK* block;
     int ret = 0;
@@ -5872,6 +7211,8 @@ md_push_container_bytes(MD_CTX* ctx, MD_BLOCKTYPE type, unsigned start,
     block->flags = flags;
     block->data = data;
     block->n_lines = start;
+    block->source_begin = source_begin;
+    block->source_end = source_end;
 
 abort:
     return ret;
@@ -6343,17 +7684,20 @@ md_enter_child_containers(MD_CTX* ctx, int n_children)
 
                 MD_CHECK(md_push_container_bytes(ctx,
                                 (is_ordered_list ? MD_BLOCK_OL : MD_BLOCK_UL),
-                                c->start, c->ch, MD_BLOCK_CONTAINER_OPENER));
+                                c->start, c->ch, c->source_begin,
+                                c->source_end, MD_BLOCK_CONTAINER_OPENER));
                 MD_CHECK(md_push_container_bytes(ctx, MD_BLOCK_LI,
                                 c->task_mark_off,
                                 (c->is_task ? CH(c->task_mark_off) : 0),
+                                c->source_begin, c->source_end,
                                 MD_BLOCK_CONTAINER_OPENER));
                 break;
 
             case _T('>'):
                 MD_CHECK(md_push_container_bytes(ctx,
                                 (c->is_admonition ? MD_BLOCK_ADMONITION : MD_BLOCK_QUOTE),
-                                0, c->admonition_type, MD_BLOCK_CONTAINER_OPENER));
+                                0, c->admonition_type, c->source_begin,
+                                c->source_end, MD_BLOCK_CONTAINER_OPENER));
                 break;
 
             default:
@@ -6386,16 +7730,19 @@ md_leave_child_containers(MD_CTX* ctx, int n_keep)
             case _T('*'):
                 MD_CHECK(md_push_container_bytes(ctx, MD_BLOCK_LI,
                                 c->task_mark_off, (c->is_task ? CH(c->task_mark_off) : 0),
+                                MD_OFFSET_INVALID, MD_OFFSET_INVALID,
                                 MD_BLOCK_CONTAINER_CLOSER));
                 MD_CHECK(md_push_container_bytes(ctx,
                                 (is_ordered_list ? MD_BLOCK_OL : MD_BLOCK_UL), 0,
-                                c->ch, MD_BLOCK_CONTAINER_CLOSER));
+                                c->ch, MD_OFFSET_INVALID, MD_OFFSET_INVALID,
+                                MD_BLOCK_CONTAINER_CLOSER));
                 break;
 
             case _T('>'):
                 MD_CHECK(md_push_container_bytes(ctx,
                                 (c->is_admonition ? MD_BLOCK_ADMONITION : MD_BLOCK_QUOTE),
-                                0, c->admonition_type, MD_BLOCK_CONTAINER_CLOSER));
+                                0, c->admonition_type, MD_OFFSET_INVALID,
+                                MD_OFFSET_INVALID, MD_BLOCK_CONTAINER_CLOSER));
                 break;
 
             default:
@@ -6427,6 +7774,8 @@ md_is_container_mark(MD_CTX* ctx, unsigned indent, OFF beg, OFF* p_end, MD_CONTA
         p_container->is_task = FALSE;
         p_container->mark_indent = indent;
         p_container->contents_indent = indent + 1;
+        p_container->source_begin = beg;
+        p_container->source_end = off;
         *p_end = off;
         return TRUE;
     }
@@ -6438,6 +7787,8 @@ md_is_container_mark(MD_CTX* ctx, unsigned indent, OFF beg, OFF* p_end, MD_CONTA
         p_container->is_task = FALSE;
         p_container->mark_indent = indent;
         p_container->contents_indent = indent + 1;
+        p_container->source_begin = beg;
+        p_container->source_end = off + 1;
         *p_end = off+1;
         return TRUE;
     }
@@ -6461,6 +7812,8 @@ md_is_container_mark(MD_CTX* ctx, unsigned indent, OFF beg, OFF* p_end, MD_CONTA
         p_container->is_task = FALSE;
         p_container->mark_indent = indent;
         p_container->contents_indent = indent + off - beg + 1;
+        p_container->source_begin = beg;
+        p_container->source_end = off + 1;
         *p_end = off+1;
         return TRUE;
     }
@@ -6486,7 +7839,84 @@ md_line_indentation(MD_CTX* ctx, unsigned total_indent, OFF beg, OFF* p_end)
     return indent - total_indent;
 }
 
-static const MD_LINE_ANALYSIS md_dummy_blank_line = { MD_LINE_BLANK, 0, 0, 0, 0, 0 };
+static const MD_LINE_ANALYSIS md_dummy_blank_line = {
+    MD_LINE_BLANK, 0, 0, 0, 0, 0, 0, 0
+};
+
+static int
+md_math_delimiter_is_escaped(MD_CTX* ctx, OFF off, OFF floor)
+{
+    unsigned n = 0;
+    while(off > floor && CH(off - 1) == _T('\\')) {
+        n++;
+        off--;
+    }
+    return (n & 1u) != 0;
+}
+
+static void
+md_update_math_block_state(MD_CTX* ctx, OFF beg, OFF end)
+{
+    OFF off = beg;
+    if(!(ctx->parser.flags & MD_FLAG_LATEXMATHSPANS))
+        return;
+
+    if(ctx->math_block_kind != 0) {
+        while(off < end) {
+            if(ctx->math_block_kind == _T('$') && off + 1 < end &&
+               CH(off) == _T('$') && CH(off + 1) == _T('$') &&
+               !md_math_delimiter_is_escaped(ctx, off, beg)) {
+                ctx->math_block_kind = 0;
+                return;
+            }
+            if(ctx->math_block_kind == _T(']') && off + 1 < end &&
+               CH(off) == _T('\\') && CH(off + 1) == _T(']') &&
+               !md_math_delimiter_is_escaped(ctx, off, beg)) {
+                ctx->math_block_kind = 0;
+                return;
+            }
+            off++;
+        }
+        return;
+    }
+
+    while(off < end) {
+        int kind = 0;
+        OFF content;
+        OFF close;
+        if(off + 1 < end && CH(off) == _T('$') && CH(off + 1) == _T('$') &&
+           !md_math_delimiter_is_escaped(ctx, off, beg)) {
+            kind = _T('$');
+            content = off + 2;
+        } else if(off + 1 < end && CH(off) == _T('\\') &&
+                  CH(off + 1) == _T('[') &&
+                  !md_math_delimiter_is_escaped(ctx, off, beg)) {
+            kind = _T(']');
+            content = off + 2;
+        } else {
+            off++;
+            continue;
+        }
+
+        close = content;
+        while(close < end) {
+            if(kind == _T('$') && close + 1 < end &&
+               CH(close) == _T('$') && CH(close + 1) == _T('$') &&
+               !md_math_delimiter_is_escaped(ctx, close, content))
+                break;
+            if(kind == _T(']') && close + 1 < end &&
+               CH(close) == _T('\\') && CH(close + 1) == _T(']') &&
+               !md_math_delimiter_is_escaped(ctx, close, content))
+                break;
+            close++;
+        }
+        if(close + 1 >= end) {
+            ctx->math_block_kind = kind;
+            return;
+        }
+        off = close + 2;
+    }
+}
 
 /* Analyze type of the line and find some its properties. This serves as a
  * main input for determining type and boundaries of a block. */
@@ -6507,6 +7937,8 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
     line->indent = md_line_indentation(ctx, total_indent, off, &off);
     total_indent += line->indent;
     line->beg = off;
+    line->source_begin = off;
+    line->source_end = off;
     line->enforce_new_block = FALSE;
 
     /* Given the indentation and block quote marks '>', determine how many of
@@ -6528,6 +7960,7 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
                 line->indent--;
 
             line->beg = off;
+            line->source_begin = off;
 
         } else if(c->ch != _T('>')  &&  line->indent >= c->contents_indent) {
             /* List. */
@@ -6558,6 +7991,8 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
             if(line->indent < ctx->code_indent_offset) {
                 if(md_is_closing_code_fence(ctx, CH(pivot_line->beg), off, &off)) {
                     line->type = MD_LINE_BLANK;
+                    if(ctx->current_block != NULL)
+                        ctx->current_block->source_end = off;
                     ctx->last_line_has_list_loosening_effect = FALSE;
                     break;
                 }
@@ -6603,6 +8038,15 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
                 n_parents = ctx->n_containers;
                 break;
             }
+        }
+
+        /* Once display math opened on a previous physical line, its contents
+         * stay in the current textual block. In particular, list markers,
+         * headings, blank lines and fences inside the formula are data. */
+        if(ctx->math_block_kind != 0) {
+            line->type = MD_LINE_TEXT;
+            n_parents = ctx->n_containers;
+            break;
         }
 
         /* Check for blank line. */
@@ -6712,6 +8156,7 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
                 line->indent = md_line_indentation(ctx, total_indent, off, &off);
                 total_indent += line->indent;
                 line->beg = off;
+                line->source_begin = off;
 
                 /* Some of the following whitespace actually still belongs to the mark. */
                 if(off >= ctx->size || ISNEWLINE(off)) {
@@ -6759,6 +8204,7 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
                 total_indent += line->indent;
 
                 line->beg = off;
+                line->source_begin = off;
                 line->data = container.ch;
 
                 /* Some of the following whitespace actually still belongs to the mark. */
@@ -6880,6 +8326,7 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
                 while(off < ctx->size  &&  ISWHITESPACE(off))
                     off++;
                 line->beg = off;
+                line->source_begin = off;
             }
         }
 
@@ -6896,6 +8343,7 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
 
     /* Set end of the line. */
     line->end = off;
+    line->source_end = off;
 
     /* But for ATX header, we should exclude the optional trailing mark. */
     if(line->type == MD_LINE_ATXHEADER) {
@@ -6913,6 +8361,9 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
         while(line->end > line->beg && ISBLANK(line->end-1))
             line->end--;
     }
+
+    if(line->type == MD_LINE_TEXT)
+        md_update_math_block_state(ctx, line->beg, line->end);
 
     /* Eat also the new line. */
     if(off < ctx->size && CH(off) == _T('\r'))
@@ -6941,13 +8392,17 @@ md_analyze_line(MD_CTX* ctx, OFF beg, OFF* p_end,
         MD_CHECK(md_push_container_bytes(ctx, MD_BLOCK_LI,
                     ctx->containers[n_parents].task_mark_off,
                     (ctx->containers[n_parents].is_task ? CH(ctx->containers[n_parents].task_mark_off) : 0),
+                    MD_OFFSET_INVALID, MD_OFFSET_INVALID,
                     MD_BLOCK_CONTAINER_CLOSER));
         MD_CHECK(md_push_container_bytes(ctx, MD_BLOCK_LI,
                     container.task_mark_off,
                     (container.is_task ? CH(container.task_mark_off) : 0),
+                    container.source_begin, container.source_end,
                     MD_BLOCK_CONTAINER_OPENER));
         ctx->containers[n_parents].is_task = container.is_task;
         ctx->containers[n_parents].task_mark_off = container.task_mark_off;
+        ctx->containers[n_parents].source_begin = container.source_begin;
+        ctx->containers[n_parents].source_end = container.source_end;
     }
 
     if(n_children > 0) {
@@ -7083,9 +8538,11 @@ md_process_footnote_def(MD_CTX* ctx, MD_FOOTNOTE_DEF* def)
     MD_CHECK(md_build_attribute(ctx, def->entry.label, def->entry.label_size, 0,
                                 &det.label, &label_build));
 
+    MD_SET_RANGE(def->source_begin, def->source_end);
     MD_ENTER_BLOCK(MD_BLOCK_FOOTNOTE_DEF, &det);
     MD_CHECK(md_process_normal_block_contents(ctx, def->content_lines,
                                               def->n_content_lines));
+    MD_SET_RANGE(def->source_begin, def->source_end);
     MD_LEAVE_BLOCK(MD_BLOCK_FOOTNOTE_DEF, &det);
 
 abort:
@@ -7108,6 +8565,7 @@ md_process_footnote_defs(MD_CTX* ctx)
     qsort(ctx->footnote_hashtable.defs, ctx->footnote_hashtable.n_defs,
           sizeof(MD_FOOTNOTE_DEF), md_footnote_def_cmp_index);
 
+    MD_SET_INVALID_RANGE();
     MD_ENTER_BLOCK(MD_BLOCK_FOOTNOTE_DEF_SECTION, NULL);
 
     for(i = 0; i < ctx->footnote_hashtable.n_defs; i++) {
@@ -7117,6 +8575,7 @@ md_process_footnote_defs(MD_CTX* ctx)
         MD_CHECK(md_process_footnote_def(ctx, def));
     }
 
+    MD_SET_INVALID_RANGE();
     MD_LEAVE_BLOCK(MD_BLOCK_FOOTNOTE_DEF_SECTION, NULL);
 
 abort:
@@ -7132,6 +8591,7 @@ md_process_doc(MD_CTX *ctx)
     OFF off = 0;
     int ret = 0;
 
+    MD_SET_RANGE(0, ctx->size);
     MD_ENTER_BLOCK(MD_BLOCK_DOC, NULL);
 
     while(off < ctx->size) {
@@ -7156,6 +8616,7 @@ md_process_doc(MD_CTX *ctx)
     if(ctx->parser.flags & MD_FLAG_FOOTNOTES)
         MD_CHECK(md_process_footnote_defs(ctx));
 
+    MD_SET_RANGE(0, ctx->size);
     MD_LEAVE_BLOCK(MD_BLOCK_DOC, NULL);
 
 abort:
@@ -7197,7 +8658,7 @@ md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userd
     int i;
     int ret;
 
-    if(parser->abi_version != 0) {
+    if(parser->abi_version != MD_PARSER_ABI_VERSION) {
         if(parser->debug_log != NULL)
             parser->debug_log("Unsupported abi_version.", userdata);
         return -1;
@@ -7209,6 +8670,8 @@ md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userd
     ctx.size = size;
     memcpy(&ctx.parser, parser, sizeof(MD_PARSER));
     ctx.userdata = userdata;
+    ctx.callback_range.begin = MD_OFFSET_INVALID;
+    ctx.callback_range.end = MD_OFFSET_INVALID;
     ctx.code_indent_offset = (ctx.parser.flags & MD_FLAG_NOINDENTEDCODEBLOCKS) ? (OFF)(-1) : 4;
     md_build_mark_char_map(&ctx);
     ctx.doc_ends_with_newline = (size > 0  &&  ISNEWLINE_(text[size-1]));
@@ -7235,6 +8698,7 @@ md_parse(const MD_CHAR* text, MD_SIZE size, const MD_PARSER* parser, void* userd
     free(ctx.marks);
     free(ctx.block_bytes);
     free(ctx.containers);
+    free(ctx.tinta_inline_frames);
 
     return ret;
 }
