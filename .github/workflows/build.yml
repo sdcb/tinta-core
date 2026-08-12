@@ -90,13 +90,19 @@ jobs:
           -DBUILD_TESTING=OFF
           -DTINTA_BUILD_EXAMPLES=ON
           -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
-      - name: Build demo
-        run: cmake --build demo-build --config Release --target tinta_demo --parallel
-      - name: Upload demo
+      - name: Build demos
+        run: >-
+          cmake --build demo-build --config Release --parallel --target
+          tinta_demo tinta_editor_demo tinta_minimal tinta_chat_demo
+      - name: Upload demos
         uses: actions/upload-artifact@v7
         with:
-          name: tinta-demo-windows-x64-static-msvcrt
-          path: demo-build/Release/tinta_demo.exe
+          name: tinta-demos-windows-x64-static-msvcrt
+          path: |
+            demo-build/Release/tinta_demo.exe
+            demo-build/Release/tinta_editor_demo.exe
+            demo-build/Release/tinta_minimal.exe
+            demo-build/Release/tinta_chat_demo.exe
           if-no-files-found: error
 
   c-package:
