@@ -100,6 +100,8 @@ static bool control_reentrant_message_allowed(UINT message) {
         case TMM_GETSCROLLPOS:
         case TMM_GETCONTENTSIZE:
         case TMM_GETFINDSTATE:
+        case TMM_GETHEADINGCOUNT:
+        case TMM_GETHEADING:
         case TMM_GETSELECTION:
         case TMM_GETAUTOSIZE:
         case TMM_GETVERSION:
