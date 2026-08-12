@@ -196,6 +196,15 @@ int main() {
                     "clipboard did not preserve LF selection");
         SendMessageW(editor, WM_LBUTTONUP, 0, point);
 
+        SendMessageW(editor, WM_LBUTTONDOWN, MK_LBUTTON, point);
+        selected = selection(editor);
+        SendMessageW(editor, WM_MOUSEMOVE, 0, MAKELPARAM(599, 399));
+        TintaEditorSelection after_move = selection(editor);
+        ok &= check(after_move.anchor == selected.anchor &&
+                    after_move.caret == selected.caret,
+                    "mouse movement without the left button extended selection");
+        SendMessageW(editor, WM_LBUTTONUP, 0, MAKELPARAM(599, 399));
+
         SendMessageW(editor, EM_SETREADONLY, TRUE, 0);
         SendMessageW(editor, EM_SETSEL, 0, -1);
         ok &= check(!SendMessageW(editor, WM_CLEAR, 0, 0) &&

@@ -1365,8 +1365,9 @@ static void editor_render(TintaEditor *editor) {
         TintaDWriteTextMetrics metrics;
         TintaEditorLineMetric line_metric;
         D2D1_POINT_2F origin;
-        size_t selected_start;
-        size_t selected_end;
+        size_t selected_start = 0;
+        size_t selected_end = 0;
+        size_t line_end;
         layout = editor_create_layout(editor, line, &text, &length,
                                       &line_start, &metrics);
         if (!layout) break;
@@ -1383,10 +1384,13 @@ static void editor_render(TintaEditor *editor) {
         }
         origin.x = editor->padding_left - editor->scroll_x;
         origin.y = y;
-        selected_start = selection_start > line_start ?
-            selection_start - line_start : 0;
-        selected_end = selection_end < line_start + length ?
-            selection_end - line_start : length;
+        line_end = line_start + length;
+        if (selection_start < line_end && selection_end > line_start) {
+            selected_start = selection_start > line_start ?
+                selection_start - line_start : 0;
+            selected_end = selection_end < line_end ?
+                selection_end - line_start : length;
+        }
         if (selected_start < selected_end)
             editor_draw_selection(editor, layout, origin, selected_start,
                                   selected_end - selected_start, false);
@@ -2135,6 +2139,17 @@ LRESULT CALLBACK tinta_editor_window_proc(HWND hwnd, UINT message,
                 int y = GET_Y_LPARAM(lparam);
                 TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, hwnd, 0};
                 TrackMouseEvent(&track);
+                if (!(wparam & MK_LBUTTON) &&
+                    (editor->selecting || editor->line_selecting ||
+                     editor->v_scrollbar_dragging ||
+                     editor->h_scrollbar_dragging)) {
+                    editor->selecting = false;
+                    editor->line_selecting = false;
+                    editor->v_scrollbar_dragging = false;
+                    editor->h_scrollbar_dragging = false;
+                    editor_stop_autoscroll(editor);
+                    if (GetCapture() == hwnd) ReleaseCapture();
+                }
                 if (editor->v_scrollbar_dragging || editor->h_scrollbar_dragging)
                     editor_drag_scrollbar(editor, x, y);
                 else if (editor->line_selecting || editor->selecting)
