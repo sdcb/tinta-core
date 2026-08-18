@@ -21,6 +21,11 @@ static bool block_resources = true;
 static bool post_quit_on_destroy;
 static int destroy_quit_code;
 static bool destroy_on_ready;
+static bool query_headings_on_ready;
+static LRESULT ready_heading_count;
+static bool ready_heading_query_succeeded;
+static std::wstring ready_heading_text;
+static std::wstring ready_heading_anchor;
 static std::wstring last_resource_uri;
 
 static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
@@ -32,6 +37,26 @@ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message,
         if (header) notifications++;
         if (header && header->code == TMN_DOCUMENTREADY)
             document_ready_notifications++;
+        if (header && header->code == TMN_DOCUMENTREADY &&
+            query_headings_on_ready) {
+            wchar_t text[64]{};
+            wchar_t anchor[64]{};
+            TintaHeadingInfo info{};
+            query_headings_on_ready = false;
+            ready_heading_count = SendMessageW(
+                header->hwndFrom, TMM_GETHEADINGCOUNT, 0, 0);
+            info.cb_size = sizeof(info);
+            info.index = 1;
+            info.text = text;
+            info.text_capacity = _countof(text);
+            info.anchor = anchor;
+            info.anchor_capacity = _countof(anchor);
+            ready_heading_query_succeeded = SendMessageW(
+                header->hwndFrom, TMM_GETHEADING, 0,
+                reinterpret_cast<LPARAM>(&info)) != FALSE;
+            ready_heading_text = text;
+            ready_heading_anchor = anchor;
+        }
         if (header && header->code == TMN_DOCUMENTREADY && destroy_on_ready) {
             destroy_on_ready = false;
             DestroyWindow(header->hwndFrom);
@@ -1459,6 +1484,28 @@ int main() {
         return 1;
     }
     DestroyWindow(second_probe);
+    HWND heading_probe = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW, L"first",
+        WS_CHILD, 0, 0, 320, 100, parent, reinterpret_cast<HMENU>(105),
+        instance, nullptr);
+    if (!heading_probe) {
+        std::cerr << "heading notification query setup failed\n";
+        return 1;
+    }
+    ready_heading_count = 0;
+    ready_heading_query_succeeded = false;
+    ready_heading_text.clear();
+    ready_heading_anchor.clear();
+    query_headings_on_ready = true;
+    SendMessageW(heading_probe, WM_SETTEXT, 0,
+                 reinterpret_cast<LPARAM>(L"# First\n\n## Second"));
+    SendMessageW(heading_probe, WM_PAINT, 0, 0);
+    if (ready_heading_count != 2 || !ready_heading_query_succeeded ||
+        ready_heading_text != L"Second" ||
+        ready_heading_anchor != L"second") {
+        std::cerr << "heading query during document-ready notification failed\n";
+        return 1;
+    }
+    DestroyWindow(heading_probe);
 #if TINTA_ENABLE_LOCAL_IMAGES
     block_resources = false;
     HWND error_probe = CreateWindowW(TINTA_MARKDOWN_VIEW_CLASSW,

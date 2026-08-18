@@ -30,6 +30,9 @@
   `TINTA_CAPABILITY_TEXT_EDITOR`. `TintaCoreInitialize` now registers both
   Tinta window classes atomically while retaining shared graphics and lifetime
   accounting.
+- Fixed read-only heading queries during control notifications, preventing the
+  demo's table of contents from being cleared when handling
+  `TMN_DOCUMENTREADY`.
 
 ## 1.2.0
 
