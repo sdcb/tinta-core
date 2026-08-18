@@ -519,6 +519,7 @@ bool tinta_copy_code_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_copy_mermaid_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_copy_svg_at(TintaApp *app, int x, int y, bool *copied);
 bool tinta_copy_document_at(TintaApp *app, int x, int y, bool *copied);
+bool tinta_document_copy_hover_at(const TintaApp *app, int x, int y);
 bool tinta_document_button_at(const TintaApp *app, int x, int y);
 int tinta_code_block_at(const TintaApp *app, int x, int y);
 bool tinta_code_button_at(const TintaApp *app, int x, int y);

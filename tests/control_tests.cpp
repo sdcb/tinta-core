@@ -703,6 +703,24 @@ int main() {
     SendMessageW(view, WM_PAINT, 0, 0);
     ValidateRect(view, nullptr);
     SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(static_cast<int>(8.0f * dpi_scale),
+                            static_cast<int>(8.0f * dpi_scale)));
+    if (!GetUpdateRect(view, nullptr, FALSE)) {
+        std::cerr << "document top hover did not invalidate\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    ValidateRect(view, nullptr);
+    SendMessageW(view, WM_MOUSEMOVE, 0,
+                 MAKELPARAM(static_cast<int>(8.0f * dpi_scale),
+                            static_cast<int>(50.0f * dpi_scale)));
+    if (!GetUpdateRect(view, nullptr, FALSE)) {
+        std::cerr << "document top hover exit did not invalidate\n";
+        return 1;
+    }
+    SendMessageW(view, WM_PAINT, 0, 0);
+    ValidateRect(view, nullptr);
+    SendMessageW(view, WM_MOUSEMOVE, 0,
                  MAKELPARAM(document_copy_x, document_copy_y));
     if (!GetUpdateRect(view, nullptr, FALSE)) {
         std::cerr << "document copy hover did not invalidate\n";

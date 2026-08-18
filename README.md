@@ -185,9 +185,9 @@ linkage.
   narrow hosts; their internal bars support dragging, horizontal wheel input,
   and Shift+wheel.
 - `TINTA_OPTION_DOCUMENT_COPY_BUTTON` adds an opt-in Copy button at the
-  document's top-right. It is always visible at the top, scrolls away with the
-  document, copies the exact source for the displayed revision, and briefly
-  changes to `Copied`.
+  document's top-right. It appears while the pointer is within the document's
+  top 40 DIPs, scrolls away with the document, copies the exact source for the
+  displayed revision, and briefly changes to `Copied`.
 - External links send `TMN_LINKACTIVATE`; returning zero permits the default
   `ShellExecuteW` behavior. Images send `TMN_RESOURCEOPENING`; the host can
   return default, block, or replace the resource URI.

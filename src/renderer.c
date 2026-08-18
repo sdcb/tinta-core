@@ -3563,6 +3563,24 @@ bool tinta_document_button_at(const TintaApp *app, int x, int y) {
            document_y >= button.top && document_y <= button.bottom;
 }
 
+bool tinta_document_copy_hover_at(const TintaApp *app, int x, int y) {
+    float document_x;
+    float document_y;
+    RECT button;
+    if (!app || !app->document_copy_button_enabled || !app->tracking_mouse)
+        return false;
+    button = document_button_rect(app);
+    if (button.left < app->scroll_x ||
+        button.bottom <= app->scroll_y ||
+        button.top >= app->scroll_y + app->height)
+        return false;
+    document_x = x - viewport_x(app) + app->scroll_x;
+    document_y = y + app->scroll_y;
+    return document_x >= app->scroll_x &&
+           document_x <= app->scroll_x + viewport_width(app) &&
+           document_y >= 0 && document_y <= scale(app, 40);
+}
+
 static D2D1_COLOR_F d2d_color(uint32_t color) {
     D2D1_COLOR_F result;
     result.r = ((color >> 16) & 0xff) / 255.0f;
@@ -4687,8 +4705,11 @@ void tinta_render(TintaApp *app) {
                           app->notice_code_block < 0 &&
                           app->notice_mermaid_block < 0 &&
                           app->notice_svg_block < 0;
+            bool hovered = tinta_document_copy_hover_at(
+                app, app->mouse_x, app->mouse_y);
             if (document_button.left >= app->scroll_x &&
-                button.bottom > 0 && button.top < app->height)
+                button.bottom > 0 && button.top < app->height &&
+                (hovered || copied))
                 draw_copy_button(app, button, copied,
                     tinta_document_button_at(
                         app, app->mouse_x, app->mouse_y));

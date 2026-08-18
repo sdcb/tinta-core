@@ -20,6 +20,50 @@ void check(bool condition, const char *message) {
     failures++;
 }
 
+void test_document_copy_hover(TintaApp &app) {
+    float old_dpi_scale = app.dpi_scale;
+    float old_zoom = app.zoom;
+    float old_scroll_x = app.scroll_x;
+    float old_scroll_y = app.scroll_y;
+    bool old_enabled = app.document_copy_button_enabled;
+    bool old_tracking_mouse = app.tracking_mouse;
+    app.dpi_scale = 1.0f;
+    app.zoom = 1.0f;
+    app.scroll_x = 0;
+    app.scroll_y = 0;
+    app.document_copy_button_enabled = true;
+    check(!tinta_document_copy_hover_at(&app, 8, 8),
+          "document copy button stays hidden before mouse tracking starts");
+    app.tracking_mouse = true;
+    check(tinta_document_copy_hover_at(&app, 8, 8),
+          "document copy button appears over the document top region");
+    check(tinta_document_copy_hover_at(&app, app.width - 8, 40),
+          "document copy hover region includes its bottom edge");
+    check(!tinta_document_copy_hover_at(&app, 8, 41),
+          "document copy button stays hidden below the top region");
+    check(!tinta_document_copy_hover_at(&app, app.width + 1, 8),
+          "document copy hover region stays within the viewport");
+    app.zoom = 2.0f;
+    check(tinta_document_copy_hover_at(&app, 8, 80),
+          "document copy hover region respects zoom");
+    check(!tinta_document_copy_hover_at(&app, 8, 81),
+          "zoomed document copy hover region has the expected boundary");
+    app.zoom = 1.0f;
+    app.scroll_y = 40;
+    check(!tinta_document_copy_hover_at(&app, 8, 0),
+          "document copy hover region scrolls away with the button");
+    app.scroll_y = 0;
+    app.document_copy_button_enabled = false;
+    check(!tinta_document_copy_hover_at(&app, 8, 8),
+          "disabled document copy button has no hover region");
+    app.dpi_scale = old_dpi_scale;
+    app.zoom = old_zoom;
+    app.scroll_x = old_scroll_x;
+    app.scroll_y = old_scroll_y;
+    app.document_copy_button_enabled = old_enabled;
+    app.tracking_mouse = old_tracking_mouse;
+}
+
 TintaTextRun *find_run(TintaApp &app, const wchar_t *text, size_t occurrence = 0) {
     for (size_t i = 0; i < app.text_runs.len; i++) {
         auto *run = TINTA_VEC_PTR(TintaTextRun, app.text_runs, i);
@@ -888,6 +932,7 @@ int main() {
     }
 
     test_inline_styles(app);
+    test_document_copy_hover(app);
     test_math_layout(app);
     test_block_collapse(app);
     test_html_details(app);

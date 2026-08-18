@@ -470,6 +470,11 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                  TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
                 tinta_document_button_at(&control->view,
                     control->view.mouse_x, control->view.mouse_y);
+            bool old_over_document_copy_hover =
+                (control->options.flags &
+                 TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
+                tinta_document_copy_hover_at(&control->view,
+                    control->view.mouse_x, control->view.mouse_y);
             bool old_over_mermaid_button = tinta_mermaid_button_at(
                 &control->view,
                 control->view.mouse_x, control->view.mouse_y);
@@ -505,6 +510,7 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                 bool hover_changed;
                 bool over_copy_button;
                 bool over_document_button;
+                bool over_document_copy_hover;
                 bool over_mermaid_button;
                 bool over_svg_button;
                 bool over_collapsible_header;
@@ -524,6 +530,10 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                     (control->options.flags &
                      TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
                     tinta_document_button_at(&control->view, x, y);
+                over_document_copy_hover =
+                    (control->options.flags &
+                     TINTA_OPTION_DOCUMENT_COPY_BUTTON) &&
+                    tinta_document_copy_hover_at(&control->view, x, y);
                 over_mermaid_button =
                     control->view.hovered_mermaid_block >= 0 &&
                     tinta_mermaid_button_at(&control->view, x, y);
@@ -537,6 +547,8 @@ bool tinta_control_handle_input(TintaControl *control, UINT message,
                     old_svg_block != control->view.hovered_svg_block ||
                     old_over_copy_button != over_copy_button ||
                     old_over_document_button != over_document_button ||
+                    old_over_document_copy_hover !=
+                        over_document_copy_hover ||
                     old_over_mermaid_button != over_mermaid_button ||
                     old_over_svg_button != over_svg_button ||
                     old_over_collapsible_header != over_collapsible_header)
