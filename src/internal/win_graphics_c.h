@@ -150,6 +150,15 @@ typedef struct TintaDWriteClusterMetrics {
     UINT16 padding : 11;
 } TintaDWriteClusterMetrics;
 
+typedef struct TintaDWriteLineMetrics {
+    UINT32 length;
+    UINT32 trailingWhitespaceLength;
+    UINT32 newlineLength;
+    FLOAT height;
+    FLOAT baseline;
+    BOOL isTrimmed;
+} TintaDWriteLineMetrics;
+
 typedef struct IDWriteFactory IDWriteFactory;
 typedef struct IDWriteFactory2 IDWriteFactory2;
 typedef struct IDWriteFontFallback IDWriteFontFallback;
@@ -229,7 +238,9 @@ typedef struct TintaIDWriteTextLayoutVtbl {
     TintaComMethod GetFontStretch;
     FLOAT (STDMETHODCALLTYPE *GetFontSize)(IDWriteTextLayout *);
     TintaComMethod unused_format_tail[2];
-    TintaComMethod unused_layout_before_metrics[32];
+    TintaComMethod unused_layout_before_line_metrics[31];
+    HRESULT (STDMETHODCALLTYPE *GetLineMetrics)(
+        IDWriteTextLayout *, TintaDWriteLineMetrics *, UINT32, UINT32 *);
     HRESULT (STDMETHODCALLTYPE *GetMetrics)(IDWriteTextLayout *, TintaDWriteTextMetrics *);
     TintaComMethod GetOverhangMetrics;
     HRESULT (STDMETHODCALLTYPE *GetClusterMetrics)(

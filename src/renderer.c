@@ -9,7 +9,6 @@
 #endif
 #if TINTA_ENABLE_MATH
 #include "math_layout.h"
-#include "math_opentype.h"
 #include "tinta_math.h"
 #endif
 
@@ -1201,96 +1200,22 @@ static bool add_wrapped(TintaApp *app, InlineState *state, const wchar_t *text,
 }
 
 #if TINTA_ENABLE_MATH
-static bool font_name_contains(const wchar_t *name, size_t name_length,
-                               const wchar_t *family) {
-    size_t family_length = wcslen(family);
-    size_t index;
-    if (family_length > name_length) return false;
-    for (index = 0; index <= name_length - family_length; index++) {
-        if (_wcsnicmp(name + index, family, family_length) == 0)
-            return true;
-    }
-    return false;
-}
-
 static bool math_font_available(void) {
-    static int cached = -1;
-    static const wchar_t *paths[] = {
-        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
-        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"
-    };
-    static const HKEY roots[] = {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER};
-    size_t root_index;
-    if (cached >= 0) return cached != 0;
-    cached = 0;
-    for (root_index = 0; root_index < 2 && !cached; root_index++) {
-        HKEY key = NULL;
-        DWORD index = 0;
-        if (RegOpenKeyExW(roots[root_index], paths[root_index], 0,
-                          KEY_READ, &key) != ERROR_SUCCESS) continue;
-        for (;;) {
-            wchar_t name[256];
-            wchar_t value[512];
-            wchar_t expanded[512];
-            wchar_t font_path[768];
-            DWORD name_length = (DWORD)(sizeof(name) / sizeof(name[0]));
-            DWORD value_size = (DWORD)sizeof(value);
-            DWORD value_type = 0;
-            LONG status = RegEnumValueW(key, index++, name, &name_length,
-                                        NULL, &value_type,
-                                        (BYTE *)value, &value_size);
-            if (status == ERROR_NO_MORE_ITEMS) break;
-            if (status == ERROR_SUCCESS &&
-                font_name_contains(name, name_length, L"Cambria Math") &&
-                (value_type == REG_SZ || value_type == REG_EXPAND_SZ) &&
-                value_size >= sizeof(wchar_t)) {
-                const wchar_t *font_file = value;
-                value[(sizeof(value) / sizeof(value[0])) - 1] = 0;
-                if (value_type == REG_EXPAND_SZ &&
-                    ExpandEnvironmentStringsW(value, expanded,
-                        (DWORD)(sizeof(expanded) / sizeof(expanded[0]))) > 0)
-                    font_file = expanded;
-                if ((font_file[0] == L'\\' && font_file[1] == L'\\') ||
-                    (font_file[0] && font_file[1] == L':')) {
-                    wcsncpy_s(font_path,
-                        sizeof(font_path) / sizeof(font_path[0]),
-                        font_file, _TRUNCATE);
-                } else {
-                    UINT windows_length = GetWindowsDirectoryW(
-                        font_path,
-                        (UINT)(sizeof(font_path) / sizeof(font_path[0])));
-                    if (!windows_length ||
-                        windows_length >= sizeof(font_path) /
-                                          sizeof(font_path[0]))
-                        continue;
-                    wcscat_s(font_path,
-                        sizeof(font_path) / sizeof(font_path[0]),
-                        L"\\Fonts\\");
-                    wcscat_s(font_path,
-                        sizeof(font_path) / sizeof(font_path[0]),
-                        font_file);
-                }
-                cached = tinta_math_ot_font_file_valid(font_path, NULL) ? 1 : 0;
-                if (cached) break;
-            }
-        }
-        RegCloseKey(key);
-    }
-    return cached != 0;
+    return true;
 }
 
 static IDWriteTextFormat *create_math_format(
         TintaApp *app, float font_size, TintaMathTextStyle style) {
-    const wchar_t *family = L"Cambria Math";
+    const wchar_t *family = app->theme->font_family;
     TintaDWriteFontWeight weight = TINTA_DWRITE_FONT_WEIGHT_NORMAL;
     TintaDWriteFontStyle font_style = TINTA_DWRITE_FONT_STYLE_NORMAL;
     IDWriteTextFormat *format = NULL;
-    if (style == TINTA_MATH_STYLE_TEXT || style == TINTA_MATH_STYLE_SANS)
-        family = app->theme->font_family;
-    else if (style == TINTA_MATH_STYLE_MONO)
+    if (style == TINTA_MATH_STYLE_MONO)
         family = app->theme->code_font_family;
+    else if (style == TINTA_MATH_STYLE_SYMBOL)
+        family = L"Cambria Math";
     if (style == TINTA_MATH_STYLE_BOLD)
-        weight = TINTA_DWRITE_FONT_WEIGHT_BOLD;
+        weight = TINTA_DWRITE_FONT_WEIGHT_SEMI_BOLD;
     if (style == TINTA_MATH_STYLE_ITALIC)
         font_style = TINTA_DWRITE_FONT_STYLE_ITALIC;
     if (FAILED(app->dwrite_factory->lpVtbl->CreateTextFormat(
@@ -1312,6 +1237,8 @@ static bool measure_math_text(void *opaque, const char *utf8, size_t length,
     IDWriteTextFormat *format = NULL;
     IDWriteTextLayout *layout = NULL;
     TintaDWriteTextMetrics metrics = {0};
+    TintaDWriteLineMetrics line_metrics = {0};
+    UINT32 actual_line_count = 0;
     bool ok = tinta_utf8_to_utf16(utf8, length, &wide);
     if (ok) format = create_math_format(app, font_size, style);
     if (ok && format)
@@ -1319,8 +1246,18 @@ static bool measure_math_text(void *opaque, const char *utf8, size_t length,
                                 100000.0f, &layout, &metrics);
     if (ok) {
         result->width = metrics.widthIncludingTrailingWhitespace;
-        result->ascent = metrics.height * 0.78f;
-        result->descent = metrics.height - result->ascent;
+        if (layout &&
+            SUCCEEDED(layout->lpVtbl->GetLineMetrics(
+                layout, &line_metrics, 1, &actual_line_count)) &&
+            actual_line_count > 0 && line_metrics.height > 0 &&
+            line_metrics.baseline > 0) {
+            result->ascent = line_metrics.baseline;
+            result->descent = maxf(0, line_metrics.height -
+                                      line_metrics.baseline);
+        } else {
+            result->ascent = metrics.height * 0.78f;
+            result->descent = metrics.height - result->ascent;
+        }
     }
     if (layout) layout->lpVtbl->Release(layout);
     if (format) format->lpVtbl->Release(format);
@@ -1468,6 +1405,61 @@ static bool emit_math_layout(TintaApp *app, const TintaMathLayout *layout,
     return true;
 }
 
+static bool math_layout_can_use(TintaApp *app, TintaMathCacheEntry *cached) {
+    size_t remaining;
+    if (!cached || !cached->parsed.success || !cached->layout_ready)
+        return false;
+    remaining = app->max_ast_nodes > app->ast_node_count +
+                    app->math_ast_nodes_used ?
+        app->max_ast_nodes - app->ast_node_count -
+            app->math_ast_nodes_used : 0;
+    if (cached->parsed.node_count > remaining) return false;
+    app->math_ast_nodes_used += cached->parsed.node_count;
+    return true;
+}
+
+static bool layout_math_block_native(TintaApp *app, const TintaElement *element,
+                                     float *y, float left, float right) {
+    TintaMathCacheEntry *cached;
+    const TintaMathLayout *layout;
+    float font_size = format_line_height(app->body_format) / 1.7f * 1.06f;
+    float top_gap = ui_scale(app, 6);
+    float bottom_gap = ui_scale(app, 14);
+    float x;
+    float top;
+    size_t region_index = SIZE_MAX;
+    RECT viewport;
+    bool ok = false;
+    if (!math_font_available()) return false;
+    cached = math_cache_entry(app, element, font_size, true);
+    if (!math_layout_can_use(app, cached)) return false;
+    layout = &cached->layout;
+    *y += top_gap;
+    viewport.left = (LONG)left;
+    viewport.right = (LONG)right;
+    viewport.top = (LONG)*y;
+    viewport.bottom = (LONG)ceilf(*y + layout->ascent + layout->descent);
+    region_index = begin_horizontal_region(
+        app, TINTA_HORIZONTAL_MATH, element->source_offset, viewport, true);
+    if (region_index == SIZE_MAX) goto done;
+    x = layout->width <= right - left ?
+        left + (right - left - layout->width) * 0.5f : left;
+    top = *y;
+    ok = emit_math_layout(app, layout, element->raw, x, top);
+    if (!ok) goto done;
+    finish_horizontal_region(app, region_index);
+    {
+        TintaHorizontalRegion *region = horizontal_region(app, region_index);
+        *y += layout->ascent + layout->descent + bottom_gap +
+              (region && region->overflow ? ui_scale(app, 14) : 0);
+    }
+done:
+    if (!ok && region_index != SIZE_MAX &&
+        app->active_horizontal_region == region_index)
+        finish_horizontal_region(app, region_index);
+    return ok;
+}
+
 static bool layout_math_native(TintaApp *app, const TintaElement *element,
                                InlineState *state, bool display) {
     TintaMathCacheEntry *cached;
@@ -1478,17 +1470,10 @@ static bool layout_math_native(TintaApp *app, const TintaElement *element,
     size_t region_index = SIZE_MAX;
     RECT viewport;
     bool ok = false;
-    size_t remaining;
     if (!math_font_available()) return false;
+    if (display) font_size *= 1.06f;
     cached = math_cache_entry(app, element, font_size, display);
-    if (!cached || !cached->parsed.success || !cached->layout_ready)
-        return false;
-    remaining = app->max_ast_nodes > app->ast_node_count +
-                    app->math_ast_nodes_used ?
-        app->max_ast_nodes - app->ast_node_count -
-            app->math_ast_nodes_used : 0;
-    if (cached->parsed.node_count > remaining) return false;
-    app->math_ast_nodes_used += cached->parsed.node_count;
+    if (!math_layout_can_use(app, cached)) return false;
     layout = &cached->layout;
     if (!display && state->x + layout->width > state->right &&
         state->x > state->left) inline_next_line(app, state);
@@ -1500,6 +1485,7 @@ static bool layout_math_native(TintaApp *app, const TintaElement *element,
             }
             inline_next_line(app, state);
         }
+        state->y += ui_scale(app, 6);
         viewport.left = (LONG)state->left;
         viewport.right = (LONG)state->right;
         viewport.top = (LONG)state->y;
@@ -1531,6 +1517,7 @@ static bool layout_math_native(TintaApp *app, const TintaElement *element,
         finish_horizontal_region(app, region_index);
         region = horizontal_region(app, region_index);
         state->y += layout->ascent + layout->descent +
+                    ui_scale(app, 14) +
                     (region && region->overflow ? ui_scale(app, 14) : 0);
         state->x = state->left;
         inline_reset_line(app, state);
@@ -1753,6 +1740,12 @@ static bool layout_paragraph(TintaApp *app, const TintaElement *element,
         }
         if (svg) return layout_svg_block(app, image, y, left, right);
     }
+#endif
+#if TINTA_ENABLE_MATH
+    if (element->child_count == 1 &&
+        element->children[0]->type == TINTA_ELEMENT_MATH_DISPLAY &&
+        layout_math_block_native(app, element->children[0], y, left, right))
+        return tinta_str16_append(&app->doc_text, L"\n\n", 2);
 #endif
     float line_height = format_line_height(app->body_format);
     InlineState state = {left, right, left, *y, line_height, line_height};

@@ -1,4 +1,5 @@
 #include "test_harness.h"
+#include "math_layout.h"
 #include "math_opentype.h"
 #include "tinta_math.h"
 
@@ -22,6 +23,15 @@ void put_u16(uint8_t *data, size_t offset, uint16_t value) {
     data[offset + 1] = static_cast<uint8_t>(value);
 }
 
+bool fake_measure(void *, const char *, size_t length, float font_size,
+                  TintaMathTextStyle,
+                  TintaMathGlyphMetrics *metrics) {
+    metrics->width = static_cast<float>(length) * font_size * 0.5f;
+    metrics->ascent = font_size * 0.8f;
+    metrics->descent = font_size * 0.2f;
+    return true;
+}
+
 }  // namespace
 
 void run_math_tests(TintaTestContext &tests) {
@@ -29,6 +39,19 @@ void run_math_tests(TintaTestContext &tests) {
     tests.check(scripts.success && scripts.root && scripts.node_count >= 7,
                 "scripts parse into a bounded AST");
     destroy(scripts);
+
+    auto adjacent_scripts = parse("a_i^2+\\int_0^\\infty");
+    bool adjacent_scripts_ok = adjacent_scripts.success &&
+        adjacent_scripts.root && adjacent_scripts.root->child_count >= 3 &&
+        adjacent_scripts.root->children[0]->type == TINTA_MATH_SCRIPT &&
+        adjacent_scripts.root->children[0]->b &&
+        adjacent_scripts.root->children[0]->c &&
+        adjacent_scripts.root->children[2]->type == TINTA_MATH_SCRIPT &&
+        adjacent_scripts.root->children[2]->b &&
+        adjacent_scripts.root->children[2]->c;
+    tests.check(adjacent_scripts_ok,
+                "unbraced adjacent subscript and superscript stay siblings");
+    destroy(adjacent_scripts);
 
     auto fraction = parse("\\frac{a}{b}+\\sqrt[3]{x}");
     tests.check(fraction.success && fraction.root,
@@ -52,6 +75,84 @@ void run_math_tests(TintaTestContext &tests) {
     tests.check(aligned.success && aligned.root,
                 "aligned environment parses column markers and rows");
     destroy(aligned);
+
+    auto multline = parse("\\begin{multline}a+b\\\\c+d\\end{multline}");
+    tests.check(multline.success && multline.root,
+                "multline environment parses as a display row stack");
+    destroy(multline);
+
+    auto aliases = parse(
+        "\\boldsymbol{x}+\\bm{y}+\\textbf{z}+\\textrm{r}+"
+        "\\mathbb{R}+\\mathcal{F}+\\mathscr{G}");
+    tests.check(aliases.success && aliases.root,
+                "common math style aliases parse");
+    destroy(aliases);
+
+    auto limits = parse("\\sum\\limits_{i=0}^n+\\sum\\nolimits_{j=0}^m");
+    bool limits_ast =
+        limits.success && limits.root && limits.root->child_count >= 3 &&
+        limits.root->children[0]->type == TINTA_MATH_SCRIPT &&
+        limits.root->children[0]->limits_mode == TINTA_MATH_LIMITS_LIMITS &&
+        limits.root->children[2]->type == TINTA_MATH_SCRIPT &&
+        limits.root->children[2]->limits_mode == TINTA_MATH_LIMITS_NOLIMITS;
+    tests.check(limits_ast, "limits and nolimits attach to scripted operators");
+    destroy(limits);
+
+    auto spaced = parse("a=b+c");
+    auto compact = parse("abc");
+    TintaMathLayout spaced_layout{};
+    TintaMathLayout compact_layout{};
+    bool spacing_ok =
+        spaced.success && compact.success &&
+        tinta_math_layout_build(spaced.root, 20.0f, false, fake_measure,
+                                nullptr, &spaced_layout) &&
+        tinta_math_layout_build(compact.root, 20.0f, false, fake_measure,
+                                nullptr, &compact_layout) &&
+        spaced_layout.width > compact_layout.width + 20.0f * 0.30f;
+    tests.check(spacing_ok, "implicit TeX-style operator spacing affects rows");
+    tinta_math_layout_destroy(&spaced_layout);
+    tinta_math_layout_destroy(&compact_layout);
+    destroy(spaced);
+    destroy(compact);
+
+    auto forced_limits = parse("\\sum\\limits_{i}^{n}");
+    auto forced_side = parse("\\sum\\nolimits_{i}^{n}");
+    TintaMathLayout limits_layout{};
+    TintaMathLayout side_layout{};
+    bool limits_layout_ok =
+        forced_limits.success && forced_side.success &&
+        tinta_math_layout_build(forced_limits.root, 20.0f, true, fake_measure,
+                                nullptr, &limits_layout) &&
+        tinta_math_layout_build(forced_side.root, 20.0f, true, fake_measure,
+                                nullptr, &side_layout) &&
+        limits_layout.width < side_layout.width &&
+        limits_layout.ascent > side_layout.ascent;
+    tests.check(limits_layout_ok,
+                "limits and nolimits choose stacked versus side scripts");
+    tinta_math_layout_destroy(&limits_layout);
+    tinta_math_layout_destroy(&side_layout);
+    destroy(forced_limits);
+    destroy(forced_side);
+
+    auto integral_auto = parse("\\int_0^\\infty");
+    auto integral_stacked = parse("\\int\\limits_0^\\infty");
+    TintaMathLayout integral_auto_layout{};
+    TintaMathLayout integral_stacked_layout{};
+    bool integral_limits_ok =
+        integral_auto.success && integral_stacked.success &&
+        tinta_math_layout_build(integral_auto.root, 20.0f, true,
+                                fake_measure, nullptr,
+                                &integral_auto_layout) &&
+        tinta_math_layout_build(integral_stacked.root, 20.0f, true,
+                                fake_measure, nullptr,
+                                &integral_stacked_layout) &&
+        integral_auto_layout.width > integral_stacked_layout.width;
+    tests.check(integral_limits_ok,
+                "display integrals keep limits beside the integral by default");
+    tinta_math_layout_destroy(&integral_auto_layout);
+    tinta_math_layout_destroy(&integral_stacked_layout);
+    destroy(integral_auto);
+    destroy(integral_stacked);
 
     auto unknown = parse("x+\\notARealCommand{y}");
     tests.check(!unknown.success && !unknown.root,

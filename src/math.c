@@ -12,6 +12,7 @@ typedef struct MathParser {
     size_t max_nodes;
     size_t max_depth;
     size_t error_offset;
+    bool suppress_scripts;
     bool failed;
 } MathParser;
 
@@ -63,6 +64,24 @@ static const MathSymbol MATH_SYMBOLS[] = {
     {"leftarrow", "\xE2\x86\x90", false}, {"leftrightarrow", "\xE2\x86\x94", false},
     {"Rightarrow", "\xE2\x87\x92", false}, {"Leftarrow", "\xE2\x87\x90", false},
     {"Leftrightarrow", "\xE2\x87\x94", false}, {"mapsto", "\xE2\x86\xA6", false},
+    {"cdots", "\xE2\x8B\xAF", false}, {"ldots", "\xE2\x80\xA6", false},
+    {"dots", "\xE2\x80\xA6", false}, {"vdots", "\xE2\x8B\xAE", false},
+    {"ddots", "\xE2\x8B\xB1", false}, {"mid", "\xE2\x88\xA3", false},
+    {"varnothing", "\xE2\x88\x85", false}, {"because", "\xE2\x88\xB5", false},
+    {"therefore", "\xE2\x88\xB4", false}, {"bigtriangleup", "\xE2\x96\xB3", false},
+    {"square", "\xE2\x96\xA1", false}, {"prime", "\xE2\x80\xB2", false},
+    {"degree", "\xC2\xB0", false}, {"lfloor", "\xE2\x8C\x8A", false},
+    {"rfloor", "\xE2\x8C\x8B", false}, {"lceil", "\xE2\x8C\x88", false},
+    {"rceil", "\xE2\x8C\x89", false}, {"langle", "\xE2\x9F\xA8", false},
+    {"rangle", "\xE2\x9F\xA9", false}, {"lbrack", "[", false},
+    {"rbrack", "]", false}, {"lvert", "|", false}, {"rvert", "|", false},
+    {"vert", "|", false}, {"lVert", "\xE2\x80\x96", false},
+    {"rVert", "\xE2\x80\x96", false}, {"Vert", "\xE2\x80\x96", false},
+    {"backslash", "\\", false}, {"setminus", "\xE2\x88\x96", false},
+    {"hbar", "\xE2\x84\x8F", false}, {"Re", "\xE2\x84\x9C", false},
+    {"Im", "\xE2\x84\x91", false}, {"aleph", "\xE2\x84\xB5", false},
+    {"wp", "\xE2\x84\x98", false}, {"lnot", "\xC2\xAC", false},
+    {"land", "\xE2\x88\xA7", false}, {"lor", "\xE2\x88\xA8", false},
     {"infty", "\xE2\x88\x9E", false}, {"partial", "\xE2\x88\x82", false},
     {"nabla", "\xE2\x88\x87", false}, {"ell", "\xE2\x84\x93", false},
     {"emptyset", "\xE2\x88\x85", false}, {"forall", "\xE2\x88\x80", false},
@@ -73,8 +92,15 @@ static const MathSymbol MATH_SYMBOLS[] = {
     {"iint", "\xE2\x88\xAC", true}, {"iiint", "\xE2\x88\xAD", true},
     {"oint", "\xE2\x88\xAE", true}, {"lim", "lim", true},
     {"min", "min", true}, {"max", "max", true}, {"log", "log", false},
-    {"ln", "ln", false}, {"sin", "sin", false}, {"cos", "cos", false},
-    {"tan", "tan", false}, {"det", "det", false}, {"gcd", "gcd", false}
+    {"ln", "ln", false}, {"lg", "lg", false}, {"sin", "sin", false},
+    {"cos", "cos", false}, {"tan", "tan", false}, {"cot", "cot", false},
+    {"sec", "sec", false}, {"csc", "csc", false}, {"sinh", "sinh", false},
+    {"cosh", "cosh", false}, {"tanh", "tanh", false},
+    {"limsup", "limsup", true}, {"liminf", "liminf", true},
+    {"sup", "sup", true}, {"inf", "inf", true}, {"exp", "exp", false},
+    {"mod", "mod", false}, {"Pr", "Pr", false}, {"dim", "dim", false},
+    {"ker", "ker", false}, {"deg", "deg", false}, {"arg", "arg", false},
+    {"det", "det", false}, {"gcd", "gcd", false}
 };
 
 static void parser_fail(MathParser *parser) {
@@ -104,6 +130,7 @@ static TintaMathNode *node_create(MathParser *parser, TintaMathNodeType type) {
     }
     node->type = type;
     node->style = TINTA_MATH_STYLE_DEFAULT;
+    node->limits_mode = TINTA_MATH_LIMITS_AUTO;
     parser->node_count++;
     return node;
 }
@@ -317,6 +344,7 @@ static TintaMathNode *parse_environment(MathParser *parser, size_t depth) {
     if (!environment) return NULL;
     if (strcmp(environment, "aligned") && strcmp(environment, "alignedat") &&
         strcmp(environment, "gathered") && strcmp(environment, "split") &&
+        strcmp(environment, "multline") && strcmp(environment, "multlined") &&
         strcmp(environment, "matrix") && strcmp(environment, "pmatrix") &&
         strcmp(environment, "bmatrix") && strcmp(environment, "Bmatrix") &&
         strcmp(environment, "vmatrix") && strcmp(environment, "Vmatrix") &&
@@ -496,6 +524,7 @@ static TintaMathNode *parse_command(MathParser *parser, size_t depth) {
     } else if (!strcmp(command, "hat") || !strcmp(command, "widehat") ||
                !strcmp(command, "bar") || !strcmp(command, "overline") ||
                !strcmp(command, "underline") || !strcmp(command, "vec") ||
+               !strcmp(command, "overrightarrow") ||
                !strcmp(command, "dot") || !strcmp(command, "ddot") ||
                !strcmp(command, "tilde") || !strcmp(command, "widetilde") ||
                !strcmp(command, "overbrace") || !strcmp(command, "underbrace")) {
@@ -503,7 +532,8 @@ static TintaMathNode *parse_command(MathParser *parser, size_t depth) {
         node = node_create(parser, TINTA_MATH_ACCENT);
         if (!strcmp(command, "bar") || !strcmp(command, "overline")) accent = "_over";
         else if (!strcmp(command, "underline")) accent = "_under";
-        else if (!strcmp(command, "vec")) accent = "\xE2\x86\x92";
+        else if (!strcmp(command, "vec") ||
+                 !strcmp(command, "overrightarrow")) accent = "\xE2\x86\x92";
         else if (!strcmp(command, "dot")) accent = "\xCB\x99";
         else if (!strcmp(command, "ddot")) accent = "\xC2\xA8";
         else if (!strcmp(command, "tilde") || !strcmp(command, "widetilde")) accent = "~";
@@ -521,15 +551,25 @@ static TintaMathNode *parse_command(MathParser *parser, size_t depth) {
             if (node) node->style = TINTA_MATH_STYLE_TEXT;
         }
         free(text);
-    } else if (!strcmp(command, "mathrm") || !strcmp(command, "mathbf") ||
+    } else if (!strcmp(command, "mathrm") || !strcmp(command, "textrm") ||
+               !strcmp(command, "mathbf") || !strcmp(command, "textbf") ||
+               !strcmp(command, "boldsymbol") || !strcmp(command, "bm") ||
                !strcmp(command, "mathit") || !strcmp(command, "mathsf") ||
-               !strcmp(command, "mathtt")) {
+               !strcmp(command, "mathtt") || !strcmp(command, "mathbb") ||
+               !strcmp(command, "mathcal") || !strcmp(command, "mathscr")) {
         node = node_create(parser, TINTA_MATH_STYLE);
         if (node) {
-            node->style = !strcmp(command, "mathbf") ? TINTA_MATH_STYLE_BOLD :
+            node->style = (!strcmp(command, "mathbf") ||
+                           !strcmp(command, "textbf") ||
+                           !strcmp(command, "boldsymbol") ||
+                           !strcmp(command, "bm")) ? TINTA_MATH_STYLE_BOLD :
                 !strcmp(command, "mathit") ? TINTA_MATH_STYLE_ITALIC :
                 !strcmp(command, "mathsf") ? TINTA_MATH_STYLE_SANS :
                 !strcmp(command, "mathtt") ? TINTA_MATH_STYLE_MONO :
+                !strcmp(command, "mathbb") ? TINTA_MATH_STYLE_BLACKBOARD :
+                (!strcmp(command, "mathcal") ||
+                 !strcmp(command, "mathscr")) ?
+                    TINTA_MATH_STYLE_CALLIGRAPHIC :
                 TINTA_MATH_STYLE_ROMAN;
             node->a = parse_group(parser, depth + 1);
             if (!node->a) parser_fail(parser);
@@ -541,9 +581,10 @@ static TintaMathNode *parse_command(MathParser *parser, size_t depth) {
         node = make_space_node(parser, 0);
         if (node && !strcmp(command, "displaystyle"))
             node->style = TINTA_MATH_STYLE_DISPLAY;
-        else if (node && (!strcmp(command, "scriptstyle") ||
-                          !strcmp(command, "scriptscriptstyle")))
+        else if (node && !strcmp(command, "scriptstyle"))
             node->style = TINTA_MATH_STYLE_SCRIPT;
+        else if (node && !strcmp(command, "scriptscriptstyle"))
+            node->style = TINTA_MATH_STYLE_SCRIPTSCRIPT;
     } else if (!strcmp(command, "begin")) {
         node = parse_environment(parser, depth + 1);
     } else if (!strcmp(command, "quad")) node = make_space_node(parser, 1.0f);
@@ -553,8 +594,11 @@ static TintaMathNode *parse_command(MathParser *parser, size_t depth) {
     else if (!strcmp(command, ";")) node = make_space_node(parser, 0.2778f);
     else if (!strcmp(command, "!")) node = make_space_node(parser, -0.1667f);
     else if (!strcmp(command, " ")) node = make_space_node(parser, 0.3333f);
-    else if (!strcmp(command, "limits") || !strcmp(command, "nolimits"))
+    else if (!strcmp(command, "limits") || !strcmp(command, "nolimits")) {
         node = make_space_node(parser, 0);
+        if (node) node->limits_mode = !strcmp(command, "limits") ?
+            TINTA_MATH_LIMITS_LIMITS : TINTA_MATH_LIMITS_NOLIMITS;
+    }
     else if (strlen(command) == 1 && strchr("{}_%#$&", command[0]))
         node = make_text_node(parser, command, 1);
     else parser_fail(parser);
@@ -601,7 +645,10 @@ static TintaMathNode *parse_atom(MathParser *parser, size_t depth) {
     TintaMathNode *base;
     TintaMathNode *sub = NULL;
     TintaMathNode *sup = NULL;
+    TintaMathLimitsMode limits_mode = TINTA_MATH_LIMITS_AUTO;
+    bool suppress_scripts = parser->suppress_scripts;
     size_t length;
+    parser->suppress_scripts = false;
     skip_space(parser);
     if (parser->max_depth && depth > parser->max_depth) {
         parser_fail(parser);
@@ -631,6 +678,16 @@ static TintaMathNode *parse_atom(MathParser *parser, size_t depth) {
         parser->position += length;
     }
     if (!base) return NULL;
+    if (suppress_scripts) return base;
+    while (!parser->failed && parser->position < parser->length &&
+           (command_at(parser, "limits") || command_at(parser, "nolimits"))) {
+        char *limits = read_command(parser);
+        if (!limits) break;
+        limits_mode = !strcmp(limits, "limits") ?
+            TINTA_MATH_LIMITS_LIMITS : TINTA_MATH_LIMITS_NOLIMITS;
+        free(limits);
+        skip_space(parser);
+    }
     while (!parser->failed && parser->position < parser->length) {
         char marker = parser->source[parser->position];
         if (marker != '^' && marker != '_' && marker != '\'') break;
@@ -683,17 +740,25 @@ static TintaMathNode *parse_atom(MathParser *parser, size_t depth) {
         script->a = base;
         script->b = sub;
         script->c = sup;
+        script->limits_mode = limits_mode;
         return script;
     }
+    base->limits_mode = limits_mode;
     return base;
 }
 
 static TintaMathNode *parse_argument(MathParser *parser, size_t depth) {
+    TintaMathNode *result;
+    bool previous_suppression;
     skip_space(parser);
     if (parser->position < parser->length &&
         parser->source[parser->position] == '{')
         return parse_group(parser, depth + 1);
-    return parse_atom(parser, depth + 1);
+    previous_suppression = parser->suppress_scripts;
+    parser->suppress_scripts = true;
+    result = parse_atom(parser, depth + 1);
+    parser->suppress_scripts = previous_suppression;
+    return result;
 }
 
 static TintaMathNode *parse_sequence(MathParser *parser, size_t depth,
@@ -716,6 +781,16 @@ static TintaMathNode *parse_sequence(MathParser *parser, size_t depth,
             (stop && !strcmp(stop, "right") && command_at(parser, "right")))
             break;
         child = parse_atom(parser, depth + 1);
+        if (child && child->type == TINTA_MATH_SPACE &&
+            child->space_em == 0 &&
+            child->limits_mode != TINTA_MATH_LIMITS_AUTO) {
+            if (row->child_count) {
+                TintaMathNode *previous = row->children[row->child_count - 1];
+                previous->limits_mode = child->limits_mode;
+            }
+            tinta_math_node_destroy(child);
+            continue;
+        }
         if (!child || !node_add_child(parser, row, child)) {
             tinta_math_node_destroy(child);
             tinta_math_node_destroy(row);

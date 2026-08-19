@@ -29,8 +29,18 @@ typedef enum TintaMathTextStyle {
     TINTA_MATH_STYLE_MONO,
     TINTA_MATH_STYLE_TEXT,
     TINTA_MATH_STYLE_DISPLAY,
-    TINTA_MATH_STYLE_SCRIPT
+    TINTA_MATH_STYLE_SCRIPT,
+    TINTA_MATH_STYLE_SCRIPTSCRIPT,
+    TINTA_MATH_STYLE_BLACKBOARD,
+    TINTA_MATH_STYLE_CALLIGRAPHIC,
+    TINTA_MATH_STYLE_SYMBOL
 } TintaMathTextStyle;
+
+typedef enum TintaMathLimitsMode {
+    TINTA_MATH_LIMITS_AUTO,
+    TINTA_MATH_LIMITS_LIMITS,
+    TINTA_MATH_LIMITS_NOLIMITS
+} TintaMathLimitsMode;
 
 typedef struct TintaMathNode TintaMathNode;
 
@@ -40,6 +50,7 @@ struct TintaMathNode {
     char *aux;
     float space_em;
     TintaMathTextStyle style;
+    TintaMathLimitsMode limits_mode;
     bool large_operator;
     TintaMathNode *a;
     TintaMathNode *b;

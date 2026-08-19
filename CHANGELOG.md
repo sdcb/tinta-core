@@ -33,6 +33,19 @@
 - Fixed read-only heading queries during control notifications, preventing the
   demo's table of contents from being cleared when handling
   `TMN_DOCUMENTREADY`.
+- Improved native math fidelity with TeX-style operator spacing, display-box
+  padding, math-axis fractions, better roots, centered scalable delimiters,
+  tighter scripts and limits, matrix spacing, and correctly positioned vector
+  and hat accents. Formula text follows the active theme while mathematical
+  operators, radicals, and scalable delimiters use a math font with DirectWrite
+  fallback.
+- Fixed unbraced adjacent scripts such as `a_i^2` and `\int_0^\infty` being
+  parsed as nested scripts. Display integrals now keep limits beside the
+  integral by default, while sums and named limit operators retain stacked
+  display limits; explicit `\limits` and `\nolimits` are honored.
+- Expanded TeX compatibility with common style aliases, blackboard and
+  calligraphic alphabets, multiline environments, additional functions and
+  symbols, and distinct display, script, and scriptscript styles.
 
 ## 1.2.0
 
